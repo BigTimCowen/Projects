@@ -3,7 +3,7 @@
 # OCI POC Setup Script with User Group Management
 # Creates compartment
 # Groups - OCI-HPC-POC-Group, 
-# Dynamic group - tc_instance_principal
+# Dynamic group - oci_hpc_instance_principal
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
 
@@ -153,20 +153,20 @@ fi
 echo
 
 # Step 4: Create dynamic group
-print_status "Creating dynamic group 'tc_instance_principal'..."
+print_status "Creating dynamic group 'oci_hpc_instance_principal'..."
 
 # Check if dynamic group already exists
-EXISTING_DG=$(oci iam dynamic-group list --name "tc_instance_principal" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_DG=$(oci iam dynamic-group list --name "oci_hpc_instance_principal" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_DG" ]; then
-    print_warning "Dynamic group 'tc_instance_principal' already exists with OCID: $EXISTING_DG"
+    print_warning "Dynamic group 'oci_hpc_instance_principal' already exists with OCID: $EXISTING_DG"
 else
     # Create the dynamic group
     MATCHING_RULE="Any {instance.compartment.id = '$POC_OCID'}"
     
     CREATE_DG_RESULT=$(oci iam dynamic-group create \
         --compartment-id "$TENANCY_OCID" \
-        --name "tc_instance_principal" \
+        --name "oci_hpc_instance_principal" \
         --description "Dynamic group for instances in POC compartment" \
         --matching-rule "$MATCHING_RULE")
     
@@ -197,14 +197,14 @@ else
         "allow service compute_management to manage compute-management-family in tenancy",
         "allow service compute_management to read app-catalog-listing in tenancy",
         "allow group OCI-HPC-POC-Group to manage all-resources in compartment POC",
-        "allow dynamic-group tc_instance_principal to read app-catalog-listing in tenancy",
-        "allow dynamic-group tc_instance_principal to use tag-namespace in tenancy",
-        "allow dynamic-group tc_instance_principal to manage compute-management-family in compartment POC",
-        "allow dynamic-group tc_instance_principal to manage instance-family in compartment POC",
-        "allow dynamic-group tc_instance_principal to use virtual-network-family in compartment POC",
-        "allow dynamic-group tc_instance_principal to use volumes in compartment POC",
-        "allow dynamic-group tc_instance_principal to manage dns in compartment POC",
-        "allow dynamic-group tc_instance_principal to read metrics in compartment POC"
+        "allow dynamic-group oci_hpc_instance_principal to read app-catalog-listing in tenancy",
+        "allow dynamic-group oci_hpc_instance_principal to use tag-namespace in tenancy",
+        "allow dynamic-group oci_hpc_instance_principal to manage compute-management-family in compartment POC",
+        "allow dynamic-group oci_hpc_instance_principal to manage instance-family in compartment POC",
+        "allow dynamic-group oci_hpc_instance_principal to use virtual-network-family in compartment POC",
+        "allow dynamic-group oci_hpc_instance_principal to use volumes in compartment POC",
+        "allow dynamic-group oci_hpc_instance_principal to manage dns in compartment POC",
+        "allow dynamic-group oci_hpc_instance_principal to read metrics in compartment POC"
     ]'
     
     # Create the policy
@@ -233,7 +233,7 @@ print_status "Summary of created resources:"
 print_status "• Compartment 'POC': $POC_OCID"
 print_status "• User Group 'OCI-HPC-POC-Group': $GROUP_OCID"
 print_status "• Current User '$CURRENT_USERNAME' added to group"
-print_status "• Dynamic Group 'tc_instance_principal': References instances in POC compartment"
+print_status "• Dynamic Group 'oci_hpc_instance_principal': References instances in POC compartment"
 print_status "• Policy 'OCI-HPC-Deployment-Policies': Contains all required permissions"
 echo
 print_status "Your OCI environment is now ready for HPC deployment!"
