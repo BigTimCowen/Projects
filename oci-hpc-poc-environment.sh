@@ -6,23 +6,20 @@
 # Dynamic group - oci_hpc_instance_principal
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
-
 POC_COMPARTMENT_NAME="POC"
 HPC_DYNAMIC_GROUP_NAME="oci_hpc_instance_principal"
 HPC_GROUP_NAME="OCI-HPC-POC-Group"
 HPC_POLICY_NAME="OCI-HPC-Deployment-Policies"
 
 
-set -e  # Exit on any error
-
-echo "=== OCI POC Setup Script Starting ==="
-echo
-
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[0;37m'
+NC='\033[0m' # No Color (reset)
 
 # Function to print colored output
 print_status() {
@@ -37,31 +34,14 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+
 # Get tenancy OCID (needed for compartment creation)
 print_status "Getting tenancy OCID..."
-TENANCY_OCID=$(oci iam compartment list --all --query "data[?\"lifecycle-state\"=='ACTIVE' && \"name\"=='root'].id | [0]" --raw-output 2>/dev/null)
+TENANCY_OCID=$OCI_TENANCY
+TENANCY_NAME=$(oci iam compartment get --compartment-id "$OCI_TENANCY" --output json | jq -r '.data.description')
 
-# Alternative method if the above doesn't work - get from config
-if [ -z "$TENANCY_OCID" ] || [ "$TENANCY_OCID" = "null" ]; then
-    print_status "Trying alternative method to get tenancy OCID..."
-    TENANCY_OCID=$(oci iam region list --query "data[0].key" --raw-output 2>/dev/null | head -1)
-    if [ -n "$TENANCY_OCID" ]; then
-        # Get tenancy from config file
-        TENANCY_OCID=$(grep -E "^tenancy\s*=" ~/.oci/config | head -1 | cut -d'=' -f2 | tr -d ' ')
-    fi
-fi
 
-# Final fallback - use a simple compartment list to extract tenancy
-if [ -z "$TENANCY_OCID" ] || [ "$TENANCY_OCID" = "null" ]; then
-    print_status "Using compartment list to determine tenancy..."
-    TENANCY_OCID=$(oci iam compartment list --compartment-id-in-subtree false --query "data[0].\"compartment-id\"" --raw-output 2>/dev/null)
-fi
-
-if [ -z "$TENANCY_OCID" ] || [ "$TENANCY_OCID" = "null" ]; then
-    print_error "Failed to get tenancy OCID. Please check your OCI CLI configuration."
-    exit 1
-fi
-
+print_status "Tenancy Name: $TENANCY_NAME"
 print_status "Tenancy OCID: $TENANCY_OCID"
 echo
 
@@ -79,6 +59,18 @@ fi
 CURRENT_USERNAME=$(oci iam user get --user-id "$CURRENT_USER_OCID" --query "data.name" --raw-output 2>/dev/null)
 print_status "Detected user: $CURRENT_USERNAME ($CURRENT_USER_OCID)"
 echo
+
+
+
+
+create_poc() {
+
+set -e  # Exit on any error
+
+echo "=== OCI POC Setup Script Starting ==="
+echo
+
+
 
 # Step 1: Create POC compartment
 print_status "Creating $POC_COMPARTMENT_NAME compartment..."
@@ -244,3 +236,54 @@ print_status "• Policy $HPC_POLICY_NAME : Contains all required permissions"
 echo
 print_status "Your OCI environment is now ready for HPC deployment!"
 print_status "You have full access to the $POC_COMPARTMENT_NAME compartment through the $HPC_GROUP_NAME!"
+
+}
+
+delete_poc() {
+
+
+    EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "$POC_COMPARTMENT_NAME" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
+    EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    
+    echo
+    print_status "Summary of created resources:"
+    print_status "• Tenancy Name: $TENANCY_NAME"
+    print_status "• Compartment Name: $POC_COMPARTMENT_NAME, ocid $EXISTING_COMPARTMENT"
+    print_status "• User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
+    print_status "• Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
+    print_status "• Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"
+    
+        echo -e "${RED}Please confirm you want to delete the POC environment in this tenancy. (yes)${NC}"
+        read dele
+
+        if [ $dele == "yes" ]; then
+            print_status "Deleting"
+            oci iam compartment delete --compartment-id $EXISTING_COMPARTMENT
+            oci iam group delete --group-id $EXISTING_GROUP
+            oci iam policy delete --compartment-id $EXISTING_COMPARTMENT --policy-id $EXISTING_POLICY
+            oci iam dynamic-group delete --dynamic-group-id $EXISTING_DG
+        fi
+}
+
+main() {
+    echo -e "${CYAN}What would you like to do,
+                        ${YELLOW}1. Create POC Environment?
+                        2. Clean up tenancy for POC Environment?
+                        
+                        >${NC}"
+
+    read action
+
+    if [ $action -eq 1 ]; then
+        create_poc
+    elif [ $action -eq 2 ]; then
+
+            delete_poc
+    fi
+
+
+}
+
+main "$@"
