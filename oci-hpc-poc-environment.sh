@@ -7,6 +7,12 @@
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
 
+POC_COMPARTMENT_NAME="POC"
+HPC_DYNAMIC_GROUP_NAME="oci_hpc_instance_principal"
+HPC_GROUP_NAME="OCI-HPC-POC-Group"
+HPC_POLICY_NAME="OCI-HPC-Deployment-Policies"
+
+
 set -e  # Exit on any error
 
 echo "=== OCI POC Setup Script Starting ==="
@@ -75,10 +81,10 @@ print_status "Detected user: $CURRENT_USERNAME ($CURRENT_USER_OCID)"
 echo
 
 # Step 1: Create POC compartment
-print_status "Creating POC compartment..."
+print_status "Creating $POC_COMPARTMENT_NAME compartment..."
 
 # Check if compartment already exists
-EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "POC" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "$POC_COMPARTMENT_NAME" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_COMPARTMENT" ]; then
     print_warning "Compartment 'POC' already exists with OCID: $EXISTING_COMPARTMENT"
@@ -87,7 +93,7 @@ else
     # Create the compartment
     CREATE_RESULT=$(oci iam compartment create \
         --compartment-id "$TENANCY_OCID" \
-        --name "POC" \
+        --name "$POC_COMPARTMENT_NAME" \
         --description "Proof of Concept compartment for HPC deployment" \
         --wait-for-state "ACTIVE" \
         --max-wait-seconds 300)
@@ -99,26 +105,26 @@ else
         exit 1
     fi
     
-    print_status "POC compartment created successfully!"
+    print_status "$POC_COMPARTMENT_NAME compartment created successfully!"
 fi
 
-print_status "POC Compartment OCID: $POC_OCID"
+print_status "$POC_COMPARTMENT_NAME Compartment OCID: $POC_OCID"
 echo
 
 # Step 2: Create user group
-print_status "Creating user group 'OCI-HPC-POC-Group'..."
+print_status "Creating user group $HPC_GROUP_NAME..."
 
 # Check if group already exists
-EXISTING_GROUP=$(oci iam group list --name "OCI-HPC-POC-Group" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_GROUP" ]; then
-    print_warning "Group 'OCI-HPC-POC-Group' already exists with OCID: $EXISTING_GROUP"
+    print_warning "Group '$HPC_GROUP_NAME' already exists with OCID: $EXISTING_GROUP"
     GROUP_OCID="$EXISTING_GROUP"
 else
     # Create the group
     CREATE_GROUP_RESULT=$(oci iam group create \
         --compartment-id "$TENANCY_OCID" \
-        --name "OCI-HPC-POC-Group" \
+        --name "$HPC_GROUP_NAME" \
         --description "Group for users with access to POC HPC resources")
     
     GROUP_OCID=$(echo "$CREATE_GROUP_RESULT" | jq -r '.data.id')
@@ -128,14 +134,14 @@ else
         exit 1
     fi
     
-    print_status "User group created successfully!"
+    print_status "$HPC_GROUP_NAME group created successfully!"
 fi
 
-print_status "Group OCID: $GROUP_OCID"
+print_status "$HPC_GROUP_NAME OCID: $GROUP_OCID"
 echo
 
 # Step 3: Add current user to the group
-print_status "Adding current user to OCI-HPC-POC-Group..."
+print_status "Adding current user to $HPC_GROUP_NAME..."
 
 # Check if user is already in the group
 USER_IN_GROUP=$(oci iam group list-users --group-id "$GROUP_OCID" --query "data[?id=='$CURRENT_USER_OCID'].id | [0]" --raw-output 2>/dev/null)
@@ -148,25 +154,25 @@ else
         --group-id "$GROUP_OCID" \
         --user-id "$CURRENT_USER_OCID" >/dev/null
     
-    print_status "User $CURRENT_USERNAME added to group successfully!"
+    print_status "User $CURRENT_USERNAME added to $HPC_GROUP_NAME successfully!"
 fi
 echo
 
 # Step 4: Create dynamic group
-print_status "Creating dynamic group 'oci_hpc_instance_principal'..."
+print_status "Creating dynamic group $HPC_DYNAMIC_GROUP_NAME..."
 
 # Check if dynamic group already exists
-EXISTING_DG=$(oci iam dynamic-group list --name "oci_hpc_instance_principal" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_DG" ]; then
-    print_warning "Dynamic group 'oci_hpc_instance_principal' already exists with OCID: $EXISTING_DG"
+    print_warning "Dynamic group $HPC_DYNAMIC_GROUP_NAME already exists with OCID: $EXISTING_DG"
 else
     # Create the dynamic group
     MATCHING_RULE="Any {instance.compartment.id = '$POC_OCID'}"
     
     CREATE_DG_RESULT=$(oci iam dynamic-group create \
         --compartment-id "$TENANCY_OCID" \
-        --name "oci_hpc_instance_principal" \
+        --name "$HPC_DYNAMIC_GROUP_NAME" \
         --description "Dynamic group for instances in POC compartment" \
         --matching-rule "$MATCHING_RULE")
     
@@ -177,52 +183,52 @@ else
         exit 1
     fi
     
-    print_status "Dynamic group created successfully!"
-    print_status "Dynamic group OCID: $DG_OCID"
+    print_status "$HPC_DYNAMIC_GROUP_NAME dynamic group created successfully!"
+    print_status "$HPC_DYNAMIC_GROUP_NAME dynamic group OCID: $DG_OCID"
 fi
 echo
 
 # Step 5: Create policy
-print_status "Creating policy 'OCI-HPC-Deployment-Policies'..."
+print_status "Creating policy $HPC_POLICY_NAME ..."
 
 # Check if policy already exists
-EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "OCI-HPC-Deployment-Policies" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_POLICY" ]; then
-    print_warning "Policy 'OCI-HPC-Deployment-Policies' already exists with OCID: $EXISTING_POLICY"
+    print_warning "Policy "$HPC_POLICY_NAME" already exists with OCID: $EXISTING_POLICY"
 else
     # Define policy statements with proper replacements
     POLICY_STATEMENTS='[
         "allow service compute_management to use tag-namespace in tenancy",
         "allow service compute_management to manage compute-management-family in tenancy",
         "allow service compute_management to read app-catalog-listing in tenancy",
-        "allow group OCI-HPC-POC-Group to manage all-resources in compartment POC",
+        "allow group OCI-HPC-POC-Group to manage all-resources in compartment '$POC_COMPARTMENT_NAME'",
         "allow dynamic-group oci_hpc_instance_principal to read app-catalog-listing in tenancy",
         "allow dynamic-group oci_hpc_instance_principal to use tag-namespace in tenancy",
-        "allow dynamic-group oci_hpc_instance_principal to manage compute-management-family in compartment POC",
-        "allow dynamic-group oci_hpc_instance_principal to manage instance-family in compartment POC",
-        "allow dynamic-group oci_hpc_instance_principal to use virtual-network-family in compartment POC",
-        "allow dynamic-group oci_hpc_instance_principal to use volumes in compartment POC",
-        "allow dynamic-group oci_hpc_instance_principal to manage dns in compartment POC",
-        "allow dynamic-group oci_hpc_instance_principal to read metrics in compartment POC"
+        "allow dynamic-group oci_hpc_instance_principal to manage compute-management-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group oci_hpc_instance_principal to manage instance-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group oci_hpc_instance_principal to use virtual-network-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group oci_hpc_instance_principal to use volumes in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group oci_hpc_instance_principal to manage dns in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group oci_hpc_instance_principal to read metrics in compartment '$POC_COMPARTMENT_NAME'"
     ]'
     
     # Create the policy
     CREATE_POLICY_RESULT=$(oci iam policy create \
         --compartment-id "$TENANCY_OCID" \
-        --name "OCI-HPC-Deployment-Policies" \
+        --name "$HPC_POLICY_NAME" \
         --description "Policies for HPC deployment in POC compartment" \
         --statements "$POLICY_STATEMENTS")
     
     POLICY_OCID=$(echo "$CREATE_POLICY_RESULT" | jq -r '.data.id')
     
     if [ -z "$POLICY_OCID" ] || [ "$POLICY_OCID" = "null" ]; then
-        print_error "Failed to create policy"
+        print_error "Failed to create policy, $HPC_POLICY_NAME"
         exit 1
     fi
     
-    print_status "Policy created successfully!"
-    print_status "Policy OCID: $POLICY_OCID"
+    print_status "$HPC_POLICY_NAME - Policy created successfully!"
+    print_status "$HPC_POLICY_NAME - Policy OCID: $POLICY_OCID"
 fi
 echo
 
@@ -230,11 +236,11 @@ echo
 print_status "=== Setup Complete! ==="
 echo
 print_status "Summary of created resources:"
-print_status "• Compartment 'POC': $POC_OCID"
-print_status "• User Group 'OCI-HPC-POC-Group': $GROUP_OCID"
+print_status "• Compartment $POC_COMPARTMENT_NAME: $POC_OCID"
+print_status "• User Group $HPC_GROUP_NAME : $GROUP_OCID"
 print_status "• Current User '$CURRENT_USERNAME' added to group"
-print_status "• Dynamic Group 'oci_hpc_instance_principal': References instances in POC compartment"
-print_status "• Policy 'OCI-HPC-Deployment-Policies': Contains all required permissions"
+print_status "• Dynamic Group $HPC_DYNAMIC_GROUP_NAME : References instances in POC compartment"
+print_status "• Policy $HPC_POLICY_NAME : Contains all required permissions"
 echo
 print_status "Your OCI environment is now ready for HPC deployment!"
-print_status "You have full access to the POC compartment through the OCI-HPC-POC-Group!"
+print_status "You have full access to the $POC_COMPARTMENT_NAME compartment through the $HPC_GROUP_NAME!"
