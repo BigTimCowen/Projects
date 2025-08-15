@@ -223,7 +223,7 @@ def print_domain_summary(domains_info, filter_username=None):
             domain_info['type'],
             user_count,
             domain_info['status'],
-            domain_info['id'][:50] + '...' if len(domain_info['id']) > 50 else domain_info['id']
+            domain_info['id']
         ])
     
     if summary_data:
@@ -274,7 +274,7 @@ def print_detailed_domain_info(domains_info, show_users=True, filter_username=No
                         user['email'],
                         user['status'],
                         user['created'],
-                        user['user_id'][:30] + '...' if len(user['user_id']) > 30 else user['user_id']
+                        user['user_id']
                     ])
                 else:
                     user_data.append([
@@ -283,8 +283,7 @@ def print_detailed_domain_info(domains_info, show_users=True, filter_username=No
                         user['email'],
                         user['status'],
                         user['created'],
-                        user['user_id'][:20] + '...' if len(user['user_id']) > 20 else user['user_id']
-                    ])
+                        user['user_id']                    ])
             
             # Different headers for different domain types
             if domain_info['type'] == 'Legacy IAM':
