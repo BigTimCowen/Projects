@@ -6,12 +6,18 @@
 # Dynamic group - oci_hpc_instance_principal
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
+# Creates TAG_NAMESPACE for tagging unhealthy GPUs
 # Run this script in the OCI Shell of an admin users of the tenancy
 
 POC_COMPARTMENT_NAME="POC"
 HPC_DYNAMIC_GROUP_NAME="oci_hpc_instance_principal"
 HPC_GROUP_NAME="OCI-HPC-POC-Group"
 HPC_POLICY_NAME="OCI-HPC-Deployment-Policies"
+TAG_NAMESPACE="ComputeInstanceHostActions"
+TAG_NAMESPACE_DESCRIPTION="Compute Instance Actions Tag Namespace"
+TAG_NAME="CustomerReportedHostStatus"
+TAG_NAME_DESCRIPTION="host is unhealthy and needs manual intervention before returning to the previous pool post-recycle"
+TAG_VALUE="unhealthy"
 
 HOME_REGION_KEY=$(oci iam tenancy get --tenancy-id $OCI_TENANCY --query "data.\"home-region-key\"" --raw-output)
 HOME_REGION=$(oci iam region list --query "data[?key=='$HOME_REGION_KEY'].name | [0]" --raw-output)
@@ -98,10 +104,10 @@ delete_resource_manager() {
         esac
     done
 
-    echo -e "${CYAN}Simple OCI Resource Manager Stack Deletion Script"
+    echo -e "${CYAN}OCI Resource Manager Stack Deletion Script"
     echo "=============================================="
     echo "Compartment: $COMPARTMENT_ID"
-    echo "Search term: $SEARCH_TERM"
+    echo "Searching for Resource Manager Stacks that contain the Search term: $SEARCH_TERM"
     echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
     echo -e "${NC}"
 
@@ -236,10 +242,10 @@ delete_images() {
                     esac
                 done
 
-                echo -e "${CYAN}Simple OCI Custom Image Deletion Script"
+                echo -e "${CYAN}OCI Custom Image Deletion Script"
                 echo "================================"
                 echo "Compartment: $COMPARTMENT_ID"
-                echo "Search term: $SEARCH_TERM"
+                echo "Searching for Custom Images that contain the Search term: $SEARCH_TERM"
                 echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
                 echo -e "${NC}"
 
@@ -311,7 +317,50 @@ delete_images() {
 
 }
 
+create_tag_namespace() {
+    # Step 5: Create tag_namespace
+    print_status "Creating tag_namespace $TAG_NAMESPACE ..."
 
+    # Check if namespace already exists
+    EXISTING_NAMESPACE=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
+
+    if [ -n "$EXISTING_NAMESPACE" ]; then
+        print_warning "Namespace "$TAG_NAMESPACE" already exists with OCID: $EXISTING_NAMESPACE"
+    else
+            ## This will create the ComputeInstanceHostActions namespace and corresponding tags for tagging GPUs
+
+    print_status "Creating Tag Namespace $TAG_NAMESPACE" 
+    oci iam tag-namespace create --compartment-id $OCI_TENANCY --name $TAG_NAMESPACE --description "$TAG_NAMESPACE_DESCRIPTION" --region $HOME_REGION
+  
+    print_status "Searching for newly created Tag Namespace's ocid for $TAG_NAMESPACE"
+    NAMESPACE_OCID=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
+
+    print_status "Creating Tag Value, $TAG_NAME for $TAG_VALUE"
+    # Create a tag key with description
+    oci iam tag create --tag-namespace-id $NAMESPACE_OCID --name $TAG_NAME --description "$TAG_NAME_DESCRIPTION" --validator '{"validator-type": "ENUM", "values": ["'"$TAG_VALUE"'"]}' --region $HOME_REGION
+    
+    print_status "$TAG_NAMESPACE - Tag Namespace created successfully!"
+    print_status "$TAG_NAMESPACE - Tag Namespace OCID: $NAMESPACE_OCID"
+    print_status "$TAG_NAME - Tag Name created successfully!"
+
+    fi
+}
+
+delete_tag_namespace() {
+    ## This will delete the corresponding ComputeInstanceHostActions namespace
+
+    print_status "Searching for created TAG Namespace's ocid for $TAG_NAMESPACE"
+    NAMESPACE_OCID=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='ComputeInstanceHostActions'].id | [0]" --raw-output)
+  
+    print_status "Retiring $TAG_NAMESPACE with $NAMESPACE_OCID"
+    oci iam tag-namespace retire --tag-namespace-id $NAMESPACE_OCID --region $HOME_REGION
+    
+    print_status "Deleting $TAG_NAMESPACE with $NAMESPACE_OCID"
+    oci iam tag-namespace cascade-delete --tag-namespace-id $NAMESPACE_OCID --region $HOME_REGION
+
+    print_status "Delete Comlpete."
+
+}
 
 create_poc() {
 
@@ -479,6 +528,9 @@ else
 fi
 echo
 
+create_tag_namespace
+
+
 # Summary
 print_status "=== Setup Complete! ==="
 echo
@@ -486,8 +538,9 @@ print_status "Summary of created resources:"
 print_status "• Compartment $POC_COMPARTMENT_NAME: $POC_OCID"
 print_status "• User Group $HPC_GROUP_NAME : $GROUP_OCID"
 print_status "• Current User '$CURRENT_USERNAME' added to group"
-print_status "• Dynamic Group $HPC_DYNAMIC_GROUP_NAME : References instances in POC compartment"
+print_status "• Dynamic Group $HPC_DYNAMIC_GROUP_NAME : References instances in $POC_COMPARTMENT_NAME compartment"
 print_status "• Policy $HPC_POLICY_NAME : Contains all required permissions"
+print_status "• Tag Namespace $TAG_NAMESPACE, $TAG_NAME with value $TAG_VALUE created in root compartment"
 echo
 print_status "Your OCI environment is now ready for HPC deployment and for you to upload the HPC Images!"
 print_status "You have full access to the $POC_COMPARTMENT_NAME compartment through the $HPC_GROUP_NAME!"
@@ -645,19 +698,21 @@ delete_poc() {
     EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    EXISTING_NAMESPACE=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
 
     echo
-    echo -e  "${YELLOW}Summary of created resources targetted to be deleted:${NC}"
     print_status "• Tenancy Name: $TENANCY_NAME"
-    print_status "• Compartment Name: $POC_COMPARTMENT_NAME, ocid $EXISTING_COMPARTMENT"
-    print_status "• User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
-    print_status "• Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
-    print_status "• Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"
+    echo -e  "${YELLOW}Summary of created resources targeted to be deleted:${NC}"
+    print_status "• Compartment Name: $POC_COMPARTMENT_NAME, ocid: $EXISTING_COMPARTMENT"
+    print_status "• User Group Name: $HPC_GROUP_NAME, ocid: $EXISTING_GROUP"
+    print_status "• Policy Name: $HPC_POLICY_NAME, ocid: $EXISTING_POLICY"
+    print_status "• Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid: $EXISTING_DG"
+    print_status "• Tag Namespace: $TAG_NAMESPACE, ocid: $EXISTING_NAMESPACE"
     delete_resource_manager --dry-run
     delete_bv_backups --dry-run
     delete_images --dry-run
 
-        echo -e "${RED}Please confirm you want to delete the POC environment in this tenancy. (yes)${NC}"
+        echo -e "${RED}Please confirm you want to delete the POC environment in this tenancy. (You must type 'yes')${NC}"
         read dele
 
         if [ $dele == "yes" ]; then
@@ -688,6 +743,9 @@ delete_poc() {
             echo -e ""
             delete_images
 
+            echo -e ""
+            delete_tag_namespace
+
             if [ -n "$EXISTING_COMPARTMENT" ]; then 
             print_status "Deleting Compartment Name: $POC_COMPARTMENT_NAME, ocid $EXISTING_COMPARTMENT"
             oci iam compartment delete --compartment-id "$EXISTING_COMPARTMENT" --region $HOME_REGION
@@ -700,9 +758,7 @@ delete_poc() {
 main() {
     echo -e "${CYAN}What would you like to do,
                         ${YELLOW}1. Create POC Environment?
-                        2. Clean up tenancy for POC Environment?
-                        
-                        >${NC}"
+                        2. Clean up tenancy for POC Environment?${NC}"
 
     read action
 
