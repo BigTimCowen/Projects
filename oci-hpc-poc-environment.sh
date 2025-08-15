@@ -11,6 +11,11 @@ HPC_DYNAMIC_GROUP_NAME="oci_hpc_instance_principal"
 HPC_GROUP_NAME="OCI-HPC-POC-Group"
 HPC_POLICY_NAME="OCI-HPC-Deployment-Policies"
 
+HOME_REGION_KEY=$(oci iam tenancy get --tenancy-id $OCI_TENANCY --query "data.\"home-region-key\"" --raw-output)
+HOME_REGION=$(oci iam region list --query "data[?key=='$HOME_REGION_KEY'].name | [0]" --raw-output)
+
+echo "Home region: $HOME_REGION"
+
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,7 +24,7 @@ BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 WHITE='\033[0;37m'
-NC='\033[0m' # No Color (reset)
+NC='\033[0m' # No Color (reset)S
 
 # Function to print colored output
 print_status() {
@@ -39,7 +44,7 @@ print_error() {
 print_status "Getting tenancy OCID..."
 TENANCY_OCID=$OCI_TENANCY
 TENANCY_NAME=$(oci iam compartment get --compartment-id "$OCI_TENANCY" --output json | jq -r '.data.description')
-
+EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "$POC_COMPARTMENT_NAME" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
 
 print_status "Tenancy Name: $TENANCY_NAME"
 print_status "Tenancy OCID: $TENANCY_OCID"
@@ -61,15 +66,151 @@ print_status "Detected user: $CURRENT_USERNAME ($CURRENT_USER_OCID)"
 echo
 
 
+delete_resource_manager() {
+
+    COMPARTMENT_ID=$EXISTING_COMPARTMENT
+    SEARCH_TERM="Oracle Cloud HPC cluster"
+    DRY_RUN=false
+
+    # Get all compartments including root
+    #oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+
+    while [ -z "$COMPARTMENT_ID" ]; do
+        read -p "What is the Compartment OCID? " COMPARTMENT_ID
+    done
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --search-term)
+                SEARCH_TERM="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo -e "${CYAN}Simple OCI Resource Manager Stack Deletion Script"
+    echo "=============================================="
+    echo "Compartment: $COMPARTMENT_ID"
+    echo "Search term: $SEARCH_TERM"
+    echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
+    echo -e "${NC}"
+
+    # Step 1: Get all Resource Manager stacks
+    echo "Getting all Resource Manager stacks in compartment..."
+    ALL_STACKS=$(oci resource-manager stack list --compartment-id "$COMPARTMENT_ID" --all 2>/dev/null)
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to get Resource Manager stacks"
+        return 1
+    fi
+
+    # Step 2: Filter stacks by description containing search term
+    echo "Filtering stacks with description containing '$SEARCH_TERM'..."
+    FILTERED_STACKS=$(echo "$ALL_STACKS" | jq -r ".data[] | select(.description != null) | select(.description | contains(\"$SEARCH_TERM\")) | select(.\"lifecycle-state\" == \"ACTIVE\") | .id + \"|\" + .\"display-name\" + \"|\" + .\"lifecycle-state\" + \"|\" + .description")
+
+    if [[ -z "$FILTERED_STACKS" ]]; then
+        echo "No Resource Manager stacks found with description containing '$SEARCH_TERM'"
+        return 0
+    fi
+
+    # Step 3: Display found stacks
+    echo ""
+    echo "Found Resource Manager stacks with description containing '$SEARCH_TERM':"
+    echo "======================================================================"
+    printf "%-40s %-15s %-15s %s\n" "DISPLAY NAME" "STATE" "OCID" "DESCRIPTION"
+    echo "$(printf '%*s' 120 | tr ' ' '-')"
+
+    echo "$FILTERED_STACKS" | while IFS='|' read -r ocid name state description; do
+        printf "%-40s %-15s %-15s %s\n" "$name" "$state" "${ocid:0:15}..." "${description:0:50}..."
+    done
+
+    # Count stacks
+    STACK_COUNT=$(echo "$FILTERED_STACKS" | wc -l)
+    echo ""
+    echo "Total stacks: $STACK_COUNT"
+
+    # Step 4: Confirm deletion
+    if [[ "$DRY_RUN" == false ]]; then
+        echo ""
+        echo "WARNING: This will permanently delete $STACK_COUNT Resource Manager stack(s)!"
+        echo "Note: Any running jobs will be terminated and all associated resources may be affected."
+        read -p "Type 'yes' to confirm deletion: " confirm
+        
+        if [[ "$confirm" != "yes" ]]; then
+            echo "Deletion cancelled"
+            return 0
+        fi
+        
+        # Step 5: Delete stacks
+        echo ""
+        echo "Deleting Resource Manager stacks..."
+        echo "$FILTERED_STACKS" | while IFS='|' read -r ocid name state description; do
+            echo "Deleting: $name ($ocid)"
+            
+            # Check for running jobs first
+            RUNNING_JOBS=$(oci resource-manager job list --stack-id "$ocid" --lifecycle-state IN_PROGRESS --query "length(data)" --raw-output 2>/dev/null)
+            
+            if [[ "$RUNNING_JOBS" -gt 0 ]]; then
+                echo "  ⚠ Warning: Stack has $RUNNING_JOBS running job(s). Cancelling jobs first..."
+                # Cancel running jobs
+                oci resource-manager job list --stack-id "$ocid" --lifecycle-state IN_PROGRESS --query "data[*].id" --raw-output 2>/dev/null | while read -r job_id; do
+                    if [[ -n "$job_id" ]]; then
+                        echo "    Cancelling job: $job_id"
+                        oci resource-manager job cancel --job-id "$job_id" --force 2>/dev/null
+                    fi
+                done
+                echo "    Waiting for jobs to cancel..."
+                sleep 10
+            fi
+            
+            # Delete the stack
+            oci resource-manager stack delete --stack-id "$ocid" --force 2>/dev/null
+            DELETE_RESULT=$?
+            
+            if [[ $DELETE_RESULT -eq 0 ]]; then
+                echo "  ✓ Deletion initiated successfully"
+            else
+                echo "  ✗ Deletion failed (exit code: $DELETE_RESULT)"
+                # Try to get more specific error info
+                echo "  Attempting to get stack details..."
+                oci resource-manager stack get --stack-id "$ocid" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || echo "  Stack may have dependencies or active resources"
+            fi
+            echo ""
+        done
+        
+    else
+        echo ""
+        echo "This is a dry run and if actually ran would delete $STACK_COUNT Resource Manager stacks"
+        
+        # Show what would be deleted in dry run mode
+        echo ""
+        echo "Stacks that would be deleted:"
+        echo "$FILTERED_STACKS" | while IFS='|' read -r ocid name state description; do
+            echo "  - $name ($ocid)"
+            echo "    Description: $description"
+            echo "    State: $state"
+            echo ""
+        done
+    fi
+}
+
 delete_images() {
 
-                COMPARTMENT_ID=
+                COMPARTMENT_ID=$EXISTING_COMPARTMENT
                 SEARCH_TERM="OFED"
                 DRY_RUN=false
 
 
                 # Get all compartments including root
-                oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+                #oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
 
                 while [ -z $COMPARTMENT_ID ]; do
                         read -p "What is the Compartment OCID? " COMPARTMENT_ID
@@ -78,35 +219,35 @@ delete_images() {
 
                 # Parse arguments
                 while [[ $# -gt 0 ]]; do
-                case $1 in
-                        --dry-run)
-                        DRY_RUN=true
-                        shift
-                        ;;
-                        --search-term)
-                        SEARCH_TERM="$2"
-                        shift 2
-                        ;;
-                        *)
-                        shift
-                        ;;
-                esac
+                    case $1 in
+                            --dry-run)
+                            DRY_RUN=true
+                            shift
+                            ;;
+                            --search-term)
+                            SEARCH_TERM="$2"
+                            shift 2
+                            ;;
+                            *)
+                            shift
+                            ;;
+                    esac
                 done
 
-                echo "Simple OCI Image Script"
+                echo -e "${CYAN}Simple OCI Custom Image Deletion Script"
                 echo "================================"
                 echo "Compartment: $COMPARTMENT_ID"
                 echo "Search term: $SEARCH_TERM"
                 echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
-                echo ""
+                echo -e "${NC}"
 
                 # Step 1: Get all images (avoiding JMESPath filtering)
                 echo "Getting all images in compartment..."
                 ALL_IMAGES=$(oci compute image list --all --compartment-id "$COMPARTMENT_ID" 2>/dev/null)
 
                 if [[ $? -ne 0 ]]; then
-                echo "Error: Failed to get images"
-                exit 1
+                    echo "Error: Failed to get images"
+                    return 1
                 fi
 
                 # Step 2: Filter using jq instead of JMESPath
@@ -114,8 +255,8 @@ delete_images() {
                 FILTERED_IMAGES=$(echo "$ALL_IMAGES" | jq -r ".data[] | select(.\"display-name\" | contains(\"$SEARCH_TERM\")) | select(.publisher != \"Oracle\" and .publisher != \"Canonical\") | .id + \"|\" + .\"display-name\" + \"|\" + .\"lifecycle-state\"")
 
                 if [[ -z "$FILTERED_IMAGES" ]]; then
-                echo "No custom images found containing '$SEARCH_TERM'"
-                exit 0
+                    echo "No custom images found containing '$SEARCH_TERM'"
+                    return 0
                 fi
 
                 # Step 3: Display found images
@@ -347,7 +488,7 @@ print_status "You have full access to the $POC_COMPARTMENT_NAME compartment thro
 }
 
 delete_bv_backups() {
-    COMPARTMENT_ID=$POC_OCID
+    COMPARTMENT_ID=$EXISTING_COMPARTMENT
     DRY_RUN=false
 
     # Get all compartments including root
@@ -370,11 +511,11 @@ delete_bv_backups() {
         esac
     done
 
-    echo "Simple OCI Boot Volume Backup Script"
+    echo -e "${CYAN}Simple OCI Boot Volume Backup Script"
     echo "================================"
     echo "Compartment: $COMPARTMENT_ID"
     echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
-    echo ""
+    echo -e "${NC}"
 
     # Step 1: Get all boot volume backups
     echo "Getting all boot volume backups in compartment..."
@@ -384,7 +525,7 @@ delete_bv_backups() {
     
     if [[ $? -ne 0 ]]; then
         echo "Error: Failed to get boot volume backups"
-        exit 1
+        return 1
     fi
 
     # Convert JSON array to newline-separated list
@@ -497,20 +638,15 @@ delete_poc() {
     EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
-    ##NEed to add logic to delete boot-volume-backups
-    ##oci bv boot-volume-backup list --compartment-id $EXISTING_COMPARTMENT
-    
-
-    ##Need to add logic to delete Custom Images
-    delete_images
 
     echo
-    print_status "Summary of created resources:"
+    echo -e  "${YELLOW}Summary of created resources targetted to be deleted:${NC}"
     print_status "• Tenancy Name: $TENANCY_NAME"
     print_status "• Compartment Name: $POC_COMPARTMENT_NAME, ocid $EXISTING_COMPARTMENT"
     print_status "• User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
     print_status "• Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
     print_status "• Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"
+    delete_resource_manager --dry-run
     delete_bv_backups --dry-run
     delete_images --dry-run
 
@@ -518,13 +654,39 @@ delete_poc() {
         read dele
 
         if [ $dele == "yes" ]; then
-            print_status "Deleting"
-            oci iam compartment delete --compartment-id $EXISTING_COMPARTMENT
-            oci iam group delete --group-id $EXISTING_GROUP
-            oci iam policy delete --compartment-id $EXISTING_COMPARTMENT --policy-id $EXISTING_POLICY
-            oci iam dynamic-group delete --dynamic-group-id $EXISTING_DG
+            
+
+
+            if [ -n "$EXISTING_GROUP" ]; then
+            print_status "Deleting User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
+            oci iam group delete --group-id "$EXISTING_GROUP"
+            fi
+
+            if [ -n "$EXISTING_POLICY" ]; then
+            print_status "Deleting Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
+            oci iam policy delete  --policy-id "$EXISTING_POLICY"
+            fi
+
+            if [ -n "$EXISTING_DG" ]; then
+            print_status "Deleting Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"    
+            oci iam dynamic-group delete --dynamic-group-id "$EXISTING_DG"
+            fi
+
+            echo -e ""
+            delete_resource_manager
+
+            echo -e ""
             delete_bv_backups
+
+            echo -e ""
             delete_images
+
+            if [ -n "$EXISTING_COMPARTMENT" ]; then 
+            print_status "Deleting Compartment Name: $POC_COMPARTMENT_NAME, ocid $EXISTING_COMPARTMENT"
+            oci iam compartment delete --compartment-id "$EXISTING_COMPARTMENT" --region $HOME_REGION
+            fi
+
+            echo -e "${GREEN}Clean up of environment complete, exiting.${NC}"
         fi
 }
 
