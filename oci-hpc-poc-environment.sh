@@ -336,6 +336,7 @@ else
         --name "$POC_COMPARTMENT_NAME" \
         --description "Proof of Concept compartment for HPC deployment" \
         --wait-for-state "ACTIVE" \
+        --region "$HOME_REGION" \
         --max-wait-seconds 300)
     
     POC_OCID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
@@ -365,6 +366,7 @@ else
     CREATE_GROUP_RESULT=$(oci iam group create \
         --compartment-id "$TENANCY_OCID" \
         --name "$HPC_GROUP_NAME" \
+        --region "$HOME_REGION" \
         --description "Group for users with access to POC HPC resources")
     
     GROUP_OCID=$(echo "$CREATE_GROUP_RESULT" | jq -r '.data.id')
@@ -392,7 +394,8 @@ else
     # Add user to group
     oci iam group add-user \
         --group-id "$GROUP_OCID" \
-        --user-id "$CURRENT_USER_OCID" >/dev/null
+        --user-id "$CURRENT_USER_OCID" \
+        --region "$HOME_REGION" >/dev/null
     
     print_status "User $CURRENT_USERNAME added to $HPC_GROUP_NAME successfully!"
 fi
@@ -414,7 +417,8 @@ else
         --compartment-id "$TENANCY_OCID" \
         --name "$HPC_DYNAMIC_GROUP_NAME" \
         --description "Dynamic group for instances in POC compartment" \
-        --matching-rule "$MATCHING_RULE")
+        --matching-rule "$MATCHING_RULE" \
+        --region "$HOME_REGION")
     
     DG_OCID=$(echo "$CREATE_DG_RESULT" | jq -r '.data.id')
     
@@ -458,7 +462,8 @@ else
         --compartment-id "$TENANCY_OCID" \
         --name "$HPC_POLICY_NAME" \
         --description "Policies for HPC deployment in POC compartment" \
-        --statements "$POLICY_STATEMENTS")
+        --statements "$POLICY_STATEMENTS" \
+        --region "$HOME_REGION")
     
     POLICY_OCID=$(echo "$CREATE_POLICY_RESULT" | jq -r '.data.id')
     
@@ -482,7 +487,7 @@ print_status "• Current User '$CURRENT_USERNAME' added to group"
 print_status "• Dynamic Group $HPC_DYNAMIC_GROUP_NAME : References instances in POC compartment"
 print_status "• Policy $HPC_POLICY_NAME : Contains all required permissions"
 echo
-print_status "Your OCI environment is now ready for HPC deployment!"
+print_status "Your OCI environment is now ready for HPC deployment and for you to upload the HPC Images!"
 print_status "You have full access to the $POC_COMPARTMENT_NAME compartment through the $HPC_GROUP_NAME!"
 
 }
@@ -659,17 +664,17 @@ delete_poc() {
 
             if [ -n "$EXISTING_GROUP" ]; then
             print_status "Deleting User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
-            oci iam group delete --group-id "$EXISTING_GROUP"
+            oci iam group delete --group-id "$EXISTING_GROUP" --region "$HOME_REGION"
             fi
 
             if [ -n "$EXISTING_POLICY" ]; then
             print_status "Deleting Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
-            oci iam policy delete  --policy-id "$EXISTING_POLICY"
+            oci iam policy delete  --policy-id "$EXISTING_POLICY" --region "$HOME_REGION"
             fi
 
             if [ -n "$EXISTING_DG" ]; then
             print_status "Deleting Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"    
-            oci iam dynamic-group delete --dynamic-group-id "$EXISTING_DG"
+            oci iam dynamic-group delete --dynamic-group-id "$EXISTING_DG" --region "$HOME_REGION"
             fi
 
             echo -e ""
