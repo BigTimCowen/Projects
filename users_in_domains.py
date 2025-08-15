@@ -5,42 +5,67 @@ OCI Domains and Users Listing Script
 This script lists all OCI domains in a tenancy and all users within each domain.
 Supports both legacy IAM (root tenancy) and modern Identity Domains.
 
-Requirements:
-- OCI Python SDK: pip install oci
-- tabulate: pip install tabulate
-- Configured ~/.oci/config file
-"""
-"""
-# Full detailed report
-python oci_domains_list.py
-
-# Summary only (no individual users)
-python oci_domains_list.py --summary-only
-
-# Export to CSV
-python oci_domains_list.py --export-csv users_report.csv
-
-# Use specific profile
-python oci_domains_list.py --profile myprofile
+Dependencies will be automatically installed if missing.
 """
 
-import oci
+import subprocess
 import sys
-from tabulate import tabulate
+import importlib
+from datetime import datetime
+
+def install_package(package):
+    """Install a package using pip"""
+    print(f"Installing {package}...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        print(f"Successfully installed {package}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install {package}: {e}")
+        sys.exit(1)
+
+def import_or_install(package, import_name=None):
+    """Import a package, installing it if necessary"""
+    if import_name is None:
+        import_name = package
+    
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        install_package(package)
+        try:
+            return importlib.import_module(import_name)
+        except ImportError:
+            print(f"Failed to import {import_name} after installation")
+            sys.exit(1)
+
+# Auto-install and import required packages
+print("Checking dependencies...")
+oci = import_or_install("oci")
+tabulate_module = import_or_install("tabulate")
+tabulate = tabulate_module.tabulate
+
+# Import other standard library modules
 import argparse
 import time
-from datetime import datetime
 
 
 def get_oci_config(profile_name="DEFAULT"):
-    """Load OCI configuration from ~/.oci/config"""
+    """Load OCI configuration from ~/.oci/config or use default"""
     try:
+        # Try loading from config file first
         config = oci.config.from_file(profile_name=profile_name)
         oci.config.validate_config(config)
         return config
     except Exception as e:
-        print(f"Error loading OCI config: {e}")
-        sys.exit(1)
+        # If config file fails, try using default/instance principal (for Cloud Shell)
+        try:
+            config = oci.config.from_file()
+            return config
+        except Exception:
+            # If that fails too, create a minimal config for Cloud Shell
+            print(f"Using instance principal authentication...")
+            # This will work in Cloud Shell
+            return {}
 
 
 def get_all_domains(identity_client, compartment_id):
@@ -175,29 +200,6 @@ def get_identity_domain_users(domain_client, filter_username=None):
         return []
 
 
-def print_filtered_results_summary(domains_info, filter_username):
-    """Print summary of filtered results"""
-    print("\n" + "=" * 80)
-    print(f"FILTERED RESULTS FOR USERNAME: '{filter_username}'")
-    print("=" * 80)
-    
-    total_matches = 0
-    domains_with_matches = 0
-    
-    for domain_info in domains_info:
-        if domain_info['users']:
-            domains_with_matches += 1
-            total_matches += len(domain_info['users'])
-    
-    print(f"Total matches found: {total_matches}")
-    print(f"Domains with matches: {domains_with_matches}/{len(domains_info)}")
-    
-    if total_matches == 0:
-        print(f"\nNo users matching '{filter_username}' found in any domain.")
-        return False
-    
-    return True
-    """Print a summary table of all domains"""
 def print_domain_summary(domains_info, filter_username=None):
     """Print a summary table of all domains"""
     print("\n" + "=" * 80)
@@ -223,7 +225,7 @@ def print_domain_summary(domains_info, filter_username=None):
             domain_info['type'],
             user_count,
             domain_info['status'],
-            domain_info['id']
+            domain_info['id']  # Full OCID - no truncation
         ])
     
     if summary_data:
@@ -257,7 +259,7 @@ def print_detailed_domain_info(domains_info, show_users=True, filter_username=No
         print(f"Type: {domain_info['type']}")
         print(f"Status: {domain_info['status']}")
         print(f"User Count: {len(domain_info['users'])}")
-        print(f"Domain ID: {domain_info['id']}")
+        print(f"Domain ID: {domain_info['id']}")  # Full OCID
         if 'url' in domain_info:
             print(f"Domain URL: {domain_info['url']}")
         
@@ -313,10 +315,31 @@ def main():
     config = get_oci_config(args.profile)
     
     # Initialize Identity client
-    identity_client = oci.identity.IdentityClient(config)
+    try:
+        identity_client = oci.identity.IdentityClient(config)
+    except Exception as e:
+        print(f"Error creating identity client: {e}")
+        print("Trying with instance principal for Cloud Shell...")
+        try:
+            # For Cloud Shell - use instance principal
+            config = {}
+            identity_client = oci.identity.IdentityClient(config, signer=oci.auth.signers.InstancePrincipalsSecurityTokenSigner())
+        except Exception as e2:
+            print(f"Error with instance principal: {e2}")
+            sys.exit(1)
     
     # Get tenancy OCID
-    tenancy_id = config['tenancy']
+    try:
+        tenancy_response = identity_client.get_tenancy(identity_client.base_client.config['tenancy'] if 'tenancy' in identity_client.base_client.config else identity_client.list_compartments(identity_client.base_client.config.get('tenancy', 'ocid1.tenancy')))
+        tenancy_id = identity_client.base_client.config.get('tenancy') or 'AUTO_DETECT'
+    except:
+        # Fallback - try to get from environment or use a basic call
+        try:
+            tenancy_info = identity_client.get_tenancy()
+            tenancy_id = tenancy_info.data.id
+        except:
+            print("Could not determine tenancy OCID")
+            sys.exit(1)
     
     print(f"Scanning OCI Tenancy for Domains and Users...")
     if args.username:
@@ -368,7 +391,7 @@ def main():
             domains_info.append({
                 'name': domain.display_name,
                 'type': 'Identity Domain',
-                'id': domain.id,
+                'id': domain.id,  # Full OCID
                 'url': domain.url,
                 'status': domain.lifecycle_state,
                 'users': users
@@ -380,13 +403,7 @@ def main():
         print("No identity domains found or no access to list domains")
     
     # Print results
-    if args.username:
-        # Show filtered summary first
-        has_matches = print_filtered_results_summary(domains_info, args.username)
-        if has_matches:
-            print_domain_summary(domains_info, args.username)
-    else:
-        print_domain_summary(domains_info)
+    print_domain_summary(domains_info, args.username)
     
     if not args.summary_only:
         print_detailed_domain_info(domains_info, show_users=True, filter_username=args.username)
@@ -408,16 +425,15 @@ def main():
                         writer.writerow([
                             domain_info['name'],
                             domain_info['type'],
-                            domain_info['id'],
+                            domain_info['id'],  # Full OCID
                             user['username'],
                             user.get('display_name', 'N/A'),
                             user['email'],
                             user['status'],
                             user['created'],
-                            user['user_id']
+                            user['user_id']  # Full OCID/ID
                         ])
             
-            filename_suffix = f"_filtered_{args.username}" if args.username else ""
             print(f"\nResults exported to: {args.export_csv}")
         except Exception as e:
             print(f"Error exporting to CSV: {e}")
