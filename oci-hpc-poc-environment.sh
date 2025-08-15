@@ -1,11 +1,13 @@
 #!/bin/bash
-
+# v1.0.0
 # OCI POC Setup Script with User Group Management
 # Creates compartment
 # Groups - OCI-HPC-POC-Group, 
 # Dynamic group - oci_hpc_instance_principal
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
+# Run this script in the OCI Shell of an admin users of the tenancy
+
 POC_COMPARTMENT_NAME="POC"
 HPC_DYNAMIC_GROUP_NAME="oci_hpc_instance_principal"
 HPC_GROUP_NAME="OCI-HPC-POC-Group"
