@@ -2,7 +2,7 @@
 ## v1.0.0
 ## Script used to simplify determining limits for GPU deployments
 ## modify ad, gpu and provide the tenancy ocid
-## run in the oci shell of the tenancy.
+## run in the oci shell of the tenancy
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
