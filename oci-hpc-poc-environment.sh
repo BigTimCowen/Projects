@@ -61,6 +61,113 @@ print_status "Detected user: $CURRENT_USERNAME ($CURRENT_USER_OCID)"
 echo
 
 
+delete_images() {
+
+                COMPARTMENT_ID=
+                SEARCH_TERM="OFED"
+                DRY_RUN=false
+
+
+                # Get all compartments including root
+                oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+
+                while [ -z $COMPARTMENT_ID ]; do
+                        read -p "What is the Compartment OCID? " COMPARTMENT_ID
+                done
+
+
+                # Parse arguments
+                while [[ $# -gt 0 ]]; do
+                case $1 in
+                        --dry-run)
+                        DRY_RUN=true
+                        shift
+                        ;;
+                        --search-term)
+                        SEARCH_TERM="$2"
+                        shift 2
+                        ;;
+                        *)
+                        shift
+                        ;;
+                esac
+                done
+
+                echo "Simple OCI Image Script"
+                echo "================================"
+                echo "Compartment: $COMPARTMENT_ID"
+                echo "Search term: $SEARCH_TERM"
+                echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
+                echo ""
+
+                # Step 1: Get all images (avoiding JMESPath filtering)
+                echo "Getting all images in compartment..."
+                ALL_IMAGES=$(oci compute image list --all --compartment-id "$COMPARTMENT_ID" 2>/dev/null)
+
+                if [[ $? -ne 0 ]]; then
+                echo "Error: Failed to get images"
+                exit 1
+                fi
+
+                # Step 2: Filter using jq instead of JMESPath
+                echo "Filtering images containing '$SEARCH_TERM'..."
+                FILTERED_IMAGES=$(echo "$ALL_IMAGES" | jq -r ".data[] | select(.\"display-name\" | contains(\"$SEARCH_TERM\")) | select(.publisher != \"Oracle\" and .publisher != \"Canonical\") | .id + \"|\" + .\"display-name\" + \"|\" + .\"lifecycle-state\"")
+
+                if [[ -z "$FILTERED_IMAGES" ]]; then
+                echo "No custom images found containing '$SEARCH_TERM'"
+                exit 0
+                fi
+
+                # Step 3: Display found images
+                echo ""
+                echo "Found custom images containing '$SEARCH_TERM':"
+                echo "=============================================="
+                printf "%-50s %-15s %s\n" "DISPLAY NAME" "STATE" "OCID"
+                echo "$(printf '%*s' 100 | tr ' ' '-')"
+
+                echo "$FILTERED_IMAGES" | while IFS='|' read -r ocid name state; do
+                printf "%-50s %-15s %s\n" "$name" "$state" "${ocid:0:40}..."
+                done
+
+                # Count images
+                IMAGE_COUNT=$(echo "$FILTERED_IMAGES" | wc -l)
+                echo ""
+                echo "Total images: $IMAGE_COUNT"
+                
+
+                # Step 4: Confirm deletion
+                if [[ "$DRY_RUN" == false ]]; then
+                echo ""
+                echo "WARNING: This will permanently delete $IMAGE_COUNT image(s)!"
+                read -p "Type 'yes' to confirm deletion: " confirm
+                
+                if [[ "$confirm" != "yes" ]]; then
+                        echo "Deletion cancelled"
+                        exit 0
+                fi
+                
+                # Step 5: Delete images
+                echo ""
+                echo "Deleting images..."
+                echo "$FILTERED_IMAGES" | while IFS='|' read -r ocid name state; do
+                        echo "Deleting: $name ($ocid)"
+                        oci compute image delete --image-id "$ocid" --force
+                        if [[ $? -eq 0 ]]; then
+                        echo "  ✓ Deletion initiated successfully"
+                        else
+                        echo "  ✗ Deletion failed"
+                        fi
+                        echo ""
+                done
+                else
+                echo ""
+                if [[ "$DRY_RUN" ]]; then
+                        echo "This is a dry run and if actually ran would delete $IMAGE_COUNT images"
+                fi
+                fi
+
+}
+
 
 
 create_poc() {
@@ -239,6 +346,150 @@ print_status "You have full access to the $POC_COMPARTMENT_NAME compartment thro
 
 }
 
+delete_bv_backups() {
+    COMPARTMENT_ID=$POC_OCID
+    DRY_RUN=false
+
+    # Get all compartments including root
+    ##oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+
+    while [ -z "$COMPARTMENT_ID" ]; do
+        read -p "What is the Compartment OCID? " COMPARTMENT_ID
+    done
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo "Simple OCI Boot Volume Backup Script"
+    echo "================================"
+    echo "Compartment: $COMPARTMENT_ID"
+    echo "Mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "DELETE")"
+    echo ""
+
+    # Step 1: Get all boot volume backups
+    echo "Getting all boot volume backups in compartment..."
+    
+    # Get backup IDs for processing - only AVAILABLE backups
+    BACKUP_IDS_RAW=$(oci bv boot-volume-backup list --compartment-id "$COMPARTMENT_ID" --lifecycle-state AVAILABLE --query "data[*].id" --raw-output 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to get boot volume backups"
+        exit 1
+    fi
+
+    # Convert JSON array to newline-separated list
+    BACKUP_IDS=$(echo "$BACKUP_IDS_RAW" | jq -r '.[]' 2>/dev/null)
+    
+    # If jq fails, try parsing the raw output directly
+    if [[ $? -ne 0 || -z "$BACKUP_IDS" ]]; then
+        # Fallback: try to extract OCIDs directly from raw output
+        BACKUP_IDS=$(echo "$BACKUP_IDS_RAW" | grep -o 'ocid1\.bootvolumebackup\.[^"]*' 2>/dev/null)
+    fi
+
+    # Count backups
+    BV_BACKUP_COUNT=$(echo "$BACKUP_IDS" | grep -c "ocid1.bootvolumebackup" 2>/dev/null)
+    echo ""
+    echo "Total AVAILABLE boot volume backups to process: $BV_BACKUP_COUNT"
+
+    if [[ $BV_BACKUP_COUNT -eq 0 ]]; then
+        echo "No backups found to delete."
+        return 0
+    fi
+
+    # Step 4: Confirm deletion
+    if [[ "$DRY_RUN" == "false" ]]; then
+        echo ""
+        echo "WARNING: This will permanently delete $BV_BACKUP_COUNT boot volume backup(s)!"
+        read -p "Type 'yes' to confirm deletion: " confirm
+        
+        if [[ "$confirm" != "yes" ]]; then
+            echo "Deletion cancelled"
+            return 0
+        fi
+        
+        # Step 5: Delete boot volume backups
+        echo ""
+        echo "Deleting boot volume backups..."
+        
+        # Debug: Show what we're processing
+        echo "Debug: Processing backup IDs:"
+        echo "$BACKUP_IDS" | head -3
+        echo ""
+        
+        while IFS= read -r backup_id; do
+            # Skip empty lines
+            if [[ -z "$backup_id" ]]; then
+                continue
+            fi
+            
+            # Clean up any extra whitespace or quotes
+            backup_id=$(echo "$backup_id" | tr -d '"' | xargs)
+            
+            if [[ "$backup_id" =~ ^ocid1\.bootvolumebackup\. ]]; then
+                # Double-check the backup state before deletion
+                BACKUP_STATE=$(oci bv boot-volume-backup get --boot-volume-backup-id "$backup_id" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
+                BACKUP_NAME=$(oci bv boot-volume-backup get --boot-volume-backup-id "$backup_id" --query "data.\"display-name\"" --raw-output 2>/dev/null)
+                
+                if [[ "$BACKUP_STATE" != "AVAILABLE" ]]; then
+                    echo "Skipping: ${BACKUP_NAME:-Unknown} ($backup_id) - State: $BACKUP_STATE"
+                    continue
+                fi
+                
+                echo "Deleting: ${BACKUP_NAME:-Unknown} ($backup_id) - State: $BACKUP_STATE"
+                
+                # Delete with --force flag and wait for termination
+                oci bv boot-volume-backup delete --boot-volume-backup-id "$backup_id" --force --wait-for-state TERMINATED 2>/dev/null
+                DELETE_RESULT=$?
+                
+                if [[ $DELETE_RESULT -eq 0 ]]; then
+                    echo "  ✓ Deletion completed successfully"
+                else
+                    echo "  ✗ Deletion failed (exit code: $DELETE_RESULT)"
+                    # Try to get more specific error info
+                    echo "  Attempting deletion without wait state..."
+                    oci bv boot-volume-backup delete --boot-volume-backup-id "$backup_id" --force 2>&1 | head -1
+                fi
+                echo ""
+            else
+                echo "Skipping invalid backup ID: '$backup_id'"
+            fi
+        done <<< "$BACKUP_IDS"
+        
+    else
+        echo ""
+        echo "This is a dry run and if actually ran would delete $BV_BACKUP_COUNT AVAILABLE boot volume backups"
+        
+        # Show what would be deleted in dry run mode
+        echo ""
+        echo "AVAILABLE backups that would be deleted:"
+        while IFS= read -r backup_id; do
+            # Skip empty lines
+            if [[ -z "$backup_id" ]]; then
+                continue
+            fi
+            
+            # Clean up any extra whitespace or quotes
+            backup_id=$(echo "$backup_id" | tr -d '"' | xargs)
+            
+            if [[ "$backup_id" =~ ^ocid1\.bootvolumebackup\. ]]; then
+                BACKUP_STATE=$(oci bv boot-volume-backup get --boot-volume-backup-id "$backup_id" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
+                BACKUP_NAME=$(oci bv boot-volume-backup get --boot-volume-backup-id "$backup_id" --query "data.\"display-name\"" --raw-output 2>/dev/null)
+                echo "  - ${BACKUP_NAME:-Unknown} ($backup_id) - State: $BACKUP_STATE"
+            fi
+        done <<< "$BACKUP_IDS"
+    fi
+}
+
 delete_poc() {
 
 
@@ -246,7 +497,13 @@ delete_poc() {
     EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    ##NEed to add logic to delete boot-volume-backups
+    ##oci bv boot-volume-backup list --compartment-id $EXISTING_COMPARTMENT
     
+
+    ##Need to add logic to delete Custom Images
+    delete_images
+
     echo
     print_status "Summary of created resources:"
     print_status "• Tenancy Name: $TENANCY_NAME"
@@ -254,7 +511,9 @@ delete_poc() {
     print_status "• User Group Name: $HPC_GROUP_NAME, ocid $EXISTING_GROUP"
     print_status "• Policy Name: $HPC_POLICY_NAME, ocid $EXISTING_POLICY"
     print_status "• Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"
-    
+    delete_bv_backups --dry-run
+    delete_images --dry-run
+
         echo -e "${RED}Please confirm you want to delete the POC environment in this tenancy. (yes)${NC}"
         read dele
 
@@ -264,6 +523,8 @@ delete_poc() {
             oci iam group delete --group-id $EXISTING_GROUP
             oci iam policy delete --compartment-id $EXISTING_COMPARTMENT --policy-id $EXISTING_POLICY
             oci iam dynamic-group delete --dynamic-group-id $EXISTING_DG
+            delete_bv_backups
+            delete_images
         fi
 }
 
