@@ -1,3 +1,4 @@
+#!/bin/bash
 ## Author: Tim Cowen (tim.cowen@oracle)
 ## v1.0.0
 ## Script used to simplify determining limits for GPU deployments

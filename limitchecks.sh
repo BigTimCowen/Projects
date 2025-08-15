@@ -1,4 +1,5 @@
 
+#!/bin/bash
 ## v1.0.0
 ## Script used to simplify determining limits for GPU deployments
 ## modify ad, gpu and provide the tenancy ocid
