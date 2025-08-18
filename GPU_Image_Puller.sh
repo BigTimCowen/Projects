@@ -614,42 +614,355 @@ delete_images() {
 
 }
 
-compartment_lister() {
-        # Simple OCI Compartment Lister
-        # Usage: ./simple_list_compartments.sh [tenancy-ocid]
+#!/bin/bash
 
-        # Check if tenancy OCID is provided as argument
-        if [ $# -eq 1 ]; then
-        TENANCY_ID="$1"
-        else
-        # Try to get tenancy OCID from config
-        echo "No tenancy OCID provided. Trying to get from OCI config..."
-        TENANCY_ID=$(oci iam tenancy get --query "data.id" --raw-output 2>/dev/null)
+check_images() {
+    SEARCH_TERM="OFED"
+    REQUIRED_SHAPES=()
+    CHECK_ALL_SHAPES=false
+    VERBOSE=false
+    NO_ALTERNATIVE_CHECK=false
+    
+    # Default GPU shapes from official OCI documentation
+    DEFAULT_SHAPES=(
+        # Bare Metal GPU Shapes
+        "BM.GPU2.2"           # 2x P100 16GB
+        "BM.GPU3.8"           # 8x V100 16GB
+        "BM.GPU4.8"           # 8x A100 40GB
+        "BM.GPU.A10.4"        # 4x A10 24GB
+        "BM.GPU.A100-v2.8"    # 8x A100 80GB
+        "BM.GPU.MI300X.8"     # 8x MI300X 192GB (AMD)
+        "BM.GPU.L40S.4"       # 4x L40S 48GB
+        "BM.GPU.H100.8"       # 8x H100 80GB
+        "BM.GPU.H200.8"       # 8x H200 141GB
+        "BM.GPU.B200.8"       # 8x B200 180GB
+        "BM.GPU.GB200.4"      # 4x B200 192GB (Grace Blackwell)
+        # Virtual Machine GPU Shapes
+        "VM.GPU2.1"           # 1x P100 16GB
+        "VM.GPU3.1"           # 1x V100 16GB
+        "VM.GPU3.2"           # 2x V100 16GB
+        "VM.GPU3.4"           # 4x V100 16GB
+        "VM.GPU.A10.1"        # 1x A10 24GB
+        "VM.GPU.A10.2"        # 2x A10 24GB
+    )
 
-        if [ $? -ne 0 ] || [ -z "$TENANCY_ID" ]; then
-                echo "Error: Could not get tenancy OCID from config."
-                echo "Usage: $0 <tenancy-ocid>"
-                echo "Example: $0 ocid1.tenancy.oc1..aaaaaaaa..."
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --search-term)
+                SEARCH_TERM="$2"
+                shift 2
+                ;;
+            --shapes)
+                # Parse comma-separated shapes
+                IFS=',' read -ra REQUIRED_SHAPES <<< "$2"
+                shift 2
+                ;;
+            --check-all-shapes)
+                CHECK_ALL_SHAPES=true
+                shift
+                ;;
+            --debug)
+                set -x
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --help)
+                echo "Usage: $0 [OPTIONS]"
                 echo ""
-                echo "Or configure OCI CLI first:"
-                echo "oci setup config"
-                exit 1
-        fi
-        fi
+                echo "Options:"
+                echo "  --search-term TERM       Search for images containing TERM (default: OFED)"
+                echo "  --shapes SHAPE1,SHAPE2   Comma-separated list of shapes to check"
+                echo "  --check-all-shapes       Show all compatible shapes instead of checking specific ones"
+                echo "  --debug                  Enable debug mode"
+                echo "  --verbose                Enable verbose output"
+                echo "  --help                   Show this help"
+                echo ""
+                echo "Examples:"
+                echo "  $0 --shapes 'BM.GPU4.8,VM.GPU.A10.1'"
+                echo "  $0 --check-all-shapes"
+                echo "  $0 --search-term CUDA --shapes 'BM.GPU4.8'"
+                exit 0
+                ;;
+            --no-alternative-check)
+                NO_ALTERNATIVE_CHECK=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
 
-        echo "Using tenancy: $TENANCY_ID"
+    # Use default shapes if none provided
+    if [[ ${#REQUIRED_SHAPES[@]} -eq 0 ]]; then
+        REQUIRED_SHAPES=("${DEFAULT_SHAPES[@]}")
+    fi
+
+    echo "OCI OFED Image Shape Compatibility Checker"
+    echo "=========================================="
+    echo "Compartment: $COMPARTMENT_ID"
+    echo "Search term: $SEARCH_TERM"
+    if [[ "$CHECK_ALL_SHAPES" == true ]]; then
+        echo "Mode: Check all compatible shapes"
+    else
+        echo "Required shapes: ${REQUIRED_SHAPES[*]}"
+    fi
+    echo ""
+
+    # Step 1: Get all images
+    echo "Getting all images in compartment..."
+    ALL_IMAGES=$(oci compute image list --all --compartment-id "$COMP_OCID" 2>/dev/null)
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to get images"
+        exit 1
+    fi
+
+    # Step 2: Filter using jq
+    echo "Filtering custom images containing '$SEARCH_TERM'..."
+    FILTERED_IMAGES=$(echo "$ALL_IMAGES" | jq -r ".data[] | select(.\"display-name\" | contains(\"$SEARCH_TERM\")) | select(.publisher != \"Oracle\" and .publisher != \"Canonical\") | .id + \"|\" + .\"display-name\" + \"|\" + .\"lifecycle-state\"")
+
+    if [[ -z "$FILTERED_IMAGES" ]]; then
+        echo "No custom images found containing '$SEARCH_TERM'"
+        exit 0
+    fi
+
+    # Count images
+    IMAGE_COUNT=$(echo "$FILTERED_IMAGES" | wc -l)
+    echo "Found $IMAGE_COUNT custom image(s) containing '$SEARCH_TERM'"
+    echo ""
+
+    # Function to check image metadata (alternative method)
+    check_image_metadata() {
+        local image_id="$1"
+        local image_name="$2"
+        
+        echo "   🔍 Checking image metadata for clues about compatibility..."
+        
+        # Get detailed image information
+        IMAGE_DETAILS=$(oci compute image get --image-id "$image_id" 2>/dev/null)
+        
+        if [[ $? -eq 0 ]]; then
+            # Extract relevant metadata
+            OS=$(echo "$IMAGE_DETAILS" | jq -r '.data."operating-system" // "Unknown"')
+            OS_VERSION=$(echo "$IMAGE_DETAILS" | jq -r '.data."operating-system-version" // "Unknown"')
+            SIZE_GB=$(echo "$IMAGE_DETAILS" | jq -r '.data."size-in-mbs" // 0 | tonumber / 1024')
+            
+            echo "   📋 Image metadata:"
+            echo "      OS: $OS $OS_VERSION"
+            echo "      Size: ${SIZE_GB} GB"
+            
+            # Make educated guesses based on image name and metadata
+            if echo "$image_name" | grep -iq "gpu\|cuda\|rocm"; then
+                echo "   🎯 Image appears to be GPU-optimized (contains GPU/CUDA/ROCM)"
+                echo "   💡 Likely compatible with GPU shapes like:"
+                for shape in "${REQUIRED_SHAPES[@]}"; do
+                    if echo "$shape" | grep -iq "gpu"; then
+                        echo "      • $shape (GPU shape - likely compatible)"
+                    fi
+                done
+            fi
+            
+            if echo "$image_name" | grep -iq "ofed\|infiniband"; then
+                echo "   🌐 Image appears to have InfiniBand/OFED support"
+                echo "   💡 Likely compatible with high-performance compute shapes"
+            fi
+            
+            echo "   ⚠️  Note: This is an educated guess based on naming. Use OCI Console to configure actual shape compatibility."
+            echo "   🔧 To configure shape compatibility manually:"
+            for shape in "${REQUIRED_SHAPES[@]}"; do
+                echo "      oci compute image-shape-compatibility-entry create --image-id $image_id --shape-name $shape"
+            done
+        else
+            echo "   ❌ Could not retrieve image metadata"
+        fi
+    }
+
+    # Step 3: Check shape compatibility for each image
+    echo "Checking shape compatibility..."
+    echo "============================================================="
+
+    COMPATIBLE_IMAGES=0
+    INCOMPATIBLE_IMAGES=0
+    IMAGES_TO_SHOW=()
+
+    # First pass: collect images that need attention
+    while IFS='|' read -r ocid name state; do
+        if [[ "$state" != "AVAILABLE" ]]; then
+            continue  # Skip unavailable images
+        fi
+        
+        # Try the shape compatibility API first
+        SHAPES_DATA=$(oci compute image-shape-compatibility-entry list --image-id "$ocid" 2>&1)
+        SHAPES_EXIT_CODE=$?
+        
+        if [[ $SHAPES_EXIT_CODE -ne 0 ]]; then
+            # API failed - this image needs attention
+            IMAGES_TO_SHOW+=("$ocid|$name|$state|API_ERROR")
+            continue
+        fi
+        
+        COMPATIBLE_SHAPES=$(echo "$SHAPES_DATA" | jq -r '.data[].shape' 2>/dev/null | sort)
+        
+        if [[ -z "$COMPATIBLE_SHAPES" ]]; then
+            # No shapes configured - this image needs attention
+            IMAGES_TO_SHOW+=("$ocid|$name|$state|NO_SHAPES")
+            continue
+        fi
+        
+        if [[ "$CHECK_ALL_SHAPES" == true ]]; then
+            # For --check-all-shapes, always show (user wants to see what's configured)
+            IMAGES_TO_SHOW+=("$ocid|$name|$state|HAS_SHAPES")
+        else
+            # Check if any required shapes are missing
+            MISSING_SHAPES=()
+            
+            for required_shape in "${REQUIRED_SHAPES[@]}"; do
+                if ! echo "$COMPATIBLE_SHAPES" | grep -q "^$required_shape$"; then
+                    MISSING_SHAPES+=("$required_shape")
+                fi
+            done
+            
+            if [[ ${#MISSING_SHAPES[@]} -gt 0 ]]; then
+                # Has missing shapes - this image needs attention
+                IMAGES_TO_SHOW+=("$ocid|$name|$state|MISSING_SHAPES")
+            else
+                # All shapes are configured - skip this image
+                ((COMPATIBLE_IMAGES++))
+            fi
+        fi
+    done <<< "$FILTERED_IMAGES"
+
+    # Show results
+    if [[ ${#IMAGES_TO_SHOW[@]} -eq 0 ]]; then
         echo ""
+        if [[ "$CHECK_ALL_SHAPES" == true ]]; then
+            echo "✅ No images found with shape compatibility configured."
+        else
+            echo "✅ All images already have the required shapes configured!"
+            echo ""
+            echo "📊 Summary:"
+            echo "   Total images: $IMAGE_COUNT"
+            echo "   Images with all required shapes: $COMPATIBLE_IMAGES"
+            echo "   Required shapes: ${REQUIRED_SHAPES[*]}"
+        fi
+        echo ""
+        echo "💡 No action needed - all images are properly configured."
+        exit 0
+    fi
 
-        # List compartments
-        echo "Compartment Name | Compartment OCID"
-        echo "----------------------------------------"
+    # Display only images that need attention
+    for image_info in "${IMAGES_TO_SHOW[@]}"; do
+        IFS='|' read -r ocid name state status <<< "$image_info"
+        
+        echo ""
+        echo "🖼️  Image: $name"
+        echo "   OCID: ${ocid}"
+        echo "   State: $state"
+        
+        # Re-fetch shape data for display
+        SHAPES_DATA=$(oci compute image-shape-compatibility-entry list --image-id "$ocid" 2>&1)
+        SHAPES_EXIT_CODE=$?
+        
+        if [[ $SHAPES_EXIT_CODE -ne 0 ]]; then
+            # Handle API errors
+            if echo "$SHAPES_DATA" | grep -iq "notauthorizedornotfound\|not found\|404"; then
+                echo "   ⚠️  Image shape compatibility not configured or not accessible"
+            elif echo "$SHAPES_DATA" | grep -iq "serviceerror\|500\|503"; then
+                echo "   ⚠️  Service error accessing shape compatibility API"
+            elif echo "$SHAPES_DATA" | grep -iq "invalidparameter\|400"; then
+                echo "   ⚠️  Invalid parameter - image may not support shape compatibility API"
+            else
+                echo "   ❌ Error: Failed to retrieve shape compatibility"
+                if [[ $VERBOSE == true ]]; then
+                    echo "   📝 Error details: $SHAPES_DATA"
+                fi
+            fi
+            
+            if [[ $NO_ALTERNATIVE_CHECK != true ]]; then
+                echo "   💡 Trying alternative method: image metadata check..."
+                check_image_metadata "$ocid" "$name"
+            fi
+            ((INCOMPATIBLE_IMAGES++))
+            continue
+        fi
+        
+        COMPATIBLE_SHAPES=$(echo "$SHAPES_DATA" | jq -r '.data[].shape' 2>/dev/null | sort)
+        
+        if [[ -z "$COMPATIBLE_SHAPES" ]]; then
+            echo "   ❌ No shape compatibility configured"
+            echo "   💡 Configure shapes using: oci compute image-shape-compatibility-entry create --image-id $ocid --shape-name <SHAPE_NAME>"
+            ((INCOMPATIBLE_IMAGES++))
+            continue
+        fi
+        
+        if [[ "$CHECK_ALL_SHAPES" == true ]]; then
+            # Show all compatible shapes
+            echo "   ✅ Shape compatibility configured"
+            SHAPE_COUNT=$(echo "$COMPATIBLE_SHAPES" | wc -l)
+            echo "   📊 Compatible shapes ($SHAPE_COUNT):"
+            echo "$COMPATIBLE_SHAPES" | while read -r shape; do
+                echo "      ✓ $shape"
+            done
+            ((COMPATIBLE_IMAGES++))
+        else
+            # Check specific required shapes and show missing ones
+            MISSING_SHAPES=()
+            FOUND_SHAPES=()
+            
+            for required_shape in "${REQUIRED_SHAPES[@]}"; do
+                if echo "$COMPATIBLE_SHAPES" | grep -q "^$required_shape$"; then
+                    FOUND_SHAPES+=("$required_shape")
+                else
+                    MISSING_SHAPES+=("$required_shape")
+                fi
+            done
+            
+            echo "   ⚠️  Missing required shapes!"
+            
+            if [[ ${#FOUND_SHAPES[@]} -gt 0 ]]; then
+                echo "   ✅ Already configured:"
+                for shape in "${FOUND_SHAPES[@]}"; do
+                    echo "      ✓ $shape"
+                done
+            fi
+            
+            echo "   ❌ Missing shapes:"
+            for shape in "${MISSING_SHAPES[@]}"; do
+                echo "      ✗ $shape"
+                echo "         Add with: oci compute image-shape-compatibility-entry create --image-id $ocid --shape-name $shape"
+            done
+            ((INCOMPATIBLE_IMAGES++))
+        fi
+        
+        echo "   ─────────────────────────────────────────────────────────"
+    done
 
-        oci iam compartment list \
-        --compartment-id "$TENANCY_ID" \
-        --all \
-        --query "data[?\"lifecycle-state\"=='ACTIVE'].{name:name,ocid:id}" \
-        --output table
-
+    # Final summary
+    echo ""
+    echo "Summary"
+    echo "======="
+    
+    if [[ ${#IMAGES_TO_SHOW[@]} -eq 0 ]]; then
+        echo "✅ All images are properly configured!"
+    else
+        echo "Images needing attention: ${#IMAGES_TO_SHOW[@]}"
+        echo "Images already configured: $COMPATIBLE_IMAGES"
+        echo "Total images found: $IMAGE_COUNT"
+        
+        if [[ "$CHECK_ALL_SHAPES" != true ]]; then
+            echo ""
+            echo "Required shapes: ${REQUIRED_SHAPES[*]}"
+        fi
+        
+        echo ""
+        echo "💡 Use the commands above to configure missing shapes"
+    fi
 }
 
 main () {
@@ -671,12 +984,15 @@ main () {
                 elif [ $action -eq 3 ]; then
                         #March Images
                         month_import 1
+                        check_images "$@"
                 elif [ $action -eq 4 ]; then
                         #June Images
                         month_import 2
+                        check_images "$@"
                 elif [ $action -eq 5 ]; then
                         #July Images
                         month_import 3
+                        check_images"$@"
                 elif [ $action -eq 6 ]; then
                         compartment_lister "$OCI_TENANCY"
                 else
