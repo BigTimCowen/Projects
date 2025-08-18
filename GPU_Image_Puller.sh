@@ -183,11 +183,22 @@ import_images() {
 
 get_compartments() {
         # Get all compartments including root
-        oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+        local import_poc="y"
+        read -p "Do you want to import to the POC compartment? (default: y): " import_poc
+        import_poc=${import_poc:-y}
 
+        if [ "$import_poc" == "y" ]; then
+                COMP_OCID=$(oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query "data[?contains(name,'POC')].id | [0]" --raw-output)
+        else
+                oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root --lifecycle-state ACTIVE --query 'data[*].{Name:name, OCID:id, State:"lifecycle-state", Description:description}' --output table
+        
         while [ -z $COMP_OCID ]; do
-                read -p "What is the Compartment OCID? " COMP_OCID
+                read -p "Please select Compartment OCID to import images to: " COMP_OCID
         done
+
+        fi
+
+        print_status "Compartment $COMP_OCID selected"
 
 }
 
