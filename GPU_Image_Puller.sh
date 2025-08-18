@@ -572,7 +572,7 @@ delete_images() {
                 echo "$(printf '%*s' 100 | tr ' ' '-')"
 
                 echo "$FILTERED_IMAGES" | while IFS='|' read -r ocid name state; do
-                printf "%-50s %-15s %s\n" "$name" "$state" "${ocid:0:40}..."
+                printf "%-50s %-15s %s\n" "$name" "$state" "$ocid"
                 done
 
                 # Count images
