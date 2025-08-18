@@ -165,7 +165,7 @@ does_image_exist() {
         if [ -n $image_name ]; then
                 if [ "$result" = "[]" ] || [ -z "$result" ]; then
                         echo -e "${GREEN}✅ Image NOT found${NC} in compartment, importing $image_name"
-                        #oci compute image import from-object-uri --uri $uri --compartment-id $compartment_id --operating-system "$os" --display-name $image_name
+                        oci compute image import from-object-uri --uri $uri --compartment-id $compartment_id --operating-system "$os" --display-name $image_name
                 else 
                         echo -e "${RED}❌ Image FOUND${NC} in compartment already, $image_name, skipping to import."
                 fi 
