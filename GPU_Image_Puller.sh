@@ -1,7 +1,8 @@
 #!/bin/bash
 ## v1.0.0
 ## This script is used to verify, upload and/or delete HPC Images from object storage buckets for specific months.  This has to be modified manually when new images are released.  You can also view all compartments in a tenancy.
-## run in the oci shell of the tenancy as an admin that can import images or delete images.
+## Run in the oci shell of the tenancy as an admin that can import images or delete images.
+## This will default upload to the POC Compartment or it'll spit out a list of compartments with their ocid to select to upload images to.
 
 COMP_OCID=
 OS="Canonical Ubuntu"
