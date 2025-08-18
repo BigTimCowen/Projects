@@ -14,6 +14,19 @@ CYAN='\033[0;36m'
 WHITE='\033[0;37m'
 NC='\033[0m' # No Color (reset)
 
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
 region="$OCI_CLI_PROFILE"
 ad="0"
 selectad=""
