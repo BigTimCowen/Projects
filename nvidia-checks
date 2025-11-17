@@ -1,0 +1,26 @@
+#This gets the reference speed of 25G for each gpu.
+sudo nvidia-smi nvlink -s | grep -v "25"
+
+#check the nvlinks
+nvidia-smi nvlink -s
+
+#Check if there is any nvlink errors
+sudo nvidia-smi nvlink -e | egrep 'GPU|Err'| grep -v ': 0'
+
+#Check signal integrity mlxlink
+for iface in $(ibdev2netdev | awk "/rdma/ \{print \$1}"); do
+        if sudo mlxlink -d "$iface" -m -c -e 2>/dev/null | grep -q "Recommendation.*Bad signal integrity"; then
+            echo "⚠️  Bad signal integrity detected on interface: $iface"
+        fi
+    done
+
+
+rdma link | grep -Evi "active|link_up"|| echo "✅ All RDMA links are up and active."
+
+
+sudo nvidia-smi -q --display=ECC,ROW_REMAPPER | grep -E 'GPU [0-9]*|: [1-9][0-9][0-9]*$'
+
+
+#Check GPUs and firmware, driver.
+sudo nvidia-smi --query-gpu=index,name,serial,pci.bus_id,clocks.current.graphics,driver_version,vbios_version --format=csv
+

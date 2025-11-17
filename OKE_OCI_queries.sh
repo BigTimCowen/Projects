@@ -69,3 +69,6 @@ oci compute instance get --instance-id $INSTANCE_ID
 oci --region us-phoenix-1 compute capacity-topology bare-metal-host list --capacity-topology-id <...> --query "data[?contains(lifecycle-state, 'Available']"
 
 oci --region us-phoenix-1 compute capacity-topology bare-metal-host list --capacity-topology-id <...> --query "data[?contains(compute-network-block-id, '']"
+
+oci compute instance list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa  --auth instance_principal --output table --query "data[].{shape: shape, lifecycle: \"lifecycle-state\", display: \"display-name\"}"
+oci compute-management cluster-network list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa --auth instance_principal --output table --query "data[].{display:\"display-name\",instancepool:\"instance-pools\",lifecycle:\"lifecycle-state\"}"

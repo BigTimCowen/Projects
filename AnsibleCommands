@@ -1,0 +1,18 @@
+ansible-playbook -i <nodes_files>  <playbook location/yml>
+/opt/oci-hpc/playbook/site.yml (masterplaybook)
+
+#If resized, will put inventory located here
+/opt/oci-hpc/autoscaling/clusters/
+
+#Default inventory file is located under 
+#If you deploy with 1 node from the marketplace and it'll be under /etc/ansible/hosts
+
+#To run on an individual node, this checks the gpu health
+sudo python3 /opt/oci-hpc/healthchecks/check_gpu_setup.py
+
+#on controller, the toplogy configuration is located here
+/etc/slurm/topology.conf
+
+Log file under slurmctldlogfile under /etc/slurm/slurm.conf
+
+/etc/slurm -- configured by anisble

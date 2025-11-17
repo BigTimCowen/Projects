@@ -1,0 +1,12 @@
+OCI_TENANCY=`curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ | jq -r .tenantId`
+
+oci limits value list --compartment-id $OCI_TENANCY --service-name filesystem --query 'sort_by(data[?contains(name,`file-system-count`) || contains(name,`mount-target`) && !contains(name,`reserv`) && value > `0`],&"name")' --region phoenix --all --auth instance_principal --output table
+
+#Check Cloud-init
+INSTANCE_OCID=`curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance | jq -r .id`
+
+# Get the base64 encoded user data 
+ENCODED_USER_DATA=$(oci compute instance get --instance-id $INSTANCE_OCID --query "data.metadata.\"user_data\"" --raw-output --auth instance_principal) 
+
+# Decode the user data to view the cloud-init script 
+echo "$ENCODED_USER_DATA" | base64 --decode
