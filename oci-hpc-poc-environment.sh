@@ -332,6 +332,8 @@ create_tag_namespace() {
     print_status "Creating Tag Namespace $TAG_NAMESPACE" 
     oci iam tag-namespace create --compartment-id $OCI_TENANCY --name $TAG_NAMESPACE --description "$TAG_NAMESPACE_DESCRIPTION" --region $HOME_REGION
   
+    sleep 10
+
     print_status "Searching for newly created Tag Namespace's ocid for $TAG_NAMESPACE"
     NAMESPACE_OCID=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
 
@@ -378,7 +380,7 @@ print_status "Creating $POC_COMPARTMENT_NAME compartment..."
 EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "$POC_COMPARTMENT_NAME" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_COMPARTMENT" ]; then
-    print_warning "Compartment 'POC' already exists with OCID: $EXISTING_COMPARTMENT"
+    print_warning "Compartment '$POC_COMPARTMENT_NAME' already exists with OCID: $EXISTING_COMPARTMENT"
     POC_OCID="$EXISTING_COMPARTMENT"
 else
     # Create the compartment
@@ -393,7 +395,7 @@ else
     POC_OCID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
     
     if [ -z "$POC_OCID" ] || [ "$POC_OCID" = "null" ]; then
-        print_error "Failed to create POC compartment"
+        print_error "Failed to create $POC_COMPARTMENT_NAME compartment"
         exit 1
     fi
     
@@ -497,15 +499,15 @@ else
         "allow service compute_management to use tag-namespace in tenancy",
         "allow service compute_management to manage compute-management-family in tenancy",
         "allow service compute_management to read app-catalog-listing in tenancy",
-        "allow group OCI-HPC-POC-Group to manage all-resources in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to read app-catalog-listing in tenancy",
-        "allow dynamic-group oci_hpc_instance_principal to use tag-namespace in tenancy",
-        "allow dynamic-group oci_hpc_instance_principal to manage compute-management-family in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to manage instance-family in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to use virtual-network-family in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to use volumes in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to manage dns in compartment '$POC_COMPARTMENT_NAME'",
-        "allow dynamic-group oci_hpc_instance_principal to read metrics in compartment '$POC_COMPARTMENT_NAME'"
+        "allow group '$HPC_GROUP_NAME' to manage all-resources in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to read app-catalog-listing in tenancy",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to use tag-namespace in tenancy",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to manage compute-management-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to manage instance-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to use virtual-network-family in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to use volumes in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to manage dns in compartment '$POC_COMPARTMENT_NAME'",
+        "allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to read metrics in compartment '$POC_COMPARTMENT_NAME'"
     ]'
     
     # Create the policy

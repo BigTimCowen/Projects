@@ -330,9 +330,12 @@ create_tag_namespace() {
     print_status "Creating Tag Namespace $TAG_NAMESPACE" 
     oci iam tag-namespace create --compartment-id $OCI_TENANCY --name $TAG_NAMESPACE --description "$TAG_NAMESPACE_DESCRIPTION" --region $HOME_REGION
   
+    sleep 10
+
     print_status "Searching for newly created Tag Namespace's ocid for $TAG_NAMESPACE"
     NAMESPACE_OCID=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
 
+    sleep 5
     print_status "Creating Tag Value, $TAG_NAME for $TAG_VALUE"
     # Create a tag key with description
     oci iam tag create --tag-namespace-id $NAMESPACE_OCID --name $TAG_NAME --description "$TAG_NAME_DESCRIPTION" --validator '{"validator-type": "ENUM", "values": ["'"$TAG_VALUE"'"]}' --region $HOME_REGION
@@ -376,14 +379,14 @@ print_status "Creating $POC_COMPARTMENT_NAME compartment..."
 EXISTING_COMPARTMENT=$(oci iam compartment list --compartment-id "$TENANCY_OCID" --name "$POC_COMPARTMENT_NAME" --lifecycle-state "ACTIVE" 2>/dev/null | jq -r '.data[0].id // empty')
 
 if [ -n "$EXISTING_COMPARTMENT" ]; then
-    print_warning "Compartment 'POC' already exists with OCID: $EXISTING_COMPARTMENT"
+    print_warning "Compartment '$POC_COMPARTMENT_NAME' already exists with OCID: $EXISTING_COMPARTMENT"
     POC_OCID="$EXISTING_COMPARTMENT"
 else
     # Create the compartment
     CREATE_RESULT=$(oci iam compartment create \
         --compartment-id "$TENANCY_OCID" \
         --name "$POC_COMPARTMENT_NAME" \
-        --description "Proof of Concept compartment for HPC deployment" \
+        --description "Proof of Concept compartment for HPC OKE deployment" \
         --wait-for-state "ACTIVE" \
         --region "$HOME_REGION" \
         --max-wait-seconds 300)
@@ -391,7 +394,7 @@ else
     POC_OCID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
     
     if [ -z "$POC_OCID" ] || [ "$POC_OCID" = "null" ]; then
-        print_error "Failed to create POC compartment"
+        print_error "Failed to create $POC_COMPARTMENT_NAME compartment"
         exit 1
     fi
     
