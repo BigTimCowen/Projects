@@ -4,10 +4,11 @@ oci compute image list   --compartment-id ocid1.compartment.oc1..aaaaaaaaycgwyl3
 
 oci compute image list   --compartment-id ocid1.compartment.oc1..aaaaaaaaycgwyl3ud3iqn5tpz2txhtfc5i5jikurgicfyo6vgx34x3kijlva   --all --query "data[?contains(\"display-name\",'GPU')].{Compartment_ocid: \"compartment-id\", operating_system: \"operating-system\", os_ver: \"operating-system-version\", display_name: \"display-name\", image_id: \"id\"}"   --output table
 
+#Set OCI_TENANCY
+OCI_TENANCY=`curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ | jq -r .tenantId`
+
 #List OCI Regions
 oci iam region list --query "data[?contains(name,'jeddah')]" --output table
-
-
 
 #list GPU and Linux images in the tenancy to find image id easily.
 oci compute image list   --compartment-id $OCI_TENANCY   --all --query "data[?contains(\"display-name\",'GPU') && contains(\"display-name\",'Linux')].{Compartment_ocid: \"compartment-id\", operating_system: \"operating-system\", os_ver: \"operating-system-version\", display_name: \"display-name\", image_id: \"id\"}"  --region me-jeddah-1 --output table

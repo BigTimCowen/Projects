@@ -1,3 +1,4 @@
+OCI_CLI_AUTH=instance_principal
 OCI_TENANCY=`curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ | jq -r .tenantId`
 
 oci limits value list --compartment-id $OCI_TENANCY --service-name filesystem --query 'sort_by(data[?contains(name,`file-system-count`) || contains(name,`mount-target`) && !contains(name,`reserv`) && value > `0`],&"name")' --region phoenix --all --auth instance_principal --output table
@@ -10,3 +11,23 @@ ENCODED_USER_DATA=$(oci compute instance get --instance-id $INSTANCE_OCID --quer
 
 # Decode the user data to view the cloud-init script 
 echo "$ENCODED_USER_DATA" | base64 --decode
+
+
+#Check if OCI Compartment has images
+
+comp_id=`curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ | jq -r .compartmentId`
+
+#CUDA Image
+oci compute image list   --compartment-id $comp_id   --all --query "data[?contains(\"display-name\",'OFED')].{Compartment_ocid: \"compartment-id\", operating_system: \"operating-system\", os_ver: \"operating-system-version\", display_name: \"display-name\", image_id: \"id\"}"   --output table --auth instance_principal
+
+#Check Image for compability
+image_id=ocid1.image.oc1.phx.aaaaaaaav7mi7rgfi2hr6gsua4xogtlkergzvmnyvvs6qxsbax6n3vvvuhmq
+oci compute image-shape-compatibility-entry list --image-id $image_id --query "data[?contains(shape,'A100')]" --auth instance_principal
+
+
+#check shape configuration
+curl -H "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance
+curl -H "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/vnics
+
+#find out the ip for the current instance
+curl ifconfig.io
