@@ -450,38 +450,7 @@ else
 fi
 echo
 
-# Step 4: Create dynamic group
-print_status "Creating dynamic group $HPC_DYNAMIC_GROUP_NAME..."
-
-# Check if dynamic group already exists
-EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
-
-if [ -n "$EXISTING_DG" ]; then
-    print_warning "Dynamic group $HPC_DYNAMIC_GROUP_NAME already exists with OCID: $EXISTING_DG"
-else
-    # Create the dynamic group
-    MATCHING_RULE="Any {instance.compartment.id = '$POC_OCID'}"
-    
-    CREATE_DG_RESULT=$(oci iam dynamic-group create \
-        --compartment-id "$TENANCY_OCID" \
-        --name "$HPC_DYNAMIC_GROUP_NAME" \
-        --description "Dynamic group for instances in POC compartment" \
-        --matching-rule "$MATCHING_RULE" \
-        --region "$HOME_REGION")
-    
-    DG_OCID=$(echo "$CREATE_DG_RESULT" | jq -r '.data.id')
-    
-    if [ -z "$DG_OCID" ] || [ "$DG_OCID" = "null" ]; then
-        print_error "Failed to create dynamic group"
-        exit 1
-    fi
-    
-    print_status "$HPC_DYNAMIC_GROUP_NAME dynamic group created successfully!"
-    print_status "$HPC_DYNAMIC_GROUP_NAME dynamic group OCID: $DG_OCID"
-fi
-echo
-
-# Step 5: Create policy
+# Step 4: Create policy
 print_status "Creating policy $HPC_POLICY_NAME ..."
 
 # Check if policy already exists
