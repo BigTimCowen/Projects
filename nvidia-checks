@@ -24,3 +24,14 @@ sudo nvidia-smi -q --display=ECC,ROW_REMAPPER | grep -E 'GPU [0-9]*|: [1-9][0-9]
 #Check GPUs and firmware, driver.
 sudo nvidia-smi --query-gpu=index,name,serial,pci.bus_id,clocks.current.graphics,driver_version,vbios_version --format=csv
 
+# Check GPU
+nvidia-smi
+nvidia-smi -q | grep -i error
+
+# Check RDMA
+ibv_devinfo
+ibv_devinfo -v | grep -i error
+ibstatus
+
+dmesg | tail -100
+journalctl -f 

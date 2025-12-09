@@ -73,3 +73,16 @@ oci --region us-phoenix-1 compute capacity-topology bare-metal-host list --capac
 
 oci compute instance list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa  --auth instance_principal --output table --query "data[].{shape: shape, lifecycle: \"lifecycle-state\", display: \"display-name\"}"
 oci compute-management cluster-network list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa --auth instance_principal --output table --query "data[].{display:\"display-name\",instancepool:\"instance-pools\",lifecycle:\"lifecycle-state\"}"
+
+oci ce cluster disable-addon --cluster-id <cluster-id> --addon-name NvidiaGpuPlugin
+
+#to get capacity vs allocatable on a node
+k get node 10.240.32.198 -o=yaml | grep -A 6 -B7 capacity
+
+ k get pods --show-labels -o wide
+
+k get pods -A --field-selector spec.nodeName=
+
+ k logs -l apps.kubernetes.io/pod-index=0
+
+ k exec odyssey-lr-1e4-0 - bash
