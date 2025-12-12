@@ -749,6 +749,7 @@ delete_poc() {
     EXISTING_GROUP=$(oci iam group list --name "$HPC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_POLICY=$(oci iam policy list --compartment-id "$TENANCY_OCID" --name "$HPC_POLICY_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+    EXISTING_DG1=$(oci iam dynamic-group list --name "$HPC_FN_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
     EXISTING_NAMESPACE=$(oci iam tag-namespace list --compartment-id $OCI_TENANCY --query "data[?name=='$TAG_NAMESPACE'].id | [0]" --raw-output)
 
     echo
@@ -783,6 +784,11 @@ delete_poc() {
             if [ -n "$EXISTING_DG" ]; then
             print_status "Deleting Dynamic Group Name: $HPC_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"    
             oci iam dynamic-group delete --dynamic-group-id "$EXISTING_DG" --region "$HOME_REGION"
+            fi
+
+            if [ -n "$EXISTING_DG1" ]; then
+            print_status "Deleting Dynamic Group Name: $HPC_FN_DYNAMIC_GROUP_NAME, ocid $EXISTING_DG"    
+            oci iam dynamic-group delete --dynamic-group-id "$EXISTING_DG1" --region "$HOME_REGION"
             fi
 
             echo -e ""
