@@ -4,6 +4,7 @@
 # Creates compartment
 # Groups - OCI-HPC-POC-Group, 
 # Dynamic group - fn_dg
+#dynamic group - oci_hpc_instance_principal
 # adds user from OCI Shell session running script
 # Creates policies for HPC deployment
 # Creates TAG_NAMESPACE for tagging unhealthy GPUs
