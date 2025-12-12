@@ -466,7 +466,7 @@ if [ -n "$EXISTING_DG" ]; then
     print_warning "Dynamic group $HPC_DYNAMIC_GROUP_NAME already exists with OCID: $EXISTING_DG"
 else
     # Create the dynamic group
-    MATCHING_RULE="ALL {resource.type = 'fnfunc', resource.compartment.id = '$POC_OCID'}"
+    MATCHING_RULE="ALL {instance.compartment.id = '$POC_OCID'}"
     
     CREATE_DG_RESULT=$(oci iam dynamic-group create \
         --compartment-id "$TENANCY_OCID" \
@@ -491,19 +491,19 @@ echo
 print_status "Creating dynamic group $HPC_FN_DYNAMIC_GROUP_NAME..."
 
 # Check if dynamic group already exists
-EXISTING_DG=$(oci iam dynamic-group list --name "$HPC_FN_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
+EXISTING_DG1=$(oci iam dynamic-group list --name "$HPC_FN_DYNAMIC_GROUP_NAME" 2>/dev/null | jq -r '.data[0].id // empty')
 
-if [ -n "$EXISTING_DG" ]; then
-    print_warning "Dynamic group $HPC_FN_DYNAMIC_GROUP_NAME already exists with OCID: $EXISTING_DG"
+if [ -n "$EXISTING_DG1" ]; then
+    print_warning "Dynamic group $HPC_FN_DYNAMIC_GROUP_NAME already exists with OCID: $EXISTING_DG1"
 else
     # Create the dynamic group
-    MATCHING_RULE="ALL {instance.compartment.id = '$POC_OCID'}"
+    MATCHING_RULE1="ALL {resource.type = 'fnfunc', resource.compartment.id = '$POC_OCID'}"
     
     CREATE_DG_RESULT1=$(oci iam dynamic-group create \
         --compartment-id "$TENANCY_OCID" \
         --name "$HPC_FN_DYNAMIC_GROUP_NAME" \
         --description "Dynamic group for instances in POC compartment" \
-        --matching-rule "$MATCHING_RULE" \
+        --matching-rule "$MATCHING_RULE1" \
         --region "$HOME_REGION")
     
     DG_OCID1=$(echo "$CREATE_DG_RESULT1" | jq -r '.data.id')
