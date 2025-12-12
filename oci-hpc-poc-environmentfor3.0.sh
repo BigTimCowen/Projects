@@ -554,8 +554,8 @@ else
         "Allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to use ons-family in compartment '$POC_COMPARTMENT_NAME'",
         "Allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to use stream-family in compartment '$POC_COMPARTMENT_NAME'",
         "Allow dynamic-group '$HPC_DYNAMIC_GROUP_NAME' to read all-resources in compartment '$POC_COMPARTMENT_NAME'",
-        "Allow group '$HPC_GROUP_NAME' to read metrics in tenancy where all {request.principal.type = 'serviceconnector', request.principal.compartment.id = '$POC_OCID'}
-        "Allow group '$HPC_GROUP_NAME' to use stream-push in compartment id '$POC_OCID' where all {request.principal.type='serviceconnector', request.principal.compartment.id='$POC_OCID'}
+        "Allow group '$HPC_GROUP_NAME' to read metrics in tenancy where all {request.principal.type = 'serviceconnector', request.principal.compartment.id = '$POC_OCID'}",
+        "Allow group '$HPC_GROUP_NAME' to use stream-push in compartment id '$POC_OCID' where all {request.principal.type='serviceconnector', request.principal.compartment.id='$POC_OCID'}"
     ]'
     
     # Create the policy
