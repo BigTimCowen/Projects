@@ -1,0 +1,567 @@
+# Copyright (c) 2025 Oracle Corporation and/or its affiliates.
+# Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl
+
+title: "OKE VCN Network Stack"
+description: Oracle Cloud Infrastructure Virtual Cloud Network (VCN) for OKE clusters with complete network security configuration
+stackDescription: Oracle Cloud Infrastructure Virtual Cloud Network (VCN) for OKE clusters with complete network security configuration
+schemaVersion: 1.1.0
+version: "20250204"
+locale: "en"
+
+variableGroups:
+  - title: "Hidden"
+    visible: false
+    variables:
+      - tenancy_ocid
+      - region
+      - assign_dns
+      - lockdown_default_seclist
+      - internet_gateway_route_rules
+      - nat_gateway_route_rules
+      - nat_gateway_public_ip_id
+      - tags
+      - control_plane_is_public
+      - vcn_name
+      - home_region
+
+  - title: "Identity"
+    variables:
+      - create_policies
+
+  - title: "Network"
+    variables:
+      - compartment_ocid
+      - create_vcn
+      - vcn_display_name
+      - vcn_cidrs
+      - create_public_subnets
+      - create_internet_gateway
+      - create_drg
+      - create_bastion_subnet
+      - create_operator_subnet
+      - create_fss_subnet
+      - create_lustre_subnet
+      - subnets_advanced_settings
+      - cp_subnet_name
+      - cp_subnet_cidr
+      - workers_subnet_name
+      - workers_subnet_cidr
+      - pods_subnet_name
+      - pods_subnet_cidr
+      - int_lb_subnet_name
+      - int_lb_subnet_cidr
+      - pub_lb_subnet_name
+      - pub_lb_subnet_cidr
+      - bastion_subnet_name
+      - bastion_subnet_cidr
+      - operator_subnet_name
+      - operator_subnet_cidr
+      - fss_subnet_name
+      - fss_subnet_cidr
+      - lustre_subnet_name
+      - lustre_subnet_cidr
+
+variables:
+  # Injected by ORM
+  tenancy_ocid:
+    title: Tenancy
+    type: oci:identity:compartment:id
+    required: true
+  compartment_ocid:
+    title: Compartment
+    description: The compartment for created resources.
+    type: oci:identity:compartment:id
+    required: true
+  region:
+    required: true
+    title: Region
+    type: oci:identity:region:name
+
+  # Identity
+  create_policies:
+    title: Create policies
+    description: "Provision a Dynamic Group with policies for network operations. This option assumes your user has the necessary permissions to create a dynamic group and policies in the root compartment of your tenancy."
+    type: boolean
+    default: false
+
+  # VCN
+  create_vcn:
+    title: Create VCN
+    type: boolean
+    default: true
+  vcn_display_name:
+    title: Virtual Cloud Network (VCN) name
+    description: Display name for the created VCN. Defaults to 'oke-gpu-quickstart' suffixed with the generated Terraform 'state_id' value.
+    type: string
+    required: true
+    default: "oke-gpu-quickstart"
+    visible: ${create_vcn}
+  vcn_cidrs:
+    title: VCN CIDR ranges
+    description: Comma-separated list of CIDR blocks for the created VCN.
+    type: string
+    required: true
+    default: "10.140.0.0/16"
+    visible: ${create_vcn}
+  create_public_subnets:
+    title: Create public subnets
+    description: Whether to create public subnets to host Internet addressable resources
+    type: boolean
+    default: true
+    visible: ${create_vcn}
+  create_internet_gateway:
+    title: Create Internet Gateway
+    description: Whether to create an Internet Gateway for public subnet connectivity
+    type: boolean
+    default: true
+    visible:
+      and:
+        - create_vcn
+        - create_public_subnets
+  create_drg:
+    title: Create Dynamic Routing Gateway (DRG)
+    description: Whether to create a Dynamic Routing Gateway for hybrid cloud connectivity (VPN, FastConnect)
+    type: boolean
+    default: false
+    visible: ${create_vcn}
+  control_plane_is_public:
+    title: Control Plane Public Access
+    description: Whether to make the Kubernetes API server publicly accessible (default is public for easier access)
+    type: boolean
+    default: true
+    visible: ${create_vcn}
+  create_bastion_subnet:
+    title: Create Bastion Subnet
+    description: Whether to create a public subnet for bastion host access
+    type: boolean
+    default: true
+    visible: ${create_vcn}
+  create_operator_subnet:
+    title: Create Operator Subnet
+    description: Whether to create a private subnet for operator/admin access (uses NAT gateway)
+    type: boolean
+    default: true
+    visible: ${create_vcn}
+  create_fss_subnet:
+    title: Create File Storage (FSS) Subnet
+    description: Whether to create a private subnet for OCI File Storage Service
+    type: boolean
+    default: true
+    visible: ${create_vcn}
+  create_lustre_subnet:
+    title: Create Lustre Subnet
+    description: Whether to create a private subnet for Lustre parallel file system
+    type: boolean
+    default: false
+    visible: ${create_vcn}
+  subnets_advanced_settings:
+    title: Subnets advanced settings
+    type: boolean
+    default: false
+    required: false
+    visible: ${create_vcn}
+  
+  # ===========================================================================
+  # CONTROL PLANE SUBNET CONFIGURATION
+  # ===========================================================================
+  cp_subnet_name:
+    title: Control Plane Subnet Display Name
+    description: Custom display name for control plane subnet
+    type: string
+    default: "cp"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  cp_subnet_cidr:
+    title: Control Plane Subnet CIDR
+    description: CIDR block for OKE control plane subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.0.8/29"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # WORKERS SUBNET CONFIGURATION
+  # ===========================================================================
+  workers_subnet_name:
+    title: Workers Subnet Display Name
+    description: Custom display name for workers subnet
+    type: string
+    default: "workers"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  workers_subnet_cidr:
+    title: Workers Subnet CIDR
+    description: CIDR block for workers subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.48.0/20"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # PODS SUBNET CONFIGURATION
+  # ===========================================================================
+  pods_subnet_name:
+    title: Pods Subnet Display Name
+    description: Custom display name for pods subnet
+    type: string
+    default: "pods"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  pods_subnet_cidr:
+    title: Pods Subnet CIDR
+    description: CIDR block for pods subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.16.0/20"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # INTERNAL LOAD BALANCER SUBNET CONFIGURATION
+  # ===========================================================================
+  int_lb_subnet_name:
+    title: Internal LB Subnet Display Name
+    description: Custom display name for internal load balancer subnet
+    type: string
+    default: "int_lb"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  int_lb_subnet_cidr:
+    title: Internal LB Subnet CIDR
+    description: CIDR block for internal load balancer subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.0.64/27"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # PUBLIC LOAD BALANCER SUBNET CONFIGURATION
+  # ===========================================================================
+  pub_lb_subnet_name:
+    title: Public LB Subnet Display Name
+    description: Custom display name for public load balancer subnet
+    type: string
+    default: "pub_lb"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_public_subnets
+        - subnets_advanced_settings
+  pub_lb_subnet_cidr:
+    title: Public LB Subnet CIDR
+    description: CIDR block for public load balancer subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.32.0/27"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_public_subnets
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # BASTION SUBNET CONFIGURATION
+  # ===========================================================================
+  bastion_subnet_name:
+    title: Bastion Subnet Display Name
+    description: Custom display name for bastion subnet
+    type: string
+    default: "bastion"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_bastion_subnet
+        - subnets_advanced_settings
+  bastion_subnet_cidr:
+    title: Bastion Subnet CIDR
+    description: CIDR block for bastion subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.0.0/29"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_bastion_subnet
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # OPERATOR SUBNET CONFIGURATION
+  # ===========================================================================
+  operator_subnet_name:
+    title: Operator Subnet Display Name
+    description: Custom display name for operator subnet
+    type: string
+    default: "operator"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_operator_subnet
+        - subnets_advanced_settings
+  operator_subnet_cidr:
+    title: Operator Subnet CIDR
+    description: CIDR block for operator subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.0.96/29"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_operator_subnet
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # FILE STORAGE SERVICE (FSS) SUBNET CONFIGURATION
+  # ===========================================================================
+  fss_subnet_name:
+    title: FSS Subnet Display Name
+    description: Custom display name for File Storage Service subnet
+    type: string
+    default: "fss"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_fss_subnet
+        - subnets_advanced_settings
+  fss_subnet_cidr:
+    title: FSS Subnet CIDR
+    description: CIDR block for File Storage Service subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.0.32/27"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_fss_subnet
+        - subnets_advanced_settings
+  
+  # ===========================================================================
+  # LUSTRE SUBNET CONFIGURATION
+  # ===========================================================================
+  lustre_subnet_name:
+    title: Lustre Subnet Display Name
+    description: Custom display name for Lustre subnet
+    type: string
+    default: "lustre"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_lustre_subnet
+        - subnets_advanced_settings
+  lustre_subnet_cidr:
+    title: Lustre Subnet CIDR
+    description: CIDR block for Lustre subnet (default auto-calculated from VCN CIDR)
+    type: string
+    default: "10.140.88.0/27"
+    pattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\/(?:1[6-9])|(?:2[0-9])|(?:30)$"
+    required: false
+    visible:
+      and:
+        - create_vcn
+        - create_lustre_subnet
+        - subnets_advanced_settings
+
+outputGroups:
+  - title: Network
+    outputs:
+      - vcn_id
+      - vcn_name
+      - state_id
+      - drg_id
+      - drg_attachment_id
+
+  - title: Subnets
+    outputs:
+      - bastion_subnet_id
+      - operator_subnet_id
+      - int_lb_subnet_id
+      - pub_lb_subnet_id
+      - cp_subnet_id
+      - workers_subnet_id
+      - pods_subnet_id
+      - fss_subnet_id
+      - lustre_subnet_id
+      - bastion_subnet_cidr
+      - operator_subnet_cidr
+      - int_lb_subnet_cidr
+      - pub_lb_subnet_cidr
+      - cp_subnet_cidr
+      - workers_subnet_cidr
+      - pods_subnet_cidr
+      - fss_subnet_cidr
+      - lustre_subnet_cidr
+
+  - title: Network Security Groups
+    outputs:
+      - nsg_configuration_summary
+      - bastion_nsg_id
+      - operator_nsg_id
+      - int_lb_nsg_id
+      - pub_lb_nsg_id
+      - cp_nsg_id
+      - workers_nsg_id
+      - pods_nsg_id
+      - fss_nsg_id
+
+  - title: IAM Policies
+    outputs:
+      - dynamic_group_id
+      - dynamic_group_name
+      - iam_policy_id
+      - iam_policy_name
+
+outputs:
+  # State
+  state_id:
+    title: State ID
+    type: copyableString
+
+  # Network
+  vcn_id:
+    title: VCN OCID
+    type: ocid
+  vcn_name:
+    title: VCN name
+    type: string
+  drg_id:
+    title: DRG OCID
+    type: ocid
+  drg_attachment_id:
+    title: DRG Attachment OCID
+    type: ocid
+
+  # Subnets
+  bastion_subnet_id:
+    title: Bastion Subnet
+    type: ocid
+  operator_subnet_id:
+    title: Operator Subnet
+    type: ocid
+  int_lb_subnet_id:
+    title: Internal LB Subnet
+    type: ocid
+  pub_lb_subnet_id:
+    title: Public LB Subnet
+    type: ocid
+  cp_subnet_id:
+    title: Control Plane Subnet
+    type: ocid
+  workers_subnet_id:
+    title: Workers Subnet
+    type: ocid
+  pods_subnet_id:
+    title: Pods Subnet
+    type: ocid
+  fss_subnet_id:
+    title: FSS Subnet
+    type: ocid
+  lustre_subnet_id:
+    title: Lustre Subnet
+    type: ocid
+
+  # Subnet CIDR Blocks
+  bastion_subnet_cidr:
+    title: Bastion Subnet CIDR
+    type: string
+  operator_subnet_cidr:
+    title: Operator Subnet CIDR
+    type: string
+  int_lb_subnet_cidr:
+    title: Internal LB Subnet CIDR
+    type: string
+  pub_lb_subnet_cidr:
+    title: Public LB Subnet CIDR
+    type: string
+  cp_subnet_cidr:
+    title: Control Plane Subnet CIDR
+    type: string
+  workers_subnet_cidr:
+    title: Workers Subnet CIDR
+    type: string
+  pods_subnet_cidr:
+    title: Pods Subnet CIDR
+    type: string
+  fss_subnet_cidr:
+    title: FSS Subnet CIDR
+    type: string
+  lustre_subnet_cidr:
+    title: Lustre Subnet CIDR
+    type: string
+
+  # Network Security Groups
+  nsg_configuration_summary:
+    title: NSG Configuration Summary
+    type: string
+  bastion_nsg_id:
+    title: Bastion NSG
+    type: ocid
+  operator_nsg_id:
+    title: Operator NSG
+    type: ocid
+  int_lb_nsg_id:
+    title: Internal LB NSG
+    type: ocid
+  pub_lb_nsg_id:
+    title: Public LB NSG
+    type: ocid
+  cp_nsg_id:
+    title: Control Plane NSG
+    type: ocid
+  workers_nsg_id:
+    title: Workers NSG
+    type: ocid
+  pods_nsg_id:
+    title: Pods NSG
+    type: ocid
+  fss_nsg_id:
+    title: FSS NSG
+    type: ocid
+
+  # IAM Policies
+  dynamic_group_id:
+    title: Dynamic Group OCID
+    type: ocid
+  dynamic_group_name:
+    title: Dynamic Group Name
+    type: string
+  iam_policy_id:
+    title: IAM Policy OCID
+    type: ocid
+  iam_policy_name:
+    title: IAM Policy Name
+    type: string
