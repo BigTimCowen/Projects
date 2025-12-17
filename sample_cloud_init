@@ -1,0 +1,196 @@
+Content-Type: multipart/mixed; boundary="MIMEBOUNDARY"
+MIME-Version: 1.0
+
+--MIMEBOUNDARY
+Content-Transfer-Encoding: 7bit
+Content-Type: text/cloud-config
+Mime-Version: 1.0
+X-Merge-Type: list(append)+dict(no_replace,recurse_list)+str(append)
+
+"runcmd":
+- "bash /tmp/oke_nvme_raid.sh '0' || echo 'Error initializing RAID' >&2"
+- "bash /tmp/oke_start_script.sh 'purpose=ray,ray_node_type=worker,ray_purpose=training,prelaunch=true'
+  '[{\"effect\":\"NoSchedule\",\"key\":\"purpose\",\"value\":\"ray\"},{\"effect\":\"NoSchedule\",\"key\":\"prelaunch\",\"value\":\"true\"}]'
+  || echo 'Error bootstrapping OKE' >&2"
+- "sudo mkdir -p /mnt/nvme/logs"
+- "if [[ -d /logs ]]; then sudo rsync -av /logs/ /mnt/nvme/logs/; else sudo mkdir
+  -p /logs; fi"
+- "if mountpoint -q /logs; then sudo umount /logs; fi"
+- "sudo mount --bind /mnt/nvme/logs /logs"
+- "if ! mountpoint -q /logs; then exit 1; fi"
+- "FSTAB_ENTRY=\"/mnt/nvme/logs /logs none bind 0 0\""
+- "if ! grep -Fxq \"$FSTAB_ENTRY\" /etc/fstab; then echo \"$FSTAB_ENTRY\" | sudo tee
+  -a /etc/fstab > /dev/null; fi"
+- "if ! grep -q \"/mnt/nvme/logs /logs none bind\" /etc/fstab; then exit 1; fi"
+- "if ! [[ -d /logs ]] || ! [[ \"$(stat -c %d /logs)\" == \"$(stat -c %d /mnt/nvme/logs)\"
+  ]]; then exit 1; fi"
+"write_files":
+- "content": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURpVENDQW5HZ0F3SUJBZ0lSQUs1T1B4RW50SXZYQUdzOGxSbWM3SEl3RFFZSktvWklodmNOQVFFTEJRQXcKWGpFUE1BMEdBMVVFQXd3R1N6aHpJRU5CTVFzd0NRWURWUVFHRXdKVlV6RVBNQTBHQTFVRUJ3d0dRWFZ6ZEdsdQpNUTh3RFFZRFZRUUtEQVpQY21GamJHVXhEREFLQmdOVkJBc01BMDlqYVRFT01Bd0dBMVVFQ0F3RlZHVjRZWE13CkhoY05NalF3T1RJMk1qRTBOREV3V2hjTk1qa3dPVEkyTWpFME5ERXdXakJlTVE4d0RRWURWUVFEREFaTE9ITWcKUTBFeEN6QUpCZ05WQkFZVEFsVlRNUTh3RFFZRFZRUUhEQVpCZFhOMGFXNHhEekFOQmdOVkJBb01Cazl5WVdOcwpaVEVNTUFvR0ExVUVDd3dEVDJOcE1RNHdEQVlEVlFRSURBVlVaWGhoY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCCkJRQURnZ0VQQURDQ0FRb0NnZ0VCQUpZQjVmU2d2SExHQS9FUDV5ZjZFMElMdzJUUDhSTXlqN1lQeWViOEQ5QzgKVWRSS2EvK3R2eTY5U1dpWGJxUmR6SUU5SUdiU29XcW5VcmdqOGJmZlFyQ3FzRGx6dFZCM2lSRTJZWTAyWlFtTgpIR04wOWw1TFFscGE0UEEyYlhjVVpiTlk3dnVkWHhjSy9DTUd6RDVmdml5UHRiZW1yWVF0NXM1bDdyQndvaWxrClRzTUZONDZJU0hUS2xWdTlFZlVhdHlUWUZzeWx2VHRNZHQxM0hlMFpXU3BoM3BCRDcycWtVTEtjd2tITFBWdVUKbk93QmttMG8xREZvWDJPQTQ1Q0xTSGI1Y3czLzVTYURKdTVRaU1jakZNeWp3MnlkWExtNkdibUtNSllOcUNoTwo1M2Y4WG4wZm5acXg2ekJrN0lOaU5GNGxucGtiMC9JZ1FuU2VPOThCQnRFQ0F3RUFBYU5DTUVBd0R3WURWUjBUCkFRSC9CQVV3QXdFQi96QU9CZ05WSFE4QkFmOEVCQU1DQVFZd0hRWURWUjBPQkJZRUZLaHRjeDh2ajlEWThnYjcKanFHaC9ZZ0dVVzgwTUEwR0NTcUdTSWIzRFFFQkN3VUFBNElCQVFBcTVORlZrdldjcWRramwrNEMyQkFXRjRNMQp2R0RuVHlnL0ZoWDI5MHBvYnVtUGYrUTE1MUtHemlpT0xMejFCdTVCU2NnZ2Judk83MkRMZDFrVUlqeUY5Y3RzCkI2YU1zZWo5Q3cyeDI5TnlKRXlBbXZOLzMvOE1xazhCYnBLZXlpM0k5YlJkd3dyRFQ2ZTJrRnkyTVpIYkovU2YKVnRpRithK0lVdHRZZnBreG5admJ2WFVnRGlwQUp1Vk94U0dsQ2JaNlJJK2FHY0VwS2F1Z0dhZEw0VUJsbzBmSApBTHpRTk9hNGNReEJGZHliRlhBVXM2d0pKY0FnaVJQOEl2OU5FUEt5eVVJaEgwQUQ3MUJPYXRER1dEcUluTmNnClRLUDJrT2VSQUM5WmFydWszQ1psa0VRRWQ3WE4vTEhIVUl2bWcrZGZSRVF4NmlzTjljbjMrdGJIaFRJWgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+  "encoding": "base64"
+  "path": "/etc/kubernetes/ca.crt"
+- "content": "132.226.126.29"
+  "path": "/etc/oke/oke-apiserver"
+- "content": |
+    #!/bin/bash
+
+    # This script will be used in the oke cloudinit terraform module, see the main.tf in the same directory for more details.
+    # It bootstraps nodes using the HPC image and configures the kubelet with the provided arguments.
+    # 1. KUBELET_NODE_LABELS_ARGS: key=value pairs separated by ','. See variable `kubelet_node_labels` in variables.tf.
+    # 2. KUBELET_TAINTS: A JSON array of taints to be added to the node. See variable `kubelet_taints` in variables.tf.
+    KUBELET_NODE_LABELS_ARGS="${1:-}"
+    KUBELET_TAINTS="${2:-[]}"
+
+    # Add OKE repo & install the package
+    add-apt-repository -y 'deb [trusted=yes] https://odx-oke.objectstorage.us-sanjose-1.oci.customer-oci.com/n/odx-oke/b/okn-repositories/o/prod/ubuntu-jammy/kubernetes-1.34 stable main'
+
+    # Wait for apt lock and install the package
+    while fuser /var/{lib/{dpkg,apt/lists},cache/apt/archives}/lock >/dev/null 2>&1; do
+       sleep 1
+    done
+
+    apt-get -y update
+
+    apt-get install -y oci-oke-node-all-1.34.1
+
+    # TEMPORARY REQUIREMENT: Edit registries.conf to add unqualified registries
+    # TODO (yisheng)(DMP-523): Remove when oracle bakes this into the node image.
+    cat <<EOF > /etc/containers/registries.conf
+    unqualified-search-registries = ["container-registry.oracle.com", "docker.io"]
+    short-name-mode = "permissive"
+    EOF
+
+    # These binaries and configs are necessary for the kubelet to pull images based on the OCI instance principal attached to the node.
+    wget https://github.com/oracle-devrel/oke-credential-provider-for-ocir/releases/download/v0.1.0/oke-credential-provider-for-ocir-linux-amd64 -O /usr/local/bin/credential-provider-oke
+    wget https://github.com/oracle-devrel/oke-credential-provider-for-ocir/releases/download/v0.1.0/credential-provider-config.yaml -P /etc/kubernetes/
+    sudo chmod 755 /usr/local/bin/credential-provider-oke
+
+    # Convert the KUBELET_TAINTS positional argument to a kubelet taint argument that will be passed to the kubelet.
+    declare -a KUBELET_TAINTS_ARGS=()
+    if [ "$KUBELET_TAINTS" != "[]" ]; then
+        apt-get install -y jq # We need jq to parse the taints
+        for taint in $(echo "$KUBELET_TAINTS" | jq -r '.[] | @base64'); do
+            _jq() {
+                echo "${taint}" | base64 --decode | jq -r "${1}"
+            }
+
+            key=$(_jq '.key')
+            value=$(_jq '.value')
+            effect=$(_jq '.effect')
+
+            # Continually build the taint argument.
+            KUBELET_TAINTS_ARGS+=(--taint="{\"key\":\"$key\",\"value\":\"$value\",\"effect\":\"$effect\"}")
+        done
+    fi
+
+    # Base kubelet arguments that should always be present
+    declare -a BASE_KUBELET_ARGS=(
+        --image-credential-provider-bin-dir=/usr/local/bin/
+        --image-credential-provider-config=/etc/kubernetes/credential-provider-config.yaml
+    )
+
+    # Add node labels if provided
+    [ -n "$KUBELET_NODE_LABELS_ARGS" ] && BASE_KUBELET_ARGS+=(--node-labels="$KUBELET_NODE_LABELS_ARGS")
+    oke bootstrap --manage-gpu-services --kubelet-extra-args "${BASE_KUBELET_ARGS[*]}" "${KUBELET_TAINTS_ARGS[@]}"
+  "path": "/tmp/oke_start_script.sh"
+  "permissions": "0755"
+- "content": |
+    #!/usr/bin/env bash
+    # shellcheck disable=SC2086,SC2174
+    #
+    # This script is taken from https://github.com/oracle-quickstart/oci-hpc-oke/blob/3d7c1050c06980f1dc2232f2bf49fb4d4b313fc9/files/oke-nvme-raid.sh
+    # The only modifications done was adding the `shellcheck dissable` directives.
+    #
+    set -o errexit -o nounset -o pipefail -x
+    shopt -s nullglob
+
+    level="${1:-0}"
+    pattern="${2:-/dev/nvme*n1}"
+    mount_primary="${3:-/mnt/nvme}"
+    mount_extra=(/var/lib/{containers,kubelet,logs/pods})
+    md_device="/dev/md/0"
+
+    # Enumerate NVMe devices, exit if absent
+    # shellcheck disable=SC2206
+    devices=($pattern)
+    if [ ${#devices[@]} -eq 0 ]; then
+      echo "No NVMe devices" >&2
+      exit 0
+    fi
+
+    # Determine config for detected device count and RAID level
+    count=${#devices[@]}; bs=4; chunk=256
+    stride=$((chunk/bs)) # chunk size / block size
+    eff_count=$count # $level == 0
+    if [[ $level == 10 ]]; then eff_count=$((count/2)); fi
+    if [[ $level == 5 ]]; then eff_count=$((count-1)); fi
+    if [[ $level == 6 ]]; then eff_count=$((count-2)); fi
+    stripe=$((eff_count*stride)) # number of data disks * stride
+
+    echo -e "Creating RAID${level} filesystem mounted under ${mount_primary} with $count devices:\n  ${devices[*]}" >&2
+    echo -e "Filesystem options:\n  eff_count=$eff_count; chunk=${chunk}K; bs=${bs}K; stride=$stride; stripe-width=${stripe}" >&2
+    shopt -u nullglob; seen_arrays=(/dev/md/*);
+    # shellcheck disable=SC2034
+    device=${seen_arrays[0]}
+    if [ ! -e "$md_device" ]; then
+      echo "y" | mdadm --create "$md_device" --level="$level" --chunk=$chunk --force --raid-devices="$count" "${devices[@]}"
+      dd if=/dev/zero of="$md_device" bs=${bs}K count=128
+    else
+      echo "$md_device already initialized" >&2
+    fi
+
+    if ! tune2fs -l "$md_device" &>/dev/null; then
+      echo "Formatting '$md_device'" >&2
+      mkfs.ext4 -I 512 -b $((bs*1024)) -E stride=${stride},stripe-width=${stripe} -O dir_index -m 1 -F "$md_device"
+    else
+      echo "$md_device already formatted" >&2
+    fi
+
+    mkdir -m 0755 -p "$mount_primary" "${mount_extra[@]}"
+    dev_uuid=$(blkid -s UUID -o value "${md_device}")
+    mount_unit_name="$(systemd-escape --path --suffix=mount "${mount_primary}")"
+    cat > "/etc/systemd/system/${mount_unit_name}" << EOF
+        [Unit]
+        Description=Mount local NVMe RAID for OKE
+        [Mount]
+        What=UUID=${dev_uuid}
+        Where=${mount_primary}
+        Type=ext4
+        Options=defaults,noatime
+        [Install]
+        WantedBy=multi-user.target
+    EOF
+      systemd-analyze verify "${mount_unit_name}"
+      systemctl enable "${mount_unit_name}" --now
+
+    for mount in "${mount_extra[@]}"; do
+      name=$(basename "$mount")
+      array_mount_point_name="$mount_primary/$name"
+      mkdir -m 0755 -p "$mount_primary/$name"
+      mount_unit_name="$(systemd-escape --path --suffix=mount "${mount}")"
+      cat > "/etc/systemd/system/${mount_unit_name}" << EOF
+          [Unit]
+          Description=Mount ${name} on OKE NVMe RAID
+          [Mount]
+          What=${array_mount_point_name}
+          Where=${mount}
+          Type=none
+          Options=bind
+          [Install]
+          WantedBy=multi-user.target
+    EOF
+        systemd-analyze verify "${mount_unit_name}"
+        systemctl enable "${mount_unit_name}" --now
+    done
+
+    mdadm --detail --scan --verbose >> /etc/mdadm/mdadm.conf
+
+    update-initramfs -u
+  "path": "/tmp/oke_nvme_raid.sh"
+  "permissions": "0755"
+- "content": |
+    ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDGyELDrrlr4fEUpdc8GWMsJsjPvom5BlY4hix9C/JQ5rLRiBlefPi/i6wYPQYbZk50/4fsK50aXMn1soXwEw40FbwG42JMlh5r/Ei6dMiOpfJRSqY3ZDr8809EQpy/kGGyZYy92YRw38pdbSJKubKsQMil6QHGzrdD+luVHGa3bJnl+eqOqrq3tp2iDUxCMZl63CyDjNcVWYAUYprMEUGzrxFWKqmR0XTNzipAYN2dlBwUgA72e0ttvV7E4zNR52S8yAUaLvPaYUjC089wd89VTj4yFQUM2ZMOx/ck0vMTcXdVeOxUiPqeCygtHa1ZfjYRLDQ6GoSAMqT9xf7pfEQ/
+  "encoding": null
+  "path": "/home/ubuntu/.ssh/authorized_keys"
+  "permissions": "0600"
+
+--MIMEBOUNDARY--
