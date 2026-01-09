@@ -1,7 +1,10 @@
 # Tenancy Variables
+# To populate these variables, run the following command list_oke_cluster.sh.  Need to make sure Region, TENANCY_ID, COMPARTMENT_ID and a portion of the cluster_name to search for are specified before running.
 REGION=""
 TENANCY_ID=""
 COMPARTMENT_ID=""
+
+
 AD=""
 WORKER_SUBNET_ID=""
 WORKER_SUBNET_NSG_ID=""
