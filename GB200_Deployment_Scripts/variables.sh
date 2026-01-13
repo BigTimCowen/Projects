@@ -22,6 +22,7 @@ IMAGE_ID=""
 
 # OKE Cluster Name to search for in tenancy
 CLUSTER_NAME=""
+SHAPE_NAME="BM.GPU.GB200-v3.4"
 
 # Comparmtnet name to search for in tenancy
 COMPARTMENT_NAME=""

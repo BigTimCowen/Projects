@@ -6,6 +6,15 @@ exec > >(tee -a  $LOGFILE) 2>&1
 echo "Starting creation of instance configuration at $(date)"
 echo "Sourcing Variables from variables.sh"
 source ./variables.sh
+echo "Region: ${REGION}"
+echo "Compartment OCID: ${COMPARTMENT_ID}"
+echo "Availability Domain: ${AD}"
+echo "Worker Subnet OCID: ${WORKER_SUBNET_ID}"
+echo "Worker Subnet NSG OCID: ${WORKER_SUBNET_NSG_ID}"
+echo "POD Subnet OCID: ${POD_SUBNET_ID}"
+echo "POD Subnet NSG OCID: ${POD_SUBNET_NSG_ID}"
+echo "Image OCID: ${IMAGE_ID}"
+echo "Shape Name: ${SHAPE_NAME}"
 
 # -----------------------------
 # Encode cloud-init
@@ -43,7 +52,7 @@ oci --region "${REGION}" \
       "pod-subnets": "${POD_SUBNET_ID}",
       "pod-nsgids": "${POD_SUBNET_NSG_ID}"
     },
-    "shape": "BM.GPU.B200.8",
+    "shape": "${SHAPE_NAME}",
     "sourceDetails": {
       "bootVolumeSizeInGBs": "512",
       "bootVolumeVpusPerGB": "20",
