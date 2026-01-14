@@ -10,7 +10,8 @@ source ./variables.sh
 
 
 echo "Adding image compatability entry for image $IMAGE_ID with $SHAPE_NAME"
-
+set -x 
 oci compute image-shape-compatibility-entry add --image-id $IMAGE_ID --shape-name $SHAPE_NAME
+set +x 
 
 echo "Completed adding image compatability entry for image $IMAGE_ID in compartment $COMPARTMENT_ID at $(date)"

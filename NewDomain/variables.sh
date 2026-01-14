@@ -2,6 +2,10 @@
 # To populate these variables, run the following command list_oke_cluster.sh.  Need to make sure Region, TENANCY_ID, COMPARTMENT_ID and a portion of the cluster_name to search for are specified before running.
 REGION=""
 TENANCY_ID=""
+DOMAIN_NAME="AI-Domain"
+DOMAIN_DESCRIPTION="AI Domain for AI Infrastructure"
+AI_DOMAIN_ID=""
+AI_GROUP_NAME="AI-Administrators"
 
 # Compartment where the OKE Cluster and worker nodes will be created
 COMPARTMENT_ID=""
@@ -26,8 +30,6 @@ SHAPE_NAME="BM.GPU.GB200-v3.4"
 
 # Comparmtnet name to search for in tenancy
 COMPARTMENT_NAME=""
-INSTANCE_CONFIG_DISPLAY_NAME="GB200-OKE-Worker-Config"
-COMPUTE_CLUSTER_DISPLAY_NAME="GB200-OKE-Compute-Cluster"
 
 #
 # Compute Cluster OCID
