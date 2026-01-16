@@ -14,7 +14,7 @@ echo "Region: $REGION"
 echo "Compartment ID: $COMPARTMENT_ID"
 
 set -x
-oci --region $REGION compute-management instance-configuration list --compartment-id $COMPARTMENT_ID
+oci --region $REGION compute-management instance-configuration list --compartment-id $COMPARTMENT_ID --query "data[?contains(\"display-name\", '$INSTANCE_CONFIG_DISPLAY_NAME')]"
 set +x
 
 echo "Completed listing instance configuration at $(date)"

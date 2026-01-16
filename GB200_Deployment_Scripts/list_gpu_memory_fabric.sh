@@ -8,6 +8,7 @@ echo "Listing GPU Memory Fabrics at $(date)"
 echo "Sourcing Variables from variables.sh"
 
 source ./variables.sh
+echo "This is refreshed every 15 minutes based on capacity topology"
 set -x
 oci compute compute-gpu-memory-fabric list --compartment-id $TENANCY_ID
 set +x

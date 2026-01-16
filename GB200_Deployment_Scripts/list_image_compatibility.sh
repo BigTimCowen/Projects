@@ -12,7 +12,7 @@ source ./variables.sh
 echo "Listing image compatability entry for image $IMAGE_ID with $SHAPE_NAME"
 
 set -x 
-oci compute image-shape-compatibility-entry list --image-id $IMAGE_ID
+oci compute image-shape-compatibility-entry list --image-id $IMAGE_ID --query "data[?contains(\"shape\", '$SHAPE_NAME')]"
 set +x 
 
 echo "Completed listing image compatability entry for image $IMAGE_ID at $(date)"

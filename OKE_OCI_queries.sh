@@ -17,7 +17,7 @@ oci compute image list   --compartment-id $OCI_TENANCY   --all --query "data[?co
 oci compute image-shape-compatibility-entry list --image-id <image_id> --query "data[?contains(shape,'MI300X')]"
 oci compute image-shape-compatibility-entry list --image-id ocid1.image.oc1.phx.aaaaaaaalebw6ni657v57gtjnxkztzvvomwckzqrvkodxh22czeiscgdqkhq --query "data[?contains(shape,'MI300X')]"
 
-oci compute image list   --compartment-id ocid1.compartment.oc1..aaaaaaaaycgwyl3ud3iqn5tpz2txhtfc5i5jikurgicfyo6vgx34x3kijlva   --all --query "data[?\"compartment-id\" != null].{Compartment_ocid: \"compartment-id\", operating_system: \"operating-system\", os_ver: \"operating-system-version\", display_name: \"display-name\"}"   --output table
+oci compute image list   --compartment-id ocid1.compartment.oc1..aaaaaaaazlnxy2aq3qbp5yuvbvs3prw3olcz47hjz473pr2qreznohqedndq   --all --query "data[?\"compartment-id\" != null].{Compartment_ocid: \"compartment-id\", operating_system: \"operating-system\", os_ver: \"operating-system-version\", display_name: \"display-name\"}"   --output table
 
 COMPARTMENT_NAME="TimCowen"
 NODE_POOL_NAME="gpu"
@@ -71,7 +71,7 @@ oci --region us-phoenix-1 compute capacity-topology bare-metal-host list --capac
 
 oci --region us-phoenix-1 compute capacity-topology bare-metal-host list --capacity-topology-id <...> --query "data[?contains(compute-network-block-id, '']"
 
-oci compute instance list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa  --auth instance_principal --output table --query "data[].{shape: shape, lifecycle: \"lifecycle-state\", display: \"display-name\"}"
+oci compute instance list --compartment-id ocid1.compartment.oc1..aaaaaaaazlnxy2aq3qbp5yuvbvs3prw3olcz47hjz473pr2qreznohqedndq  --auth instance_principal --output table --query "data[].{shape: shape, lifecycle: \"lifecycle-state\", display: \"display-name\"}"
 oci compute-management cluster-network list --compartment-id ocid1.compartment.oc1..aaaaaaaaq6c6fs2yk7z7gb4gxousnsf5dmuwjl2rzpwenjucnfunqtp6wufa --auth instance_principal --output table --query "data[].{display:\"display-name\",instancepool:\"instance-pools\",lifecycle:\"lifecycle-state\"}"
 
 oci ce cluster disable-addon --cluster-id <cluster-id> --addon-name NvidiaGpuPlugin
@@ -95,3 +95,10 @@ oci compute console-history get-content --instance-console-history-id $CONSOLE_H
 
 #Manually add image capability to an image
 oci compute image-shape-compatibility-entry add --image-id ocid1.image.oc1.ca-montreal-1.aaaaaaaajvjfqw3jhibunlykampikotas36ce3sb --shape-name BM.GPU.B4.8
+
+kubectl get nodes -l node.kubernetes.io/instance-type=BM.GPU.GB200-v3.4 -o jsonpath='{range .items[*]}{.spec.providerID}{"\n"}{end}'
+
+for i in $(cat cn-node-id)
+do
+oci compute instance action --action RESET --instance-id $i
+done

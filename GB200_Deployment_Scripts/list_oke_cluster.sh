@@ -20,10 +20,16 @@ COMPARTMENT_OCID=$(oci iam compartment list --compartment-id $TENANCY_OCID  --co
 PRIMARY_CLUSTER_NAME=$(oci ce cluster list --compartment-id $COMPARTMENT_OCID   --query "data[?\"lifecycle-state\"==\`ACTIVE\` && contains(name, \`$CLUSTER_NAME\`)].\"name\" | [0]" --raw-output)
 PRIMARY_OKE_OCID=$(oci ce cluster list --compartment-id $COMPARTMENT_OCID   --query "data[?\"lifecycle-state\"==\`ACTIVE\` && contains(name, \`$CLUSTER_NAME\`)].\"id\" | [0]" --raw-output)
 PRIMARY_OKE_VCN=$(oci ce cluster list --compartment-id $COMPARTMENT_OCID   --query "data[?\"lifecycle-state\"==\`ACTIVE\` && contains(name, \`$CLUSTER_NAME\`)].\"vcn-id\" | [0]" --raw-output)
+PRIMARY_OKE_VCN_NAME=$(oci network vcn list --compartment-id $COMPARTMENT_OCID --query "data[?\"id\"==\`$PRIMARY_OKE_VCN\`].\"display-name\" | [0]" --raw-output)
+CLUSTER_POD_NETWORK_OPTION=$(oci ce cluster list --compartment-id $COMPARTMENT_OCID   --query "data[?\"lifecycle-state\"==\`ACTIVE\` && contains(name, \`$CLUSTER_NAME\`)].\"cluster-pod-network-options\" | [0]" --raw-output)
 WORKER_VCN=$(oci network subnet list --vcn-id $PRIMARY_OKE_VCN --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `workers`)].id | [0]' --raw-output)
+WORKER_VCN_NAME=$(oci network subnet list --vcn-id $PRIMARY_OKE_VCN --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `workers`)]."display-name" | [0]' --raw-output)
 WORKER_NSG_OCID=$(oci network nsg list --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `workers`)].id | [0]' --raw-output)
+WORKER_NSG_NAME=$(oci network nsg list --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `workers`)]."display-name" | [0]' --raw-output)
 POD_VCN=$(oci network subnet list --vcn-id $PRIMARY_OKE_VCN --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `pods`)].id | [0]' --raw-output)
+POD_VCN_NAME=$(oci network subnet list --vcn-id $PRIMARY_OKE_VCN --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `pods`)]."display-name" | [0]' --raw-output)
 POD_NSG_OCID=$(oci network nsg list --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `pods`)].id | [0]' --raw-output)
+POD_NSG_NAME=$(oci network nsg list --compartment-id $COMPARTMENT_OCID --query 'data[?contains("display-name", `pods`)]."display-name" | [0]' --raw-output)
 AD1=$(oci iam availability-domain list --compartment-id $COMPARTMENT_OCID --query 'data[0].name' --region $REGION --raw-output)
 AD2=$(oci iam availability-domain list --compartment-id $COMPARTMENT_OCID --query 'data[1].name' --region $REGION --raw-output)
 AD3=$(oci iam availability-domain list --compartment-id $COMPARTMENT_OCID --query 'data[2].name' --region $REGION --raw-output)
@@ -37,12 +43,18 @@ echo "Compartment Name: " $COMPARTMENT_NAME
 echo "Compartment OCID: " $COMPARTMENT_OCID
 echo "Availability Domains: " $AD1, $AD2, $AD3
 echo "OKE Cluster Name: " $PRIMARY_CLUSTER_NAME
+echo "OKE Cluster POD Network Option: " $CLUSTER_POD_NETWORK_OPTION
 echo "OKE OCID: " $PRIMARY_OKE_OCID
 echo "OKE VCN OCID: " $PRIMARY_OKE_VCN
-echo "OKE Worker VCN: " $WORKER_VCN
-echo "OKE Worker NSG OCID: " $WORKER_NSG_OCID
-echo "OKE PODs VCN: " $POD_VCN
-echo "OKE PODs NSG OCID: " $POD_NSG_OCID
+echo "OKE VCN Name: " $PRIMARY_OKE_VCN_NAME
+echo "OKE Worker Subnet: " $WORKER_VCN
+echo "OKE Worker Subnet Name: " $WORKER_VCN_NAME
+echo "OKE Worker Subnet NSG OCID: " $WORKER_NSG_OCID
+echo "OKE Worker Subnet NSG Name:  " $WORKER_NSG_NAME
+echo "OKE PODs Subnet: " $POD_VCN
+echo "OKE PODs Subnet Name: " $POD_VCN_NAME
+echo "OKE PODs Subnet NSG OCID: " $POD_NSG_OCID
+echo "OKE PODs Subnet NSG Name: " $POD_NSG_NAME
 echo "Compute Cluster OCID: " $COMPUTE_CLUSTER
 echo "Instance Configuration OCID: " $IC_CC
 

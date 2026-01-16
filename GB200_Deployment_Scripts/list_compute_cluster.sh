@@ -4,5 +4,5 @@
 source ./variables.sh
 
 set -x
-oci compute compute-cluster list --availability-domain $AD --compartment-id $COMPARTMENT_ID --region $REGION
+oci compute compute-cluster list --availability-domain $AD --compartment-id $COMPARTMENT_ID --region $REGION   --query "data.items[?contains(['ACTIVE', 'UPDATING', 'CREATING'], \"lifecycle-state\")]"
 set +x
