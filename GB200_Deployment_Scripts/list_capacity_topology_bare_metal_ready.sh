@@ -1,7 +1,7 @@
 #!/bin/bash
-# This script lists the Compute Capacity Topology.
+# This script lists the Compute Capacity Topology for instances in tenancy.
 # Requires policy compute-capacity-topology
-# Usage: ./list_capacity_topology_bare_metal.sh [LIFECYCLE_STATE]
+# Usage: ./list_capacity_topology_bare_metal_ready.sh [LIFECYCLE_STATE]
 # LIFECYCLE_STATE is optional. If not provided, shows ALL states without filtering.
 # Valid values: ACTIVE, INACTIVE, DELETED, CREATING, UPDATING, DELETING
 
