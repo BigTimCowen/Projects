@@ -99,7 +99,7 @@ fetch_gpu_clusters() {
     local raw_json=$(mktemp)
     
     oci compute compute-gpu-memory-cluster list \
-        --compartment-id "$COMPARTMENT_ID" \
+        --compartment-id "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}" \
         --all \
         --output json > "$raw_json" 2>/dev/null || {
         rm -f "$raw_json"
@@ -291,8 +291,8 @@ list_instances_not_in_k8s() {
     else
         # Fetch all instances from OCI in the correct format
         oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --region "$REGION" \
+            --compartment-id "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}" \
+            --region "${EFFECTIVE_REGION:-$REGION}" \
             --all \
             --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_normalized" 2>/dev/null
     fi
@@ -376,8 +376,8 @@ list_all_cliques() {
     # Fetch all instances from OCI once
     echo "Fetching all instance details from OCI..."
     oci compute instance list \
-        --compartment-id "$COMPARTMENT_ID" \
-        --region "$REGION" \
+        --compartment-id "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}" \
+        --region "${EFFECTIVE_REGION:-$REGION}" \
         --all \
         --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
     
@@ -505,8 +505,8 @@ list_cliques_summary() {
     # Fetch all instances from OCI once
     echo "Fetching all instance details from OCI..."
     oci compute instance list \
-        --compartment-id "$COMPARTMENT_ID" \
-        --region "$REGION" \
+        --compartment-id "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}" \
+        --region "${EFFECTIVE_REGION:-$REGION}" \
         --all \
         --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
     
@@ -698,8 +698,8 @@ get_node_info() {
             # Create temp file for OCI data
             local oci_temp=$(mktemp)
             oci compute instance list \
-                --compartment-id "$COMPARTMENT_ID" \
-                --region "$REGION" \
+                --compartment-id "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}" \
+                --region "${EFFECTIVE_REGION:-$REGION}" \
                 --all \
                 --output json | jq -r '.data[] | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_temp"
             
@@ -1108,9 +1108,48 @@ list_instances_by_gpu_cluster() {
 }
 
 # Main script
+
+# Parse global options first
+CUSTOM_COMPARTMENT=""
+CUSTOM_REGION=""
+
+# Check for --compartment-id option
+args=("$@")
+new_args=()
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    if [[ "${args[$i]}" == "--compartment-id" ]]; then
+        if [[ $((i + 1)) -lt ${#args[@]} ]]; then
+            CUSTOM_COMPARTMENT="${args[$((i + 1))]}"
+            i=$((i + 2))
+        else
+            echo -e "${RED}Error: --compartment-id requires a value${NC}"
+            exit 1
+        fi
+    elif [[ "${args[$i]}" == "--region" ]]; then
+        if [[ $((i + 1)) -lt ${#args[@]} ]]; then
+            CUSTOM_REGION="${args[$((i + 1))]}"
+            i=$((i + 2))
+        else
+            echo -e "${RED}Error: --region requires a value${NC}"
+            exit 1
+        fi
+    else
+        new_args+=("${args[$i]}")
+        i=$((i + 1))
+    fi
+done
+
+# Use custom values if provided, otherwise use defaults from variables.sh
+EFFECTIVE_COMPARTMENT_ID="${CUSTOM_COMPARTMENT:-$COMPARTMENT_ID}"
+EFFECTIVE_REGION="${CUSTOM_REGION:-$REGION}"
+
+# Restore positional parameters without the global options
+set -- "${new_args[@]}"
+
 if [ -z "$1" ]; then
     # No arguments - list all GPU instances in compartment
-    list_all_instances "$COMPARTMENT_ID" "$REGION"
+    list_all_instances "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
     exit 0
 fi
 
@@ -1134,15 +1173,19 @@ if [[ "$1" == "--list-cluster" ]]; then
     fi
     
     gpu_cluster="$2"
-    list_instances_by_gpu_cluster "$gpu_cluster" "$COMPARTMENT_ID" "$REGION"
+    list_instances_by_gpu_cluster "$gpu_cluster" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
     exit $?
 fi
 
 # Check if showing help
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    echo -e "${BOLD}Usage:${NC} $0 [instance-ocid] [OPTIONS]"
+    echo -e "${BOLD}Usage:${NC} $0 [OPTIONS] [instance-ocid] [OPTIONS]"
     echo ""
     echo "If no instance-ocid is provided, lists all GPU instances in the compartment with fabric details"
+    echo ""
+    echo -e "${BOLD}Global Options:${NC}"
+    echo "  --compartment-id <ocid>   Override compartment ID from variables.sh"
+    echo "  --region <region>          Override region from variables.sh"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  --labels         Show all labels for the node"
@@ -1162,6 +1205,8 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  $0                                                    # List all GPU instances with fabric info"
+    echo "  $0 --compartment-id ocid1.compartment.oc1..xxx        # Use different compartment"
+    echo "  $0 --region us-ashburn-1                              # Use different region"
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
     echo "  $0 --cliques-summary                                  # Summary table of cliques with fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx                 # Basic node info"
