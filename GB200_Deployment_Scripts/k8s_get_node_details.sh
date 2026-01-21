@@ -545,21 +545,25 @@ list_cliques_summary() {
         
         local cluster_count="${#mem_clusters[@]}"
         
-        # Get fabric for first cluster
+        # Get fabric and cluster state for first cluster
         local fabric_display="N/A"
         local fabric_ocid_display="N/A"
+        local cluster_state="N/A"
         if [[ -n "$first_cluster" ]]; then
             local fabric_info=$(get_fabric_from_cluster "$first_cluster")
             IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_info"
             fabric_display="$fabric_name"
             fabric_ocid_display="$fabric_ocid"
+            
+            # Get cluster state
+            cluster_state=$(get_cluster_state "$first_cluster")
         fi
         
         # Don't truncate - show full values
         local clique_display="$clique_id"
         local fabric_ocid_short="$fabric_ocid_display"
         
-        echo "$clique_display|$node_count|$cluster_count|$first_cluster|$fabric_display|$fabric_ocid_short" >> "$temp_output"
+        echo "$clique_display|$node_count|$cluster_count|$first_cluster|$cluster_state|$fabric_display|$fabric_ocid_short" >> "$temp_output"
         
         unset mem_clusters
     done <<< "$cliques"
