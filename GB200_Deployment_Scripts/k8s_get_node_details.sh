@@ -27,6 +27,7 @@ mkdir -p "$CACHE_DIR"
 
 FABRIC_CACHE="$CACHE_DIR/gpu_fabrics.txt"
 CLUSTER_CACHE="$CACHE_DIR/gpu_clusters.txt"
+NODE_STATE_CACHE="$CACHE_DIR/node_states.txt"
 
 # Function to fetch and cache GPU memory fabrics
 fetch_gpu_fabrics() {
@@ -131,6 +132,21 @@ fetch_gpu_clusters() {
     return 0
 }
 
+# Function to fetch and cache node states
+fetch_node_states() {
+    echo "# Node States" > "$NODE_STATE_CACHE"
+    echo "# Format: ProviderID|NodeState" >> "$NODE_STATE_CACHE"
+    
+    kubectl get nodes -o json 2>/dev/null | jq -r '.items[] | 
+        "\(.spec.providerID)|\(
+            .status.conditions[] | 
+            select(.type=="Ready") | 
+            if .status=="True" then "Ready" 
+            elif .status=="False" then "NotReady" 
+            else "Unknown" end
+        )"' >> "$NODE_STATE_CACHE" 2>/dev/null || true
+}
+
 # Function to get cluster state from OCID
 get_cluster_state() {
     local cluster_ocid="$1"
@@ -174,6 +190,19 @@ get_fabric_from_cluster() {
     fi
 }
 
+# Function to get node state from cache
+get_node_state_cached() {
+    local instance_id="$1"
+    
+    if [[ ! -f "$NODE_STATE_CACHE" ]]; then
+        echo "N/A"
+        return 1
+    fi
+    
+    local state=$(grep "^${instance_id}|" "$NODE_STATE_CACHE" | cut -d'|' -f2)
+    echo "${state:-N/A}"
+}
+
 # Function to list fabrics without clusters
 list_fabrics_without_clusters() {
     echo -e "${BOLD}${MAGENTA}=== GPU Memory Fabrics Without Active Clusters ===${NC}"
@@ -191,6 +220,7 @@ list_fabrics_without_clusters() {
     local used_fabric_suffixes=$(grep -v '^#' "$CLUSTER_CACHE" | grep "|ACTIVE|" | cut -d'|' -f4 | sort -u)
     
     local found_unused=false
+    local temp_output=$(mktemp)
     
     while read -r fabric_suffix; do
         # Check if this suffix is used by any ACTIVE cluster
@@ -201,18 +231,121 @@ list_fabrics_without_clusters() {
             local fabric_line=$(grep -v '^#' "$FABRIC_CACHE" | grep "|$fabric_suffix|" | head -n1)
             IFS='|' read -r fabric_name fabric_suf fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_line"
             
-            echo -e "${BOLD}${CYAN}Fabric: $fabric_name${NC}"
-            echo -e "  OCID: $fabric_ocid"
-            echo -e "  Suffix: $fabric_suf"
-            echo -e "  State: $fabric_state"
-            echo -e "  Hosts: ${avail_hosts}/${total_hosts} available"
-            echo ""
+            echo "$fabric_name|$fabric_ocid|$fabric_state|${avail_hosts}/${total_hosts}" >> "$temp_output"
         fi
     done <<< "$all_fabric_suffixes"
     
     if [[ "$found_unused" == false ]]; then
         echo -e "${GREEN}All fabrics have active clusters${NC}"
+    else
+        # Print column headers
+        printf "${BOLD}%-40s %-105s %-15s %s${NC}\n" \
+            "Fabric Name" "Fabric OCID" "State" "Hosts (Avail/Total)"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        
+        # Print data
+        while IFS='|' read -r fabric_name fabric_ocid fabric_state hosts; do
+            printf "${CYAN}%-40s${NC} ${YELLOW}%-105s${NC} ${MAGENTA}%-15s${NC} ${GREEN}%s${NC}\n" \
+                "$fabric_name" "$fabric_ocid" "$fabric_state" "$hosts"
+        done < "$temp_output"
     fi
+    
+    rm -f "$temp_output"
+}
+
+# Function to list instances not in K8s cluster
+list_instances_not_in_k8s() {
+    local oci_data_file="$1"  # Optional: path to existing OCI data file
+    
+    echo -e "${BOLD}${MAGENTA}=== GPU Instances Not in Kubernetes Cluster ===${NC}"
+    echo ""
+    
+    # Create temp files
+    local oci_temp=$(mktemp)
+    local oci_normalized=$(mktemp)
+    local k8s_temp=$(mktemp)
+    
+    # Use provided OCI data or fetch fresh data
+    if [[ -n "$oci_data_file" ]] && [[ -f "$oci_data_file" ]]; then
+        # Use existing OCI data - need to determine format and normalize
+        # All sources should now be filtering for GPU instances already
+        # Check first line to determine format
+        local first_line=$(head -n1 "$oci_data_file")
+        local field_count=$(echo "$first_line" | awk -F'|' '{print NF}')
+        
+        if [[ $field_count -eq 4 ]]; then
+            # Could be either format, check if first field looks like an OCID
+            local first_field=$(echo "$first_line" | cut -d'|' -f1)
+            if [[ "$first_field" =~ ^ocid1\.instance\. ]]; then
+                # Format: instance_id|display_name|state|gpu_cluster (correct format)
+                cp "$oci_data_file" "$oci_normalized"
+            else
+                # Format: display_name|status|instance_ocid|gpu_mem (needs reordering)
+                # Reorder to: instance_ocid|display_name|status|gpu_mem
+                awk -F'|' '{print $3"|"$1"|"$2"|"$4}' "$oci_data_file" > "$oci_normalized"
+            fi
+        else
+            # Unknown format, copy as-is and hope for the best
+            cp "$oci_data_file" "$oci_normalized"
+        fi
+    else
+        # Fetch all instances from OCI in the correct format
+        oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --region "$REGION" \
+            --all \
+            --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_normalized" 2>/dev/null
+    fi
+    
+    # Fetch only GPU K8s nodes (not all nodes)
+    kubectl get nodes -l nvidia.com/gpu.present=true -o json | jq -r '.items[] | .spec.providerID' > "$k8s_temp" 2>/dev/null
+    
+    local found_orphaned=false
+    local temp_output=$(mktemp)
+    
+    # Find instances not in K8s
+    while IFS='|' read -r instance_id display_name state gpu_cluster; do
+        if ! grep -q "^${instance_id}$" "$k8s_temp"; then
+            found_orphaned=true
+            
+            # Get cluster state
+            local cluster_state="N/A"
+            if [[ "$gpu_cluster" != "N/A" ]]; then
+                cluster_state=$(get_cluster_state "$gpu_cluster")
+            fi
+            
+            # Truncate for display
+            local gpu_cluster_display="$gpu_cluster"
+            if [[ "$gpu_cluster" != "N/A" && ${#gpu_cluster} -gt 20 ]]; then
+                gpu_cluster_display="...${gpu_cluster: -17}"
+            fi
+            
+            echo "$display_name|$instance_id|$state|$gpu_cluster_display|$cluster_state" >> "$temp_output"
+        fi
+    done < "$oci_normalized"
+    
+    if [[ "$found_orphaned" == false ]]; then
+        echo -e "${GREEN}All GPU instances are in the Kubernetes cluster${NC}"
+    else
+        # Print column headers
+        printf "${BOLD}%-30s %-95s %-12s %-23s %s${NC}\n" \
+            "Display Name" "Instance OCID" "OCI State" "GPU Cluster" "Cluster State"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        
+        # Print data
+        while IFS='|' read -r display_name instance_id state gpu_cluster cluster_state; do
+            # Color code the state
+            local state_color="${GREEN}"
+            if [[ "$state" != "RUNNING" ]]; then
+                state_color="${YELLOW}"
+            fi
+            
+            printf "${WHITE}%-30s${NC} ${YELLOW}%-95s${NC} ${state_color}%-12s${NC} ${CYAN}%-23s${NC} ${MAGENTA}%s${NC}\n" \
+                "$display_name" "$instance_id" "$state" "$gpu_cluster" "$cluster_state"
+        done < "$temp_output"
+    fi
+    
+    rm -f "$oci_temp" "$oci_normalized" "$k8s_temp" "$temp_output"
 }
 
 # Function to list all unique cliques
@@ -223,6 +356,7 @@ list_all_cliques() {
     # Fetch fabrics and clusters first
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_node_states
     
     # Get all unique cliques (GPU nodes only)
     local cliques=$(kubectl get nodes -l nvidia.com/gpu.present=true -o json | jq -r '.items[].metadata.labels["nvidia.com/gpu.clique"]' | grep -v null | sort -u)
@@ -245,7 +379,7 @@ list_all_cliques() {
         --compartment-id "$COMPARTMENT_ID" \
         --region "$REGION" \
         --all \
-        --output json | jq -r '.data[] | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
+        --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
     
     # Iterate through each clique
     while read -r clique_id; do
@@ -316,7 +450,12 @@ list_all_cliques() {
             fi
             
             while IFS='|' read -r node ocid; do
-                echo -e "    ${WHITE}$node${NC} - ${YELLOW}$ocid${NC}"
+                local node_state=$(get_node_state_cached "$ocid")
+                local state_color="${GREEN}"
+                if [[ "$node_state" != "Ready" ]]; then
+                    state_color="${RED}"
+                fi
+                echo -e "    ${WHITE}$node${NC} ${state_color}($node_state)${NC} - ${YELLOW}$ocid${NC}"
             done <<< "${cluster_nodes[$mem_cluster]}"
             echo ""
         done
@@ -327,13 +466,20 @@ list_all_cliques() {
     done <<< "$cliques"
     
     # Cleanup
-    rm -f "$oci_data"
+    # Don't cleanup yet - pass to list_instances_not_in_k8s
     
     echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
     # Show fabrics without clusters
     list_fabrics_without_clusters
+    echo ""
+    
+    # Show instances not in K8s - pass the OCI data file
+    list_instances_not_in_k8s "$oci_data"
+    
+    # Now cleanup
+    rm -f "$oci_data"
 }
 
 # Function to get summary of all cliques
@@ -362,11 +508,12 @@ list_cliques_summary() {
         --compartment-id "$COMPARTMENT_ID" \
         --region "$REGION" \
         --all \
-        --output json | jq -r '.data[] | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
+        --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(.id)|\(."display-name")|\(."lifecycle-state")|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_data"
     
     echo ""
-    printf "${BOLD}%-40s %-15s %-30s %-50s${NC}\n" "Clique ID" "Total Nodes" "Memory Clusters" "Fabric Name"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Collect summary data
+    local temp_output=$(mktemp)
     
     while read -r clique_id; do
         [[ -z "$clique_id" ]] && continue
@@ -396,29 +543,59 @@ list_cliques_summary() {
             fi
         done <<< "$clique_data"
         
-        local cluster_list=$(echo "${!mem_clusters[@]}" | tr ' ' '\n' | sort | tr '\n' ',' | sed 's/,$//')
+        local cluster_count="${#mem_clusters[@]}"
         
         # Get fabric for first cluster
         local fabric_display="N/A"
+        local fabric_ocid_display="N/A"
         if [[ -n "$first_cluster" ]]; then
             local fabric_info=$(get_fabric_from_cluster "$first_cluster")
             IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_info"
             fabric_display="$fabric_name"
+            fabric_ocid_display="$fabric_ocid"
         fi
         
-        printf "${CYAN}%-40s${NC} ${GREEN}%-15s${NC} ${YELLOW}%-30s${NC} ${MAGENTA}%-50s${NC}\n" \
-            "$clique_id" "$node_count" "$cluster_list" "$fabric_display"
+        # Don't truncate - show full values
+        local clique_display="$clique_id"
+        local fabric_ocid_short="$fabric_ocid_display"
+        
+        echo "$clique_display|$node_count|$cluster_count|$first_cluster|$fabric_display|$fabric_ocid_short" >> "$temp_output"
         
         unset mem_clusters
     done <<< "$cliques"
     
-    # Cleanup
-    rm -f "$oci_data"
+    # Print column headers
+    printf "${BOLD}%-48s %-7s %-4s %-106s %-18s${NC}\n" \
+        "Clique ID" "Nodes" "#Cl" "GPU Memory Cluster" "State"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Print data
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid; do
+        # Print main line
+        printf "${CYAN}%-48s${NC} ${GREEN}%-7s${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-95s${NC} ${WHITE}%-12s${NC}\n" \
+            "$clique_id" "$nodes" "$clusters" "$gpu_mem_cluster" "$cluster_state"
+        # Print fabric details on second line if available
+        if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
+            printf "          ${BOLD}${MAGENTA}└─ Fabric:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+                "$fabric_name" "$fabric_ocid"
+        fi
+        echo ""
+    done < "$temp_output"
+    
+    # Cleanup temp_output but keep oci_data for list_instances_not_in_k8s
+    rm -f "$temp_output"
     
     echo ""
     
     # Show fabrics without clusters
     list_fabrics_without_clusters
+    echo ""
+    
+    # Show instances not in K8s - pass the OCI data file
+    list_instances_not_in_k8s "$oci_data"
+    
+    # Now cleanup oci_data
+    rm -f "$oci_data"
 }
 
 # Function to get node name from instance OCID
@@ -431,6 +608,7 @@ get_node_info() {
     # Fetch fabrics and clusters first
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_node_states
     
     local provider_id="${instance_id}"
     local node_name=$(kubectl get nodes -o jsonpath="{.items[?(@.spec.providerID=='${provider_id}')].metadata.name}" 2>/dev/null)
@@ -442,6 +620,14 @@ get_node_info() {
     
     echo -e "${BOLD}${CYAN}Node Name:${NC} $node_name"
     echo -e "${BOLD}${CYAN}Instance OCID:${NC} $instance_id"
+    
+    # Get and show node state
+    local node_state=$(get_node_state_cached "$instance_id")
+    local state_color="${GREEN}"
+    if [[ "$node_state" != "Ready" ]]; then
+        state_color="${RED}"
+    fi
+    echo -e "${BOLD}${CYAN}Node State:${NC} ${state_color}$node_state${NC}"
     
     # Show labels if requested
     if [[ "$show_labels" == "true" ]]; then
@@ -570,10 +756,16 @@ get_node_info() {
                     local oci_info=$(grep "^${provider_id}|" "$oci_temp")
                     IFS='|' read -r ocid display_name state gpu_cluster <<< "$oci_info"
                     
+                    local node_state=$(get_node_state_cached "$provider_id")
+                    local state_color="${GREEN}"
+                    if [[ "$node_state" != "Ready" ]]; then
+                        state_color="${RED}"
+                    fi
+                    
                     if [[ "$node" == "$(kubectl get nodes -o jsonpath="{.items[?(@.spec.providerID=='${instance_id}')].metadata.name}")" ]]; then
-                        echo -e "  ${BOLD}${WHITE}► $node${NC} ${YELLOW}(this node)${NC}"
+                        echo -e "  ${BOLD}${WHITE}► $node${NC} ${state_color}($node_state)${NC} ${YELLOW}(this node)${NC}"
                     else
-                        echo -e "  ${WHITE}  $node${NC}"
+                        echo -e "  ${WHITE}  $node${NC} ${state_color}($node_state)${NC}"
                     fi
                     echo -e "    ${CYAN}Display Name:${NC} $display_name"
                     echo -e "    ${CYAN}State:${NC} $state"
@@ -624,19 +816,23 @@ list_all_instances() {
         --compartment-id "$compartment_id" \
         --region "$region" \
         --all \
-        --output json | jq -r '.data[] | "\(."display-name")|\(."lifecycle-state")|\(.id)|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_temp"
+        --output json | jq -r '.data[] | select(."shape" | contains("GPU")) | "\(."display-name")|\(."lifecycle-state")|\(.id)|\(."freeform-tags"."oci:compute:gpumemorycluster" // "N/A")"' > "$oci_temp"
     
     # Fetch all K8s GPU nodes only
     echo "Fetching GPU nodes from Kubernetes..."
     kubectl get nodes -l nvidia.com/gpu.present=true -o json | jq -r '.items[] | "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels."nvidia.com/gpu.clique" // "N/A")"' > "$k8s_temp"
     
+    # Fetch node states once
+    echo "Fetching node states..."
+    fetch_node_states
+    
     echo "Processing data..."
     echo ""
     
     # Print table header
-    printf "${BOLD}%-28s %-15s %-10s %-95s %-12s %-12s %s${NC}\n" \
-        "Display Name" "K8s Node" "State" "Instance OCID" "GPU Cluster" "Cluster St" "Clique ID"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    printf "${BOLD}%-28s %-15s %-11s %-10s %-95s %-12s %-12s %-48s${NC}\n" \
+        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "GPU Cluster" "Cluster St" "Clique ID"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     # Join the data and print (only include GPU nodes)
     local output_temp=$(mktemp)
@@ -646,6 +842,9 @@ list_all_instances() {
         if [[ -n "$k8s_info" ]]; then
             # Only include if it's in K8s GPU nodes
             IFS='|' read -r ocid node_name clique_id <<< "$k8s_info"
+            
+            # Get node state from cache
+            local node_state=$(get_node_state_cached "$instance_ocid")
             
             # Get cluster state using FULL OCID
             local cluster_state="N/A"
@@ -665,21 +864,30 @@ list_all_instances() {
                 cluster_state_display="${cluster_state:0:9}..."
             fi
             
-            # Truncate clique for display
+            # Don't truncate - show full clique ID
             local clique_display="$clique_id"
-            if [[ "$clique_id" != "N/A" && ${#clique_id} -gt 40 ]]; then
-                clique_display="${clique_id:0:37}..."
-            fi
             
             # Store for sorting: gpu_mem|display_name|rest_of_line
-            # IMPORTANT: Store the FULL gpu_mem OCID for later lookup
-            echo "$gpu_mem|$display_name|%-28s %-15s %-10s %-95s %-12s %-12s %s\n||$display_name||$node_name||$status||$instance_ocid||$gpu_mem_display||$cluster_state_display||$clique_display||$gpu_mem" >> "$output_temp"
+            echo "$gpu_mem|$display_name|%-28s %-15s %-11s %-10s %-95s %-12s %-12s %s\n||$display_name||$node_name||$node_state||$status||$instance_ocid||$gpu_mem_display||$cluster_state_display||$clique_display||$gpu_mem" >> "$output_temp"
         fi
     done < "$oci_temp"
     
     # Sort by GPU memory cluster (column 1), then display name (column 2)
-    sort -t'|' -k1,1 -k2,2 "$output_temp" | while IFS='|' read -r gpu_mem display_name format_str _ dn _ nn _ st _ io _ gm _ cs _ cd _ gpu_mem_full; do
-        printf "$format_str" "$dn" "$nn" "$st" "$io" "$gm" "$cs" "$cd"
+    sort -t'|' -k1,1 -k2,2 "$output_temp" | while IFS='|' read -r gpu_mem display_name format_str _ dn _ nn _ ns _ st _ io _ gm _ cs _ cd _ gpu_mem_full; do
+        # Color code node state
+        local node_state_color="${GREEN}"
+        if [[ "$ns" != "Ready" ]]; then
+            node_state_color="${RED}"
+        fi
+        
+        # Color code OCI state
+        local oci_state_color="${GREEN}"
+        if [[ "$st" != "RUNNING" ]]; then
+            oci_state_color="${YELLOW}"
+        fi
+        
+        printf "%-28s %-15s ${node_state_color}%-11s${NC} ${oci_state_color}%-10s${NC} %-95s %-12s %-12s %-48s\n" \
+            "$dn" "$nn" "$ns" "$st" "$io" "$gm" "$cs" "$cd"
     done
     
     rm -f "$output_temp"
@@ -704,15 +912,19 @@ list_all_instances() {
     echo -e "${BOLD}${BLUE}=== Summary by GPU Clique ===${NC}"
     echo ""
     
+    # Collect summary data
+    local summary_temp=$(mktemp)
+    
     while read -r clique; do
         [[ -z "$clique" ]] && continue
         
         if [[ "$clique" == "N/A" ]]; then
-            echo -e "${BOLD}${YELLOW}Clique: N/A (No GPU or not in cluster)${NC}"
+            local clique_display="N/A (No GPU or not in cluster)"
         else
-            local clique_size=$(grep -c "|${clique}\$" "$joined_temp")
-            echo -e "${BOLD}${CYAN}Clique: $clique${NC} ${GREEN}(Total: $clique_size instances)${NC}"
+            local clique_display="$clique"
         fi
+        
+        local clique_size=$(grep -c "|${clique}\$" "$joined_temp")
         
         # Get all entries for this clique from joined file
         local clique_entries=$(grep "|${clique}\$" "$joined_temp")
@@ -741,47 +953,59 @@ list_all_instances() {
             fi
         done <<< "$clique_entries"
         
-        # Display counts sorted by GPU memory cluster
-        local total_count=0
-        for gpu_mem in $(echo "${!gpu_clusters_count[@]}" | tr ' ' '\n' | sort -n 2>/dev/null || echo "${!gpu_clusters_count[@]}" | tr ' ' '\n' | sort); do
-            local count=${gpu_clusters_count[$gpu_mem]}
-            ((total_count += count))
-            
-            echo -e "  ${MAGENTA}GPU Mem Cluster:${NC} $gpu_mem ${GREEN}($count instances)${NC}"
-            
-            # Show cluster state
-            if [[ -n "${gpu_clusters_states[$gpu_mem]}" ]]; then
-                echo -e "    ${YELLOW}├─ Cluster State:${NC} ${gpu_clusters_states[$gpu_mem]}"
-            fi
-            
-            # Show fabric info if available
-            if [[ -n "${gpu_clusters_fabrics[$gpu_mem]}" ]]; then
-                IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "${gpu_clusters_fabrics[$gpu_mem]}"
-                
-                if [[ "$fabric_name" != "N/A" ]]; then
-                    echo -e "    ${CYAN}├─ Fabric Name:${NC} $fabric_name"
-                    echo -e "    ${CYAN}├─ Fabric OCID:${NC} $fabric_ocid"
-                    echo -e "    ${CYAN}├─ Fabric State:${NC} $fabric_state"
-                    echo -e "    ${CYAN}└─ Hosts:${NC} ${avail_hosts}/${total_hosts} available"
-                fi
-            fi
-        done
+        # Get first cluster info for summary
+        local first_gpu_mem=$(echo "${!gpu_clusters_count[@]}" | tr ' ' '\n' | sort | head -n1)
+        local fabric_name="N/A"
+        local fabric_ocid="N/A"
+        local cluster_state="N/A"
         
-        echo -e "  ${BOLD}${WHITE}Total:${NC} ${GREEN}$total_count instances${NC}"
-        echo ""
+        if [[ -n "$first_gpu_mem" ]] && [[ "$first_gpu_mem" != "N/A" ]]; then
+            IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "${gpu_clusters_fabrics[$first_gpu_mem]}"
+            cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
+        fi
+        
+        # Don't truncate - show full values
+        local fabric_ocid_short="$fabric_ocid"
+        
+        echo "$clique_display|$clique_size|${#gpu_clusters_count[@]}|$first_gpu_mem|$cluster_state|$fabric_name|$fabric_ocid_short" >> "$summary_temp"
         
         unset gpu_clusters_count
         unset gpu_clusters_fabrics
         unset gpu_clusters_states
     done <<< "$unique_cliques"
     
-    # Cleanup temp files
-    rm -f "$oci_temp" "$k8s_temp" "$joined_temp"
+    # Print column headers
+    printf "${BOLD}%-48s %-7s %-4s %-106s %-18s${NC}\n" \
+        "Clique ID" "Nodes" "#Cl" "GPU Memory Cluster" "State"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Print data
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid; do
+        # Print main line
+        printf "${CYAN}%-48s${NC} ${GREEN}%-7s${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-95s${NC} ${WHITE}%-12s${NC}\n" \
+            "$clique_id" "$nodes" "$clusters" "$gpu_mem_cluster" "$cluster_state"
+        # Print fabric details on second line if available
+        if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
+            printf "          ${BOLD}${MAGENTA}└─ Fabric:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+                "$fabric_name" "$fabric_ocid"
+        fi
+        echo ""
+    done < "$summary_temp"
+    
+    # Cleanup most temp files but keep oci_temp for list_instances_not_in_k8s
+    rm -f "$k8s_temp" "$joined_temp" "$summary_temp"
     
     echo ""
     
     # Show fabrics without clusters
     list_fabrics_without_clusters
+    echo ""
+    
+    # Show instances not in K8s - pass the OCI data file
+    list_instances_not_in_k8s "$oci_temp"
+    
+    # Now cleanup oci_temp
+    rm -f "$oci_temp"
 }
 
 # Function to list all instances in a GPU memory cluster
@@ -793,6 +1017,7 @@ list_instances_by_gpu_cluster() {
     # Fetch fabrics and clusters first
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_node_states
     
     if [[ -z "$gpu_cluster" ]]; then
         echo -e "${RED}Error: GPU cluster ID required${NC}"
@@ -854,11 +1079,19 @@ list_instances_by_gpu_cluster() {
         if [[ -n "$node_name" ]]; then
             echo -e "${BOLD}${CYAN}Display Name:${NC} $display_name"
             
-            # Color code the state
+            # Get node state
+            local node_state=$(get_node_state_cached "$instance_id")
+            local node_state_color="${GREEN}"
+            if [[ "$node_state" != "Ready" ]]; then
+                node_state_color="${RED}"
+            fi
+            echo -e "${BOLD}${CYAN}Node State:${NC} ${node_state_color}$node_state${NC}"
+            
+            # Color code the OCI state
             if [[ "$state" == "RUNNING" ]]; then
-                echo -e "${BOLD}${CYAN}State:${NC} ${GREEN}$state${NC}"
+                echo -e "${BOLD}${CYAN}OCI State:${NC} ${GREEN}$state${NC}"
             else
-                echo -e "${BOLD}${CYAN}State:${NC} ${YELLOW}$state${NC}"
+                echo -e "${BOLD}${CYAN}OCI State:${NC} ${YELLOW}$state${NC}"
             fi
             
             echo -e "  ${GREEN}$node_name${NC} - ${YELLOW}$instance_id${NC}"
@@ -919,9 +1152,9 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     echo ""
     echo -e "${BOLD}Clique Analysis:${NC}"
     echo "  --list-cliques   List all unique cliques with nodes grouped by GPU memory cluster and fabric"
-    echo "                   Also shows fabrics without active clusters"
+    echo "                   Also shows fabrics without active clusters and instances not in K8s"
     echo "  --cliques-summary   Show summary table of all cliques with fabric info"
-    echo "                      Also shows fabrics without active clusters"
+    echo "                      Also shows fabrics without active clusters and instances not in K8s"
     echo ""
     echo -e "${BOLD}GPU Cluster Search:${NC}"
     echo "  --list-cluster <gpu-cluster-id>"
