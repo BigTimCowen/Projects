@@ -19,7 +19,7 @@
 #   Requires variables.sh with COMPARTMENT_ID, REGION, and TENANCY_ID
 #
 # Author: GPU Infrastructure Team
-# Version: 2.1
+# Version: 2.2
 #
 
 set -o pipefail
@@ -53,6 +53,8 @@ readonly INSTANCE_CONFIG_CACHE="${CACHE_DIR}/instance_configurations.txt"
 readonly NODE_STATE_CACHE="${CACHE_DIR}/node_states.txt"
 readonly CAPACITY_TOPOLOGY_CACHE="${CACHE_DIR}/capacity_topology_hosts.txt"
 readonly ANNOUNCEMENTS_LIST_CACHE="${CACHE_DIR}/announcements_list.json"
+readonly OKE_ENV_CACHE="${CACHE_DIR}/oke_environment.txt"
+readonly COMPUTE_CLUSTER_CACHE="${CACHE_DIR}/compute_clusters.txt"
 
 # Global associative arrays for lookups (must use declare -gA for global scope)
 declare -gA INSTANCE_ANNOUNCEMENTS
@@ -205,10 +207,10 @@ fetch_gpu_clusters() {
     # Write cache header
     {
         echo "# GPU Memory Clusters"
-        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId"
+        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId"
     } > "$CLUSTER_CACHE"
     
-    # Get cluster IDs and fetch details for each to get instance-configuration-id
+    # Get cluster IDs and fetch details for each to get instance-configuration-id and compute-cluster-id
     local cluster_ids
     cluster_ids=$(jq -r '.data.items[]?.id // empty' "$raw_json" 2>/dev/null)
     
@@ -228,7 +230,7 @@ fetch_gpu_clusters() {
                 jq -r '
                     .data["display-name"] as $name |
                     ($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}) as $match |
-                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($match.suffix)|\(.data["instance-configuration-id"] // "N/A")"
+                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($match.suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")"
                 ' "$cluster_detail_file" >> "$CLUSTER_CACHE" 2>/dev/null
             fi
         fi
@@ -284,6 +286,64 @@ get_instance_config_name() {
     
     # Lookup from cache
     lookup_cache "$INSTANCE_CONFIG_CACHE" "$config_id" 2
+}
+
+# Fetch and cache compute clusters from OCI
+fetch_compute_clusters() {
+    local compartment="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    [[ -z "$compartment" ]] && { log_warn "COMPARTMENT_ID not set. Compute clusters unavailable."; return 1; }
+    
+    is_cache_fresh "$COMPUTE_CLUSTER_CACHE" && return 0
+    
+    log_info "Fetching compute clusters from OCI..."
+    
+    # Write cache header
+    {
+        echo "# Compute Clusters"
+        echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain"
+    } > "$COMPUTE_CLUSTER_CACHE"
+    
+    # Get availability domains
+    local ad_list
+    ad_list=$(oci iam availability-domain list --compartment-id "$compartment" --region "$region" --query 'data[].name' --raw-output 2>/dev/null | jq -r '.[]' 2>/dev/null)
+    
+    # Fetch compute clusters from each AD
+    local ad
+    for ad in $ad_list; do
+        [[ -z "$ad" ]] && continue
+        
+        local raw_json
+        raw_json=$(create_temp_file) || continue
+        
+        if oci compute compute-cluster list \
+                --compartment-id "$compartment" \
+                --availability-domain "$ad" \
+                --region "$region" \
+                --all \
+                --output json > "$raw_json" 2>/dev/null; then
+            
+            jq -r '.data.items[]? | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
+        fi
+        
+        rm -f "$raw_json"
+    done
+    
+    return 0
+}
+
+# Get compute cluster name from cache
+# Args: $1 = compute cluster OCID
+get_compute_cluster_name() {
+    local cluster_id="$1"
+    
+    [[ -z "$cluster_id" || "$cluster_id" == "N/A" || "$cluster_id" == "null" ]] && { echo "N/A"; return 1; }
+    
+    # Ensure cache is populated
+    fetch_compute_clusters
+    
+    # Lookup from cache
+    lookup_cache "$COMPUTE_CLUSTER_CACHE" "$cluster_id" 2
 }
 
 # Fetch and cache Kubernetes node states
@@ -356,6 +416,145 @@ fetch_capacity_topology() {
     
     rm -f "$topologies_json"
     return 0
+}
+
+# Fetch and cache OKE environment information
+fetch_oke_environment() {
+    local compartment_id="$1"
+    local region="$2"
+    
+    is_cache_fresh "$OKE_ENV_CACHE" && return 0
+    
+    log_info "Fetching OKE environment information..."
+    
+    # Get tenancy OCID
+    local tenancy_ocid="${TENANCY_ID:-}"
+    if [[ -z "$tenancy_ocid" ]]; then
+        # Try to get from instance metadata if running on OCI
+        tenancy_ocid=$(curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ 2>/dev/null | jq -r '.tenantId // empty')
+    fi
+    
+    # Get compartment name
+    local compartment_name="N/A"
+    if [[ -n "$tenancy_ocid" && -n "$compartment_id" ]]; then
+        compartment_name=$(oci iam compartment get --compartment-id "$compartment_id" --query 'data.name' --raw-output 2>/dev/null) || compartment_name="N/A"
+    fi
+    
+    # Get availability domains
+    local ads=""
+    ads=$(oci iam availability-domain list --compartment-id "$compartment_id" --region "$region" --query 'data[].name' --raw-output 2>/dev/null | jq -r 'join(", ")') || ads="N/A"
+    
+    # Get OKE cluster info (find first active cluster matching pattern or just first active)
+    local cluster_json
+    cluster_json=$(oci ce cluster list --compartment-id "$compartment_id" --region "$region" --lifecycle-state ACTIVE --limit 1 --output json 2>/dev/null)
+    
+    local cluster_name cluster_ocid cluster_state pod_network vcn_ocid
+    cluster_name=$(echo "$cluster_json" | jq -r '.data[0].name // "N/A"')
+    cluster_ocid=$(echo "$cluster_json" | jq -r '.data[0].id // "N/A"')
+    cluster_state=$(echo "$cluster_json" | jq -r '.data[0]["lifecycle-state"] // "N/A"')
+    pod_network=$(echo "$cluster_json" | jq -r '.data[0]["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
+    vcn_ocid=$(echo "$cluster_json" | jq -r '.data[0]["vcn-id"] // "N/A"')
+    
+    # Get VCN name
+    local vcn_name="N/A"
+    if [[ "$vcn_ocid" != "N/A" && "$vcn_ocid" != "null" && -n "$vcn_ocid" ]]; then
+        vcn_name=$(oci network vcn get --vcn-id "$vcn_ocid" --query 'data."display-name"' --raw-output 2>/dev/null) || vcn_name="N/A"
+    fi
+    
+    # Get subnet and NSG info
+    local worker_subnet_name="N/A" worker_subnet_ocid="N/A"
+    local worker_nsg_name="N/A" worker_nsg_ocid="N/A"
+    local pod_subnet_name="N/A" pod_subnet_ocid="N/A"
+    local pod_nsg_name="N/A" pod_nsg_ocid="N/A"
+    
+    if [[ "$vcn_ocid" != "N/A" && "$vcn_ocid" != "null" && -n "$vcn_ocid" ]]; then
+        local subnet_json nsg_json
+        subnet_json=$(oci network subnet list --vcn-id "$vcn_ocid" --compartment-id "$compartment_id" --output json 2>/dev/null)
+        nsg_json=$(oci network nsg list --compartment-id "$compartment_id" --vcn-id "$vcn_ocid" --output json 2>/dev/null)
+        
+        # Worker subnet
+        worker_subnet_name=$(echo "$subnet_json" | jq -r '.data[] | select(."display-name" | test("worker"; "i")) | ."display-name"' 2>/dev/null | head -n1)
+        worker_subnet_ocid=$(echo "$subnet_json" | jq -r '.data[] | select(."display-name" | test("worker"; "i")) | .id' 2>/dev/null | head -n1)
+        worker_subnet_name="${worker_subnet_name:-N/A}"
+        worker_subnet_ocid="${worker_subnet_ocid:-N/A}"
+        
+        # Worker NSG
+        worker_nsg_name=$(echo "$nsg_json" | jq -r '.data[] | select(."display-name" | test("worker"; "i")) | ."display-name"' 2>/dev/null | head -n1)
+        worker_nsg_ocid=$(echo "$nsg_json" | jq -r '.data[] | select(."display-name" | test("worker"; "i")) | .id' 2>/dev/null | head -n1)
+        worker_nsg_name="${worker_nsg_name:-N/A}"
+        worker_nsg_ocid="${worker_nsg_ocid:-N/A}"
+        
+        # Pod subnet
+        pod_subnet_name=$(echo "$subnet_json" | jq -r '.data[] | select(."display-name" | test("pod"; "i")) | ."display-name"' 2>/dev/null | head -n1)
+        pod_subnet_ocid=$(echo "$subnet_json" | jq -r '.data[] | select(."display-name" | test("pod"; "i")) | .id' 2>/dev/null | head -n1)
+        pod_subnet_name="${pod_subnet_name:-N/A}"
+        pod_subnet_ocid="${pod_subnet_ocid:-N/A}"
+        
+        # Pod NSG
+        pod_nsg_name=$(echo "$nsg_json" | jq -r '.data[] | select(."display-name" | test("pod"; "i")) | ."display-name"' 2>/dev/null | head -n1)
+        pod_nsg_ocid=$(echo "$nsg_json" | jq -r '.data[] | select(."display-name" | test("pod"; "i")) | .id' 2>/dev/null | head -n1)
+        pod_nsg_name="${pod_nsg_name:-N/A}"
+        pod_nsg_ocid="${pod_nsg_ocid:-N/A}"
+    fi
+    
+    # Get availability domains for compute cluster lookup
+    local ad_list
+    ad_list=$(oci iam availability-domain list --compartment-id "$compartment_id" --region "$region" --query 'data[].name' --raw-output 2>/dev/null | jq -r '.[]' 2>/dev/null)
+    
+    # Get compute cluster info (search across all ADs)
+    local compute_cluster_name="N/A" compute_cluster_ocid="N/A"
+    local ad
+    for ad in $ad_list; do
+        [[ -z "$ad" ]] && continue
+        local compute_cluster_json
+        compute_cluster_json=$(oci compute compute-cluster list \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --region "$region" \
+            --limit 1 \
+            --output json 2>/dev/null)
+        
+        local found_name found_ocid
+        found_name=$(echo "$compute_cluster_json" | jq -r '.data.items[0]."display-name" // empty' 2>/dev/null)
+        found_ocid=$(echo "$compute_cluster_json" | jq -r '.data.items[0].id // empty' 2>/dev/null)
+        
+        if [[ -n "$found_name" && -n "$found_ocid" ]]; then
+            compute_cluster_name="$found_name"
+            compute_cluster_ocid="$found_ocid"
+            break
+        fi
+    done
+    
+    # Write cache
+    {
+        echo "TENANCY_OCID|${tenancy_ocid:-N/A}"
+        echo "COMPARTMENT_NAME|${compartment_name}"
+        echo "COMPARTMENT_OCID|${compartment_id}"
+        echo "REGION|${region}"
+        echo "ADS|${ads}"
+        echo "CLUSTER_NAME|${cluster_name}"
+        echo "CLUSTER_OCID|${cluster_ocid}"
+        echo "CLUSTER_STATE|${cluster_state}"
+        echo "POD_NETWORK|${pod_network}"
+        echo "VCN_NAME|${vcn_name}"
+        echo "VCN_OCID|${vcn_ocid}"
+        echo "WORKER_SUBNET_NAME|${worker_subnet_name}"
+        echo "WORKER_SUBNET_OCID|${worker_subnet_ocid}"
+        echo "WORKER_NSG_NAME|${worker_nsg_name}"
+        echo "WORKER_NSG_OCID|${worker_nsg_ocid}"
+        echo "POD_SUBNET_NAME|${pod_subnet_name}"
+        echo "POD_SUBNET_OCID|${pod_subnet_ocid}"
+        echo "POD_NSG_NAME|${pod_nsg_name}"
+        echo "POD_NSG_OCID|${pod_nsg_ocid}"
+        echo "COMPUTE_CLUSTER_NAME|${compute_cluster_name}"
+        echo "COMPUTE_CLUSTER_OCID|${compute_cluster_ocid}"
+    } > "$OKE_ENV_CACHE"
+}
+
+# Get value from OKE environment cache
+get_oke_env_value() {
+    local key="$1"
+    grep "^${key}|" "$OKE_ENV_CACHE" 2>/dev/null | cut -d'|' -f2
 }
 
 # Build announcement lookup tables from cached data
@@ -471,6 +670,12 @@ get_cluster_state() {
 # Args: $1 = cluster OCID
 get_instance_config_from_cluster() {
     lookup_cache "$CLUSTER_CACHE" "$1" 5
+}
+
+# Get compute cluster ID from GPU memory cluster OCID
+# Args: $1 = GPU memory cluster OCID
+get_compute_cluster_from_gpu_cluster() {
+    lookup_cache "$CLUSTER_CACHE" "$1" 6
 }
 
 # Get node state from cache
@@ -608,6 +813,138 @@ truncate_string() {
 }
 
 #===============================================================================
+# OKE ENVIRONMENT HEADER
+#===============================================================================
+
+# Display OKE environment header
+display_oke_environment_header() {
+    local compartment_id="$1"
+    local region="$2"
+    
+    # Fetch/refresh cache
+    fetch_oke_environment "$compartment_id" "$region"
+    
+    # Read values from cache
+    local tenancy_ocid compartment_name ads
+    local cluster_name cluster_ocid cluster_state pod_network vcn_name vcn_ocid
+    local worker_subnet_name worker_subnet_ocid worker_nsg_name worker_nsg_ocid
+    local pod_subnet_name pod_subnet_ocid pod_nsg_name pod_nsg_ocid
+    local compute_cluster_name compute_cluster_ocid
+    
+    tenancy_ocid=$(get_oke_env_value "TENANCY_OCID")
+    compartment_name=$(get_oke_env_value "COMPARTMENT_NAME")
+    ads=$(get_oke_env_value "ADS")
+    cluster_name=$(get_oke_env_value "CLUSTER_NAME")
+    cluster_ocid=$(get_oke_env_value "CLUSTER_OCID")
+    cluster_state=$(get_oke_env_value "CLUSTER_STATE")
+    pod_network=$(get_oke_env_value "POD_NETWORK")
+    vcn_name=$(get_oke_env_value "VCN_NAME")
+    vcn_ocid=$(get_oke_env_value "VCN_OCID")
+    worker_subnet_name=$(get_oke_env_value "WORKER_SUBNET_NAME")
+    worker_subnet_ocid=$(get_oke_env_value "WORKER_SUBNET_OCID")
+    worker_nsg_name=$(get_oke_env_value "WORKER_NSG_NAME")
+    worker_nsg_ocid=$(get_oke_env_value "WORKER_NSG_OCID")
+    pod_subnet_name=$(get_oke_env_value "POD_SUBNET_NAME")
+    pod_subnet_ocid=$(get_oke_env_value "POD_SUBNET_OCID")
+    pod_nsg_name=$(get_oke_env_value "POD_NSG_NAME")
+    pod_nsg_ocid=$(get_oke_env_value "POD_NSG_OCID")
+    compute_cluster_name=$(get_oke_env_value "COMPUTE_CLUSTER_NAME")
+    compute_cluster_ocid=$(get_oke_env_value "COMPUTE_CLUSTER_OCID")
+    
+    # Box width for content (excluding border chars)
+    local width=148
+    local h_line
+    h_line=$(printf '═%.0s' $(seq 1 $width))
+    
+    # Helper function to print a simple labeled row (no OCID)
+    _print_row() {
+        local label="$1"
+        local value="$2"
+        local label_width=18
+        local value_width=$((width - 2 - label_width))
+        printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${WHITE}%-${value_width}s${NC}${BOLD}${BLUE}║${NC}\n" "$label" "$value"
+    }
+    
+    # Helper function to print a row with name and OCID (OCID in yellow)
+    _print_row_with_ocid() {
+        local label="$1"
+        local name="$2"
+        local ocid="$3"
+        local label_width=18
+        local combined="${name} (${ocid})"
+        local combined_len=${#combined}
+        local value_width=$((width - 2 - label_width))
+        local padding=$((value_width - combined_len))
+        [[ $padding -lt 0 ]] && padding=0
+        printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${WHITE}%s${NC} ${YELLOW}(%s)${NC}%${padding}s${BOLD}${BLUE}║${NC}\n" "$label" "$name" "$ocid" ""
+    }
+    
+    # Helper for OCID-only rows (like tenancy)
+    _print_ocid_row() {
+        local label="$1"
+        local ocid="$2"
+        local label_width=18
+        local value_width=$((width - 2 - label_width))
+        printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${YELLOW}%-${value_width}s${NC}${BOLD}${BLUE}║${NC}\n" "$label" "$ocid"
+    }
+    
+    echo ""
+    
+    # Top border
+    echo -e "${BOLD}${BLUE}╔${h_line}╗${NC}"
+    
+    # Title row - centered
+    local title="OKE CLUSTER ENVIRONMENT"
+    local title_len=${#title}
+    local left_pad=$(( (width - title_len) / 2 ))
+    local right_pad=$(( width - title_len - left_pad ))
+    printf "${BOLD}${BLUE}║${NC}%${left_pad}s${BOLD}${WHITE}%s${NC}%${right_pad}s${BOLD}${BLUE}║${NC}\n" "" "$title" ""
+    
+    # Section separator
+    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
+    
+    # Tenancy & Region section
+    _print_ocid_row "Tenancy:" "$tenancy_ocid"
+    _print_row "Region:" "$region"
+    _print_row_with_ocid "Compartment:" "$compartment_name" "$compartment_id"
+    _print_row "ADs:" "$ads"
+    
+    # Section separator
+    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
+    
+    # OKE Cluster section - special handling for cluster with state
+    local label_width=18
+    local cluster_combined="${cluster_name} [${cluster_state}] (${cluster_ocid})"
+    local cluster_combined_len=${#cluster_combined}
+    local value_width=$((width - 2 - label_width))
+    local cluster_padding=$((value_width - cluster_combined_len))
+    [[ $cluster_padding -lt 0 ]] && cluster_padding=0
+    printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${WHITE}%s${NC} ${GREEN}[%s]${NC} ${YELLOW}(%s)${NC}%${cluster_padding}s${BOLD}${BLUE}║${NC}\n" "OKE Cluster:" "$cluster_name" "$cluster_state" "$cluster_ocid" ""
+    
+    _print_row "Pod Network:" "$pod_network"
+    _print_row_with_ocid "VCN:" "$vcn_name" "$vcn_ocid"
+    
+    # Section separator
+    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
+    
+    # Network section
+    _print_row_with_ocid "Workers Subnet:" "$worker_subnet_name" "$worker_subnet_ocid"
+    _print_row_with_ocid "Workers NSG:" "$worker_nsg_name" "$worker_nsg_ocid"
+    _print_row_with_ocid "Pods Subnet:" "$pod_subnet_name" "$pod_subnet_ocid"
+    _print_row_with_ocid "Pods NSG:" "$pod_nsg_name" "$pod_nsg_ocid"
+    
+    # Section separator
+    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
+    
+    # Compute Cluster section
+    _print_row_with_ocid "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_ocid"
+    
+    # Bottom border
+    echo -e "${BOLD}${BLUE}╚${h_line}╝${NC}"
+    echo ""
+}
+
+#===============================================================================
 # DISPLAY FUNCTIONS
 #===============================================================================
 
@@ -733,6 +1070,7 @@ list_instances_not_in_k8s() {
     local -a orphan_gpu_mems=()
     local orphan_count=0
     
+    # oci_temp format: display_name|status|instance_ocid|gpu_mem
     local display_name status instance_ocid gpu_mem
     while IFS='|' read -r display_name status instance_ocid gpu_mem; do
         [[ -z "$instance_ocid" ]] && continue
@@ -829,14 +1167,15 @@ list_all_instances() {
         return 1
     fi
     
+    # Display OKE environment header
+    display_oke_environment_header "$compartment_id" "$region"
+    
     # Fetch all cached data
     fetch_gpu_fabrics
     fetch_gpu_clusters
     fetch_instance_configurations
     
     echo -e "${BOLD}${MAGENTA}=== All GPU Instances in Compartment ===${NC}"
-    echo -e "${CYAN}Compartment:${NC} $compartment_id"
-    echo -e "${CYAN}Region:${NC} $region"
     echo ""
     
     # Create temp files
@@ -873,6 +1212,9 @@ list_all_instances() {
     
     log_info "Fetching capacity topology..."
     fetch_capacity_topology
+    
+    log_info "Fetching compute clusters..."
+    fetch_compute_clusters
     
     echo "Processing data..."
     echo ""
@@ -948,7 +1290,7 @@ display_clique_summary() {
     local joined_temp
     joined_temp=$(create_temp_file) || return 1
     
-    # Join OCI and K8s data
+    # Join OCI and K8s data (oci_temp format: display_name|status|instance_ocid|gpu_mem)
     local display_name status instance_ocid gpu_mem
     while IFS='|' read -r display_name status instance_ocid gpu_mem; do
         [[ -z "$instance_ocid" ]] && continue
@@ -958,6 +1300,7 @@ display_clique_summary() {
         if [[ -n "$k8s_info" ]]; then
             local node_name clique_id
             IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+            # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
             echo "${display_name}|${node_name}|${status}|${instance_ocid}|${gpu_mem}|${clique_id}" >> "$joined_temp"
         fi
     done < "$oci_temp"
@@ -989,14 +1332,18 @@ display_clique_summary() {
         declare -A gpu_clusters_fabrics
         declare -A gpu_clusters_states
         declare -A gpu_clusters_instance_configs
+        declare -A gpu_clusters_compute_clusters
         
+        # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
         while IFS='|' read -r _ _ _ inst_ocid gm _; do
+            # Track GPU memory clusters
             if [[ -n "$gm" && -z "${gpu_clusters_count[$gm]:-}" ]]; then
                 gpu_clusters_count[$gm]=1
                 if [[ "$gm" != "N/A" ]]; then
                     gpu_clusters_fabrics[$gm]=$(get_fabric_from_cluster "$gm")
                     gpu_clusters_states[$gm]=$(get_cluster_state "$gm")
                     gpu_clusters_instance_configs[$gm]=$(get_instance_config_from_cluster "$gm")
+                    gpu_clusters_compute_clusters[$gm]=$(get_compute_cluster_from_gpu_cluster "$gm")
                 fi
             elif [[ -n "$gm" ]]; then
                 ((gpu_clusters_count[$gm]++))
@@ -1011,16 +1358,19 @@ display_clique_summary() {
         local fabric_ocid="N/A"
         local cluster_state="N/A"
         local instance_config_id="N/A"
+        local compute_cluster_id="N/A"
         
         if [[ -n "$first_gpu_mem" && "$first_gpu_mem" != "N/A" ]]; then
             IFS='|' read -r fabric_name _ fabric_ocid _ _ _ <<< "${gpu_clusters_fabrics[$first_gpu_mem]}"
             cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
             instance_config_id="${gpu_clusters_instance_configs[$first_gpu_mem]}"
+            compute_cluster_id="${gpu_clusters_compute_clusters[$first_gpu_mem]}"
         fi
         
-        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}" >> "$summary_temp"
+        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id
+        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}" >> "$summary_temp"
         
-        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs
+        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs gpu_clusters_compute_clusters
     done <<< "$unique_cliques"
     
     # Print summary table
@@ -1028,20 +1378,27 @@ display_clique_summary() {
         "Clique ID" "Nodes" "#Cl" "GPU Memory Cluster" "State"
     print_separator 200
     
-    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id
-    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id; do
+    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id; do
         printf "${CYAN}%-48s${NC} ${GREEN}%-7s${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-95s${NC} ${WHITE}%-12s${NC}\n" \
             "$clique_id" "$nodes" "$clusters" "$gpu_mem_cluster" "$cluster_state"
         
+        if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" && -n "$compute_cluster_id" ]]; then
+            local compute_cluster_name
+            compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
+            printf "          ${BOLD}${BLUE}├─ Compute Cluster:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
+                "$compute_cluster_name" "$compute_cluster_id"
+        fi
+        
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
                 "$fabric_name" "$fabric_ocid"
         fi
         
         if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${BOLD}${YELLOW}└─ Instance Config:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+            printf "          ${BOLD}${GREEN}└─ Instance Config:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
                 "$instance_config_name" "$instance_config_id"
         fi
         echo ""
