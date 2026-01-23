@@ -2192,11 +2192,13 @@ show_help() {
     echo "  --compartment-id <ocid>   Override compartment ID from variables.sh"
     echo "  --region <region>         Override region from variables.sh"
     echo ""
-    echo -e "${BOLD}Options:${NC}"
-    echo "  --labels         Show all labels for the node"
-    echo "  --clique         Show GPU clique information, OCI tags, cluster state, and fabric details"
-    echo "  --count-clique   Count and list all nodes in the same clique with OCI tags and fabric info"
-    echo "  --all            Show everything (labels + clique + count + OCI tags + fabric)"
+    echo -e "${BOLD}Instance Options:${NC}"
+    echo "  --labels           Show all labels for the node"
+    echo "  --clique           Show GPU clique information, OCI tags, cluster state, and fabric details"
+    echo "  --count-clique     Count and list all nodes in the same clique with OCI tags and fabric info"
+    echo "  --all              Show everything (labels + clique + count + OCI tags + fabric)"
+    echo "  --console-history  Capture and display console history for the instance"
+    echo "                     Useful for debugging instances that fail to join Kubernetes"
     echo ""
     echo -e "${BOLD}Clique Analysis:${NC}"
     echo "  --list-cliques      List all unique cliques with nodes grouped by GPU memory cluster and fabric"
@@ -2207,11 +2209,6 @@ show_help() {
     echo -e "${BOLD}GPU Cluster Search:${NC}"
     echo "  --list-cluster <gpu-cluster-id>"
     echo "    List all instances in a specific GPU memory cluster with fabric details"
-    echo ""
-    echo -e "${BOLD}Console History:${NC}"
-    echo "  --console-history <instance-ocid>"
-    echo "    Capture and display console history for a specific instance"
-    echo "    Useful for debugging instances that fail to join Kubernetes"
     echo ""
     echo -e "${BOLD}Interactive Features:${NC}"
     echo "  When listing GPU instances, if orphan instances (running in OCI but not in K8s)"
@@ -2229,8 +2226,8 @@ show_help() {
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --clique        # Show clique info + fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --count-clique  # Show clique members + fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --all           # Show everything"
+    echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --console-history  # View console history"
     echo "  $0 --list-cluster ocid1.xxx                           # List cluster instances + fabric"
-    echo "  $0 --console-history ocid1.instance.oc1.xxx           # View console history for instance"
 }
 
 #===============================================================================
@@ -2315,14 +2312,6 @@ main() {
             fi
             list_instances_by_gpu_cluster "$2" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
             ;;
-        --console-history)
-            if [[ -z "${2:-}" ]]; then
-                log_error "Instance OCID required"
-                echo "Usage: $0 --console-history <instance-ocid>"
-                exit 1
-            fi
-            get_console_history "$2"
-            ;;
         --help|-h)
             show_help
             ;;
@@ -2332,6 +2321,7 @@ main() {
             local show_labels="false"
             local show_clique="false"
             local count_clique="false"
+            local show_console_history="false"
             
             shift
             while [[ $# -gt 0 ]]; do
@@ -2355,6 +2345,10 @@ main() {
                         count_clique="true"
                         shift
                         ;;
+                    --console-history)
+                        show_console_history="true"
+                        shift
+                        ;;
                     *)
                         log_error "Unknown option: $1"
                         exit 1
@@ -2362,7 +2356,11 @@ main() {
                 esac
             done
             
-            get_node_info "$instance_id" "$show_labels" "$show_clique" "$count_clique"
+            if [[ "$show_console_history" == "true" ]]; then
+                get_console_history "$instance_id"
+            else
+                get_node_info "$instance_id" "$show_labels" "$show_clique" "$count_clique"
+            fi
             ;;
     esac
 }
