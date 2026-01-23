@@ -1088,62 +1088,92 @@ list_instances_by_gpu_cluster() {
     fetch_gpu_fabrics
     fetch_gpu_clusters
     fetch_node_states
+    fetch_capacity_topology
+    build_announcement_lookup "$compartment_id"
     
-    echo -e "${BOLD}${MAGENTA}=== Instances in GPU Memory Cluster: $gpu_cluster ===${NC}"
+    echo -e "${BOLD}${MAGENTA}=== Instances in GPU Memory Cluster ===${NC}"
+    echo -e "${CYAN}GPU Memory Cluster:${NC} $gpu_cluster"
     echo -e "${CYAN}Compartment:${NC} $compartment_id"
     echo -e "${CYAN}Region:${NC} $region"
     echo ""
     
     local cluster_state=$(get_cluster_state "$gpu_cluster")
-    echo -e "${BOLD}${GREEN}=== GPU Memory Cluster ===${NC}"
-    echo -e "${YELLOW}Cluster State:${NC} $cluster_state"
-    echo ""
+    local cluster_state_color="$GREEN"
+    [[ "$cluster_state" != "ACTIVE" ]] && cluster_state_color="$RED"
+    echo -e "${CYAN}Cluster State:${NC} ${cluster_state_color}${cluster_state}${NC}"
     
     local fabric_info=$(get_fabric_from_cluster "$gpu_cluster")
     IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_info"
     
     if [[ "$fabric_name" != "N/A" ]]; then
-        echo -e "${BOLD}${GREEN}=== GPU Memory Fabric ===${NC}"
-        echo -e "${MAGENTA}Fabric Name:${NC} $fabric_name"
-        echo -e "${MAGENTA}Fabric OCID:${NC} $fabric_ocid"
-        echo -e "${MAGENTA}Fabric State:${NC} $fabric_state"
-        echo -e "${MAGENTA}Host Capacity:${NC} ${avail_hosts}/${total_hosts} available"
         echo ""
+        echo -e "${BOLD}${GREEN}=== GPU Memory Fabric ===${NC}"
+        echo -e "${CYAN}Fabric Name:${NC}     $fabric_name"
+        echo -e "${CYAN}Fabric OCID:${NC}     $fabric_ocid"
+        local fabric_state_color="$GREEN"
+        [[ "$fabric_state" != "AVAILABLE" ]] && fabric_state_color="$RED"
+        echo -e "${CYAN}Fabric State:${NC}    ${fabric_state_color}${fabric_state}${NC}"
+        echo -e "${CYAN}Host Capacity:${NC}   ${avail_hosts}/${total_hosts} available"
     fi
     
-    local oci_data=$(create_temp_file)
+    echo ""
     
-    log_info "Fetching all instance details from OCI..."
+    local oci_data=$(create_temp_file)
+    local k8s_data=$(create_temp_file)
+    local output_temp=$(create_temp_file)
+    
+    log_info "Fetching instance details from OCI..."
     oci compute instance list \
         --compartment-id "$compartment_id" \
         --region "$region" \
         --all \
         --output json | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"' > "$oci_data"
     
+    log_info "Fetching Kubernetes node data..."
+    kubectl get nodes -l nvidia.com/gpu.present=true -o json | jq -r '
+        .items[] | 
+        "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")"
+    ' > "$k8s_data"
+    
     echo ""
     
-    grep "|${gpu_cluster}\$" "$oci_data" | while IFS='|' read -r instance_id display_name state gpu_mem; do
-        local node_name=$(kubectl get nodes -l nvidia.com/gpu.present=true -o jsonpath="{.items[?(@.spec.providerID=='${instance_id}')].metadata.name}" 2>/dev/null)
+    # Print table header
+    printf "${BOLD}%-28s %-18s %-11s %-10s %-95s %-40s %-10s %-18s${NC}\n" \
+        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "Clique ID" "CapTopo" "Announce"
+    echo -e "${BLUE}$(printf '━%.0s' {1..240})${NC}"
+    
+    # Process instances in this cluster
+    grep "|${gpu_cluster}\$" "$oci_data" | while IFS='|' read -r instance_id display_name oci_state gpu_mem; do
+        local k8s_info=$(grep "^${instance_id}|" "$k8s_data")
+        [[ -z "$k8s_info" ]] && continue
         
-        if [[ -n "$node_name" ]]; then
-            echo -e "${BOLD}${CYAN}Display Name:${NC} $display_name"
-            
-            local node_state=$(get_node_state_cached "$instance_id")
-            local node_state_color=$(color_node_state "$node_state")
-            echo -e "${BOLD}${CYAN}Node State:${NC} ${node_state_color}${node_state}${NC}"
-            
-            local oci_state_color=$(color_oci_state "$state")
-            echo -e "${BOLD}${CYAN}OCI State:${NC} ${oci_state_color}${state}${NC}"
-            
-            echo -e "  ${GREEN}$node_name${NC} - ${YELLOW}$instance_id${NC}"
-            
-            local clique_id=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.nvidia\.com/gpu\.clique}' 2>/dev/null)
-            [[ -n "$clique_id" && "$clique_id" != "null" ]] && echo -e "${BOLD}${CYAN}GPU Clique ID:${NC} $clique_id"
-            echo ""
-        fi
+        IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+        
+        local node_state=$(get_node_state_cached "$instance_id")
+        local cap_topo_state=$(get_capacity_topology_state "$instance_id")
+        local announcements=$(get_resource_announcements "$instance_id" "$gpu_mem")
+        
+        # Get colors
+        local ns_color=$(color_node_state "$node_state")
+        local st_color=$(color_oci_state "$oci_state")
+        local ct_color=$(color_cap_topo_state "$cap_topo_state")
+        local ann_color=$(color_announcement "$announcements")
+        
+        printf "%-28s %-18s ${ns_color}%-11s${NC} ${st_color}%-10s${NC} %-95s %-40s ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
+            "$display_name" "$node_name" "$node_state" "$oci_state" "$instance_id" "$clique_id" "$cap_topo_state" "$announcements"
     done
     
-    rm -f "$oci_data"
+    echo ""
+    
+    # Count total instances
+    local total_count=$(grep -c "|${gpu_cluster}\$" "$oci_data" 2>/dev/null || echo 0)
+    local k8s_count=$(grep "|${gpu_cluster}\$" "$oci_data" | while IFS='|' read -r id _ _ _; do
+        grep -q "^${id}|" "$k8s_data" && echo "1"
+    done | wc -l)
+    
+    echo -e "${CYAN}Total Instances:${NC} $total_count (${k8s_count} in Kubernetes)"
+    
+    rm -f "$oci_data" "$k8s_data" "$output_temp"
 }
 
 #===============================================================================
