@@ -28,6 +28,209 @@ mkdir -p "$CACHE_DIR"
 FABRIC_CACHE="$CACHE_DIR/gpu_fabrics.txt"
 CLUSTER_CACHE="$CACHE_DIR/gpu_clusters.txt"
 NODE_STATE_CACHE="$CACHE_DIR/node_states.txt"
+ANNOUNCEMENTS_LIST_CACHE="$CACHE_DIR/announcements_list.json"
+ANNOUNCEMENTS_CACHE_MAX_AGE=3600  # 1 hour
+
+# Declare global associative arrays for announcement lookups
+declare -gA INSTANCE_ANNOUNCEMENTS
+declare -gA GPU_MEM_CLUSTER_ANNOUNCEMENTS
+
+# Function to build announcement lookup from cached data
+build_announcement_lookup() {
+    local compartment_id="$1"
+    
+    # Reset arrays
+    INSTANCE_ANNOUNCEMENTS=()
+    GPU_MEM_CLUSTER_ANNOUNCEMENTS=()
+    
+    # Check if cache exists and is fresh enough
+    local need_refresh=false
+    if [[ ! -f "$ANNOUNCEMENTS_LIST_CACHE" ]]; then
+        need_refresh=true
+    else
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null || echo 0)))
+        if [[ $cache_age -gt $ANNOUNCEMENTS_CACHE_MAX_AGE ]]; then
+            need_refresh=true
+        fi
+    fi
+    
+    if [[ "$need_refresh" == "true" ]]; then
+        oci announce announcements list \
+            --compartment-id "$compartment_id" \
+            --all > "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null || return 1
+        
+        # Fetch details for each announcement
+        local announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
+        for ann_id in $announcement_ids; do
+            local detail_file="$CACHE_DIR/${ann_id##*.}.json"
+            if [[ ! -f "$detail_file" || ! -s "$detail_file" ]]; then
+                oci announce announcements get --announcement-id "$ann_id" > "$detail_file" 2>/dev/null &
+            fi
+        done
+        wait
+    fi
+    
+    # Process cached announcement details
+    for detail_file in "$CACHE_DIR"/*.json; do
+        [[ ! -f "$detail_file" ]] && continue
+        [[ "$detail_file" == *"/announcements_list.json" ]] && continue
+        [[ "$detail_file" == *"/ack_status_cache.json" ]] && continue
+        
+        # Validate file has announcement data
+        if ! jq -e '.data.id' "$detail_file" > /dev/null 2>&1; then
+            continue
+        fi
+        
+        local lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
+        [[ "$lifecycle_state" != "ACTIVE" ]] && continue
+        
+        local reference_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$detail_file")
+        local short_ticket="${reference_ticket:0:8}"
+        
+        # Extract affected resources
+        local resource_count=$(jq '.data."affected-resources" | length' "$detail_file" 2>/dev/null || echo 0)
+        
+        for ((i=0; i<resource_count; i++)); do
+            # Get instance/resource ID
+            local resource_id=$(jq -r ".data.\"affected-resources\"[$i] | 
+                if .properties then
+                    (.properties[] | select(.name == \"resourceId\" or .name == \"instanceId\") | .value) // null
+                else
+                    (.\"resource-id\" // .\"instance-id\" // null)
+                end" "$detail_file" 2>/dev/null)
+            
+            # Get GPU memory cluster
+            local gpu_mem_cluster=$(jq -r ".data.\"affected-resources\"[$i] |
+                if .properties then
+                    (.properties[] | select(.name == \"gpuMemoryCluster\") | .value) // null
+                else
+                    null
+                end" "$detail_file" 2>/dev/null)
+            
+            # Add to instance lookup
+            if [[ -n "$resource_id" && "$resource_id" != "null" ]]; then
+                if [[ -z "${INSTANCE_ANNOUNCEMENTS[$resource_id]}" ]]; then
+                    INSTANCE_ANNOUNCEMENTS[$resource_id]="$short_ticket"
+                elif [[ ! "${INSTANCE_ANNOUNCEMENTS[$resource_id]}" =~ "$short_ticket" ]]; then
+                    INSTANCE_ANNOUNCEMENTS[$resource_id]="${INSTANCE_ANNOUNCEMENTS[$resource_id]},$short_ticket"
+                fi
+            fi
+            
+            # Add to GPU memory cluster lookup
+            if [[ -n "$gpu_mem_cluster" && "$gpu_mem_cluster" != "null" ]]; then
+                if [[ -z "${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]}" ]]; then
+                    GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]="$short_ticket"
+                elif [[ ! "${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]}" =~ "$short_ticket" ]]; then
+                    GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]="${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]},$short_ticket"
+                fi
+            fi
+        done
+    done
+}
+
+# Function to get announcements for a resource
+get_resource_announcements() {
+    local instance_ocid="$1"
+    local gpu_mem_cluster="$2"
+    local result=""
+    
+    # Check instance-level
+    if [[ -n "$instance_ocid" && -n "${INSTANCE_ANNOUNCEMENTS[$instance_ocid]}" ]]; then
+        result="${INSTANCE_ANNOUNCEMENTS[$instance_ocid]}"
+    fi
+    
+    # Check GPU memory cluster level
+    if [[ -n "$gpu_mem_cluster" && "$gpu_mem_cluster" != "N/A" && -n "${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]}" ]]; then
+        if [[ -z "$result" ]]; then
+            result="${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]}"
+        else
+            for ticket in ${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]//,/ }; do
+                [[ ! "$result" =~ "$ticket" ]] && result="${result},${ticket}"
+            done
+        fi
+    fi
+    
+    echo "${result:--}"
+}
+
+CAPACITY_TOPOLOGY_CACHE="$CACHE_DIR/capacity_topology_hosts.txt"
+
+# Function to fetch and cache capacity topology bare metal hosts
+fetch_capacity_topology() {
+    if [[ -z "$TENANCY_ID" ]]; then
+        echo -e "${YELLOW}Warning: TENANCY_ID not set. Capacity topology details will not be available.${NC}" >&2
+        return 1
+    fi
+    
+    # Check if cache is fresh (less than 1 hour old)
+    if [[ -f "$CAPACITY_TOPOLOGY_CACHE" ]]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$CAPACITY_TOPOLOGY_CACHE" 2>/dev/null || echo 0)))
+        if [[ $cache_age -lt 3600 ]]; then
+            return 0
+        fi
+    fi
+    
+    echo "Fetching capacity topology from OCI..." >&2
+    
+    # Get list of capacity topologies (at tenancy level)
+    local topologies_json=$(mktemp)
+    oci compute capacity-topology list \
+        --compartment-id "$TENANCY_ID" \
+        --all \
+        --output json > "$topologies_json" 2>/dev/null || {
+        rm -f "$topologies_json"
+        return 1
+    }
+    
+    # Initialize cache file
+    echo "# Capacity Topology Hosts" > "$CAPACITY_TOPOLOGY_CACHE"
+    echo "# Format: InstanceOCID|HostLifecycleState|HostLifecycleDetails|TopologyOCID" >> "$CAPACITY_TOPOLOGY_CACHE"
+    
+    # Get topology IDs from data.items
+    local topology_ids=$(jq -r '.data.items[]?.id // empty' "$topologies_json" 2>/dev/null)
+    
+    for topo_id in $topology_ids; do
+        [[ -z "$topo_id" ]] && continue
+        
+        # Get bare metal hosts for this topology
+        local hosts_json=$(mktemp)
+        oci compute capacity-topology bare-metal-host list \
+            --capacity-topology-id "$topo_id" \
+            --all \
+            --output json > "$hosts_json" 2>/dev/null || {
+            rm -f "$hosts_json"
+            continue
+        }
+        
+        # Extract host details - instance-id maps to instance OCID
+        jq -r '.data.items[]? | "\(.["instance-id"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["lifecycle-details"] // "N/A")|\("'"$topo_id"'")"' "$hosts_json" >> "$CAPACITY_TOPOLOGY_CACHE" 2>/dev/null
+        
+        rm -f "$hosts_json"
+    done
+    
+    rm -f "$topologies_json"
+    return 0
+}
+
+# Function to get capacity topology host state details for an instance
+get_capacity_topology_state() {
+    local instance_ocid="$1"
+    
+    if [[ ! -f "$CAPACITY_TOPOLOGY_CACHE" ]]; then
+        echo "N/A"
+        return 1
+    fi
+    
+    local host_line=$(grep "^${instance_ocid}|" "$CAPACITY_TOPOLOGY_CACHE" | head -n1)
+    
+    if [[ -n "$host_line" ]]; then
+        # Return lifecycle-state-details (3rd field)
+        local state_details=$(echo "$host_line" | cut -d'|' -f3)
+        echo "${state_details:-N/A}"
+    else
+        echo "N/A"
+    fi
+}
 
 # Function to fetch and cache GPU memory fabrics
 fetch_gpu_fabrics() {
@@ -830,13 +1033,21 @@ list_all_instances() {
     echo "Fetching node states..."
     fetch_node_states
     
+    # Fetch announcements
+    echo "Fetching announcements..."
+    build_announcement_lookup "$compartment_id"
+    
+    # Fetch capacity topology
+    echo "Fetching capacity topology..."
+    fetch_capacity_topology
+    
     echo "Processing data..."
     echo ""
     
     # Print table header
-    printf "${BOLD}%-28s %-15s %-11s %-10s %-95s %-12s %-12s %-48s${NC}\n" \
-        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "GPU Cluster" "Cluster St" "Clique ID"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    printf "${BOLD}%-28s %-15s %-11s %-10s %-95s %-12s %-12s %-40s %-10s %-18s${NC}\n" \
+        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "GPU Cluster" "Cluster St" "Clique ID" "CapTopo" "Announce"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     # Join the data and print (only include GPU nodes)
     local output_temp=$(mktemp)
@@ -871,13 +1082,19 @@ list_all_instances() {
             # Don't truncate - show full clique ID
             local clique_display="$clique_id"
             
+            # Get capacity topology state for this instance
+            local cap_topo_state=$(get_capacity_topology_state "$instance_ocid")
+            
+            # Get announcements for this instance
+            local announcements=$(get_resource_announcements "$instance_ocid" "$gpu_mem")
+            
             # Store for sorting: gpu_mem|display_name|rest_of_line
-            echo "$gpu_mem|$display_name|%-28s %-15s %-11s %-10s %-95s %-12s %-12s %s\n||$display_name||$node_name||$node_state||$status||$instance_ocid||$gpu_mem_display||$cluster_state_display||$clique_display||$gpu_mem" >> "$output_temp"
+            echo "$gpu_mem|$display_name|%-28s %-15s %-11s %-10s %-95s %-12s %-12s %s\n||$display_name||$node_name||$node_state||$status||$instance_ocid||$gpu_mem_display||$cluster_state_display||$clique_display||$gpu_mem||$cap_topo_state||$announcements" >> "$output_temp"
         fi
     done < "$oci_temp"
     
     # Sort by GPU memory cluster (column 1), then display name (column 2)
-    sort -t'|' -k1,1 -k2,2 "$output_temp" | while IFS='|' read -r gpu_mem display_name format_str _ dn _ nn _ ns _ st _ io _ gm _ cs _ cd _ gpu_mem_full; do
+    sort -t'|' -k1,1 -k2,2 "$output_temp" | while IFS='|' read -r gpu_mem display_name format_str _ dn _ nn _ ns _ st _ io _ gm _ cs _ cd _ gpu_mem_full _ ct _ ann; do
         # Color code node state
         local node_state_color="${GREEN}"
         if [[ "$ns" != "Ready" ]]; then
@@ -890,8 +1107,22 @@ list_all_instances() {
             oci_state_color="${YELLOW}"
         fi
         
-        printf "%-28s %-15s ${node_state_color}%-11s${NC} ${oci_state_color}%-10s${NC} %-95s %-12s %-12s %-48s\n" \
-            "$dn" "$nn" "$ns" "$st" "$io" "$gm" "$cs" "$cd"
+        # Color code capacity topology state
+        local cap_topo_color="${RED}"
+        if [[ "$ct" == "AVAILABLE" ]]; then
+            cap_topo_color="${GREEN}"
+        elif [[ "$ct" == "N/A" ]]; then
+            cap_topo_color="${YELLOW}"
+        fi
+        
+        # Color code announcements
+        local announce_color="${GREEN}"
+        if [[ "$ann" != "-" ]]; then
+            announce_color="${RED}"
+        fi
+        
+        printf "%-28s %-15s ${node_state_color}%-11s${NC} ${oci_state_color}%-10s${NC} %-95s %-12s %-12s %-40s ${cap_topo_color}%-10s${NC} ${announce_color}%-18s${NC}\n" \
+            "$dn" "$nn" "$ns" "$st" "$io" "$gm" "$cs" "$cd" "$ct" "$ann"
     done
     
     rm -f "$output_temp"
