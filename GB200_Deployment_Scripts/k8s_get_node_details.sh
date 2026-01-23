@@ -669,15 +669,69 @@ list_fabrics_without_clusters() {
     rm -f "$temp_output"
 }
 
-# List instances not in Kubernetes
+# Get console history for an instance
+# Args: $1 = instance OCID
+get_console_history() {
+    local instance_ocid="$1"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    [[ -z "$instance_ocid" ]] && { log_error "Instance OCID required"; return 1; }
+    [[ -z "$region" ]] && { log_error "REGION not set"; return 1; }
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Console History for Instance ===${NC}"
+    echo -e "${YELLOW}Instance OCID:${NC} $instance_ocid"
+    echo -e "${YELLOW}Region:${NC} $region"
+    echo ""
+    
+    log_info "Capturing console history (this may take a moment)..."
+    
+    local console_history_id
+    console_history_id=$(oci --region "$region" compute console-history capture \
+        --instance-id "$instance_ocid" 2>/dev/null | jq -r '.data.id // empty')
+    
+    if [[ -z "$console_history_id" ]]; then
+        log_error "Failed to capture console history"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Console history captured: ${console_history_id}${NC}"
+    echo ""
+    
+    # Wait a moment for the capture to complete
+    sleep 2
+    
+    # Fetch and display the console history
+    echo -e "${BOLD}${MAGENTA}--- Console Output (last 10MB) ---${NC}"
+    print_separator 80
+    
+    oci compute console-history get-content \
+        --instance-console-history-id "$console_history_id" \
+        --length 10000000 \
+        --file - 2>/dev/null
+    
+    print_separator 80
+    echo -e "${BOLD}${MAGENTA}--- End of Console Output ---${NC}"
+    echo ""
+    
+    return 0
+}
+
+# List instances not in Kubernetes with interactive console history option
 list_instances_not_in_k8s() {
     local oci_temp="$1"
     local k8s_temp="$2"
+    local interactive="${3:-true}"  # Default to interactive mode
     
     echo -e "${BOLD}${MAGENTA}=== GPU Instances Not in Kubernetes ===${NC}"
     echo ""
     
-    local found_orphan=false
+    # Collect orphan instances into an array
+    local -a orphan_names=()
+    local -a orphan_ocids=()
+    local -a orphan_states=()
+    local -a orphan_gpu_mems=()
+    local orphan_count=0
     
     local display_name status instance_ocid gpu_mem
     while IFS='|' read -r display_name status instance_ocid gpu_mem; do
@@ -685,22 +739,75 @@ list_instances_not_in_k8s() {
         
         if ! grep -q "^${instance_ocid}|" "$k8s_temp" 2>/dev/null; then
             if [[ "$status" == "RUNNING" ]]; then
-                found_orphan=true
-                echo -e "${CYAN}Display Name:${NC} $display_name"
-                echo -e "  ${YELLOW}Instance OCID:${NC} $instance_ocid"
-                echo -e "  ${YELLOW}OCI State:${NC} ${GREEN}${status}${NC}"
-                
-                if [[ "$gpu_mem" != "N/A" ]]; then
-                    echo -e "  ${YELLOW}GPU Mem Cluster:${NC} ...${gpu_mem: -12}"
-                fi
-                echo ""
+                orphan_names+=("$display_name")
+                orphan_ocids+=("$instance_ocid")
+                orphan_states+=("$status")
+                orphan_gpu_mems+=("$gpu_mem")
+                ((orphan_count++))
             fi
         fi
     done < "$oci_temp"
     
-    if [[ "$found_orphan" == "false" ]]; then
+    if [[ $orphan_count -eq 0 ]]; then
         echo -e "${GREEN}All running GPU instances are in Kubernetes${NC}"
+        return 0
     fi
+    
+    # Display numbered list of orphan instances
+    printf "${BOLD}%-4s %-35s %-10s %-15s %s${NC}\n" \
+        "#" "Display Name" "OCI State" "GPU Mem Cluster" "Instance OCID"
+    print_separator 160
+    
+    local i
+    for ((i=0; i<orphan_count; i++)); do
+        local gpu_mem_display="${orphan_gpu_mems[$i]}"
+        [[ "$gpu_mem_display" != "N/A" && ${#gpu_mem_display} -gt 12 ]] && gpu_mem_display="...${gpu_mem_display: -9}"
+        
+        printf "${YELLOW}%-4s${NC} ${CYAN}%-35s${NC} ${GREEN}%-10s${NC} ${MAGENTA}%-15s${NC} ${WHITE}%s${NC}\n" \
+            "$((i+1))" \
+            "$(truncate_string "${orphan_names[$i]}" 35)" \
+            "${orphan_states[$i]}" \
+            "$gpu_mem_display" \
+            "${orphan_ocids[$i]}"
+    done
+    
+    echo ""
+    echo -e "${YELLOW}Total orphan instances: ${orphan_count}${NC}"
+    
+    # Interactive mode - prompt for console history
+    if [[ "$interactive" == "true" && -t 0 ]]; then
+        echo ""
+        echo -e "${BOLD}${CYAN}Would you like to view console history for any of these instances?${NC}"
+        echo -e "Enter instance number (1-${orphan_count}), or press Enter to skip: "
+        
+        local selection
+        read -r selection
+        
+        if [[ -n "$selection" ]]; then
+            # Validate input is a number
+            if [[ "$selection" =~ ^[0-9]+$ ]]; then
+                if [[ $selection -ge 1 && $selection -le $orphan_count ]]; then
+                    local selected_idx=$((selection - 1))
+                    echo ""
+                    echo -e "${GREEN}Selected: ${orphan_names[$selected_idx]}${NC}"
+                    get_console_history "${orphan_ocids[$selected_idx]}"
+                else
+                    log_error "Invalid selection. Please enter a number between 1 and ${orphan_count}"
+                fi
+            else
+                log_error "Invalid input. Please enter a number."
+            fi
+        else
+            echo -e "${CYAN}Skipping console history view.${NC}"
+        fi
+    fi
+}
+
+# Non-interactive version for scripting - just list orphans
+list_instances_not_in_k8s_non_interactive() {
+    local oci_temp="$1"
+    local k8s_temp="$2"
+    list_instances_not_in_k8s "$oci_temp" "$k8s_temp" "false"
 }
 
 #===============================================================================
@@ -1576,6 +1683,16 @@ show_help() {
     echo "  --list-cluster <gpu-cluster-id>"
     echo "    List all instances in a specific GPU memory cluster with fabric details"
     echo ""
+    echo -e "${BOLD}Console History:${NC}"
+    echo "  --console-history <instance-ocid>"
+    echo "    Capture and display console history for a specific instance"
+    echo "    Useful for debugging instances that fail to join Kubernetes"
+    echo ""
+    echo -e "${BOLD}Interactive Features:${NC}"
+    echo "  When listing GPU instances, if orphan instances (running in OCI but not in K8s)"
+    echo "  are found, you will be prompted to select one to view its console history."
+    echo "  This helps diagnose why an instance failed to join the Kubernetes cluster."
+    echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  $0                                                    # List all GPU instances with fabric info"
     echo "  $0 --compartment-id ocid1.compartment.oc1..xxx        # Use different compartment"
@@ -1588,6 +1705,7 @@ show_help() {
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --count-clique  # Show clique members + fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --all           # Show everything"
     echo "  $0 --list-cluster ocid1.xxx                           # List cluster instances + fabric"
+    echo "  $0 --console-history ocid1.instance.oc1.xxx           # View console history for instance"
 }
 
 #===============================================================================
@@ -1671,6 +1789,14 @@ main() {
                 exit 1
             fi
             list_instances_by_gpu_cluster "$2" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
+            ;;
+        --console-history)
+            if [[ -z "${2:-}" ]]; then
+                log_error "Instance OCID required"
+                echo "Usage: $0 --console-history <instance-ocid>"
+                exit 1
+            fi
+            get_console_history "$2"
             ;;
         --help|-h)
             show_help
