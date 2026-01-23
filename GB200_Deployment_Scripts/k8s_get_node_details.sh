@@ -181,8 +181,8 @@ fetch_gpu_fabrics() {
     # Write cache header and data
     {
         echo "# GPU Memory Fabrics"
-        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts"
-        jq -r '.data.items[] | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["healthy-host-count"] // 0)|\(.["available-host-count"] // 0)|\(.["total-host-count"] // 0)"' "$raw_json" 2>/dev/null
+        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState"
+        jq -r '.data.items[] | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["healthy-host-count"] // 0)|\(.["available-host-count"] // 0)|\(.["total-host-count"] // 0)|\(.["current-firmware-bundle-id"] // "N/A")|\(.["target-firmware-bundle-id"] // "N/A")|\(.["firmware-update-state"] // "N/A")"' "$raw_json" 2>/dev/null
     } > "$FABRIC_CACHE"
     
     rm -f "$raw_json"
@@ -213,7 +213,7 @@ fetch_gpu_clusters() {
     # Write cache header
     {
         echo "# GPU Memory Clusters"
-        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId"
+        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId|Size"
     } > "$CLUSTER_CACHE"
     
     # Get cluster IDs and fetch details for each to get instance-configuration-id and compute-cluster-id
@@ -236,7 +236,7 @@ fetch_gpu_clusters() {
                 jq -r '
                     .data["display-name"] as $name |
                     ($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}) as $match |
-                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($match.suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")"
+                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($match.suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")|\(.data["size"] // 0)"
                 ' "$cluster_detail_file" >> "$CLUSTER_CACHE" 2>/dev/null
             fi
         fi
@@ -863,6 +863,12 @@ get_compute_cluster_from_gpu_cluster() {
     lookup_cache "$CLUSTER_CACHE" "$1" 6
 }
 
+# Get GPU memory cluster size from cluster OCID
+# Args: $1 = cluster OCID
+get_cluster_size() {
+    lookup_cache "$CLUSTER_CACHE" "$1" 7
+}
+
 # Get node state from cache
 # Args: $1 = instance OCID (provider ID)
 get_node_state_cached() {
@@ -1147,29 +1153,58 @@ list_fabrics_without_clusters() {
             fabric_line=$(grep -v '^#' "$FABRIC_CACHE" | grep "|${fabric_suffix}|" | head -n1)
             
             if [[ -n "$fabric_line" ]]; then
-                # Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
-                local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts
-                IFS='|' read -r fabric_name _ fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts <<< "$fabric_line"
-                echo "${fabric_name}|${fabric_ocid}|${fabric_state}|${healthy_hosts}|${avail_hosts}|${total_hosts}" >> "$temp_output"
+                # Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState
+                local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_firmware target_firmware firmware_update_state
+                IFS='|' read -r fabric_name _ fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_line"
+                echo "${fabric_name}|${fabric_ocid}|${fabric_state}|${healthy_hosts}|${avail_hosts}|${total_hosts}|${current_firmware}|${target_firmware}|${firmware_update_state}" >> "$temp_output"
             fi
         fi
     done <<< "$all_fabric_suffixes"
     
     if [[ "$found_unused" == "true" ]]; then
         # Print header - aligned with clique summary
-        printf "${BOLD}%-48s %-8s %-6s %-6s %-12s${NC}\n" \
+        printf "${BOLD}%-48s ┌─ GPU Memory Fabric ─┐${NC}\n" ""
+        printf "${BOLD}%-48s %8s %6s %6s    %-12s${NC}\n" \
             "Fabric Display Name" "Healthy" "Avail" "Total" "State"
-        print_separator 96
+        print_separator 106
         
         # Print data rows
-        local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts
-        while IFS='|' read -r fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts; do
+        local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_firmware target_firmware firmware_update_state
+        while IFS='|' read -r fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_firmware target_firmware firmware_update_state; do
             local state_color
             state_color=$(color_fabric_state "$fabric_state")
-            printf "${CYAN}%-48s${NC} ${YELLOW}%-8s${NC} ${WHITE}%-6s${NC} ${WHITE}%-6s${NC} ${state_color}%-12s${NC}\n" \
+            
+            # Color available hosts - light green if not 0
+            local avail_color="$WHITE"
+            [[ "$avail_hosts" != "0" && "$avail_hosts" != "N/A" ]] && avail_color="$LIGHT_GREEN"
+            
+            printf "${CYAN}%-48s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC} ${WHITE}%6s${NC}    ${state_color}%-12s${NC}\n" \
                 "$fabric_name" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_state"
-            printf "          ${BOLD}${ORANGE}└─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "Fabric:" "$fabric_name" "$fabric_ocid"
+            
+            # Display firmware bundle IDs if available
+            if [[ "$current_firmware" != "N/A" && -n "$current_firmware" ]]; then
+                local current_short="${current_firmware: -5}"
+                local target_short="${target_firmware: -5}"
+                local firmware_color="$WHITE"
+                
+                # Highlight in red if current != target
+                if [[ "$current_firmware" != "$target_firmware" && "$target_firmware" != "N/A" && -n "$target_firmware" ]]; then
+                    firmware_color="$RED"
+                fi
+                
+                # Color firmware update state
+                local update_state_color="$WHITE"
+                case "$firmware_update_state" in
+                    UP_TO_DATE|COMPLETED) update_state_color="$GREEN" ;;
+                    IN_PROGRESS|UPDATING) update_state_color="$YELLOW" ;;
+                    FAILED|ERROR) update_state_color="$RED" ;;
+                esac
+                
+                printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}%-18s${NC} ${firmware_color}current: %-10s target: %-10s${NC} ${update_state_color}[%s]${NC}\n" \
+                    "Firmware:" "$current_short" "$target_short" "$firmware_update_state"
+            fi
             echo ""
         done < "$temp_output"
     else
@@ -1506,6 +1541,7 @@ display_clique_summary() {
         declare -A gpu_clusters_states
         declare -A gpu_clusters_instance_configs
         declare -A gpu_clusters_compute_clusters
+        declare -A gpu_clusters_sizes
         
         # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
         while IFS='|' read -r _ _ _ inst_ocid gm _; do
@@ -1517,6 +1553,7 @@ display_clique_summary() {
                     gpu_clusters_states[$gm]=$(get_cluster_state "$gm")
                     gpu_clusters_instance_configs[$gm]=$(get_instance_config_from_cluster "$gm")
                     gpu_clusters_compute_clusters[$gm]=$(get_compute_cluster_from_gpu_cluster "$gm")
+                    gpu_clusters_sizes[$gm]=$(get_cluster_size "$gm")
                 fi
             elif [[ -n "$gm" ]]; then
                 ((gpu_clusters_count[$gm]++))
@@ -1535,57 +1572,99 @@ display_clique_summary() {
         local healthy_hosts="N/A"
         local available_hosts="N/A"
         local total_hosts="N/A"
+        local current_firmware="N/A"
+        local target_firmware="N/A"
+        local firmware_update_state="N/A"
+        local gpu_cluster_size="N/A"
         
         if [[ -n "$first_gpu_mem" && "$first_gpu_mem" != "N/A" ]]; then
-            # Fabric format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
+            # Fabric format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState
             local fabric_line="${gpu_clusters_fabrics[$first_gpu_mem]}"
-            IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts <<< "$fabric_line"
+            IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_line"
             cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
             instance_config_id="${gpu_clusters_instance_configs[$first_gpu_mem]}"
             compute_cluster_id="${gpu_clusters_compute_clusters[$first_gpu_mem]}"
+            gpu_cluster_size="${gpu_clusters_sizes[$first_gpu_mem]}"
         fi
         
-        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts
-        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}" >> "$summary_temp"
+        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts|current_firmware|target_firmware|firmware_update_state|gpu_cluster_size
+        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}|${current_firmware}|${target_firmware}|${firmware_update_state}|${gpu_cluster_size}" >> "$summary_temp"
         
-        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs gpu_clusters_compute_clusters
+        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs gpu_clusters_compute_clusters gpu_clusters_sizes
     done <<< "$unique_cliques"
     
     # Print summary table
     # Clique ID, then counts, then State - GPU Memory Cluster moved to tree below
-    printf "${BOLD}%-48s %-6s %-8s %-6s %-6s %-4s %-12s${NC}\n" \
-        "Clique ID" "K8s" "Healthy" "Avail" "Total" "#Cl" "State"
-    print_separator 96
+    # Add spanning headers for K8s, GPU Memory Fabric, and GPU Mem Cluster columns
+    printf "${BOLD}%-48s   K8s  ┌─ GPU Memory Fabric ─┐  GPU Mem Cluster${NC}\n" ""
+    printf "${BOLD}%-48s %6s %8s %6s %6s       %6s       %-12s${NC}\n" \
+        "Clique ID" "Nodes" "Healthy" "Avail" "Total" "Size" "State"
+    print_separator 106
     
-    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts
-    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts; do
-        printf "${CYAN}%-48s${NC} ${GREEN}%-6s${NC} ${YELLOW}%-8s${NC} ${WHITE}%-6s${NC} ${WHITE}%-6s${NC} ${YELLOW}%-4s${NC} ${WHITE}%-12s${NC}\n" \
-            "$clique_id" "$nodes" "$healthy_hosts" "$available_hosts" "$total_hosts" "$clusters" "$cluster_state"
+    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size; do
+        # Color state based on value
+        local state_color
+        case "$cluster_state" in
+            ACTIVE) state_color="$GREEN" ;;
+            INACTIVE|FAILED) state_color="$RED" ;;
+            *) state_color="$YELLOW" ;;
+        esac
+        
+        # Color available hosts - light green if not 0
+        local avail_color="$WHITE"
+        [[ "$available_hosts" != "0" && "$available_hosts" != "N/A" ]] && avail_color="$LIGHT_GREEN"
+        
+        printf "${CYAN}%-48s${NC} ${WHITE}%6s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC} ${WHITE}%6s${NC}       ${WHITE}%6s${NC}       ${state_color}%-12s${NC}\n" \
+            "$clique_id" "$nodes" "$healthy_hosts" "$available_hosts" "$total_hosts" "$gpu_cluster_size" "$cluster_state"
         
         # GPU Memory Cluster
         if [[ "$gpu_mem_cluster" != "N/A" && "$gpu_mem_cluster" != "null" && -n "$gpu_mem_cluster" ]]; then
             local gpu_cluster_name
             gpu_cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
-            printf "          ${BOLD}${MAGENTA}├─${NC} ${BOLD}${MAGENTA}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            printf "          ${WHITE}├─${NC} ${BOLD}${MAGENTA}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "GPU Mem Cluster:" "$gpu_cluster_name" "$gpu_mem_cluster"
         fi
         
         if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" && -n "$compute_cluster_id" ]]; then
             local compute_cluster_name
             compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
-            printf "          ${BOLD}${BLUE}├─${NC} ${BOLD}${BLUE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            printf "          ${WHITE}├─${NC} ${BOLD}${BLUE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_id"
         fi
         
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${BOLD}${ORANGE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "Fabric:" "$fabric_name" "$fabric_ocid"
+            
+            # Display firmware bundle IDs if available
+            if [[ "$current_firmware" != "N/A" && -n "$current_firmware" ]]; then
+                local current_short="${current_firmware: -5}"
+                local target_short="${target_firmware: -5}"
+                local firmware_color="$WHITE"
+                
+                # Highlight in red if current != target
+                if [[ "$current_firmware" != "$target_firmware" && "$target_firmware" != "N/A" && -n "$target_firmware" ]]; then
+                    firmware_color="$RED"
+                fi
+                
+                # Color firmware update state
+                local update_state_color="$WHITE"
+                case "$firmware_update_state" in
+                    UP_TO_DATE|COMPLETED) update_state_color="$GREEN" ;;
+                    IN_PROGRESS|UPDATING) update_state_color="$YELLOW" ;;
+                    FAILED|ERROR) update_state_color="$RED" ;;
+                esac
+                
+                printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${firmware_color}current: %-10s target: %-10s${NC} ${update_state_color}[%s]${NC}\n" \
+                    "Firmware:" "$current_short" "$target_short" "$firmware_update_state"
+            fi
         fi
         
         if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${BOLD}${GREEN}└─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            printf "          ${WHITE}└─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "Instance Config:" "$instance_config_name" "$instance_config_id"
         fi
         echo ""
