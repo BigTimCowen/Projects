@@ -59,6 +59,16 @@ readonly OKE_ENV_CACHE="${CACHE_DIR}/oke_environment.txt"
 readonly COMPUTE_CLUSTER_CACHE="${CACHE_DIR}/compute_clusters.txt"
 readonly NETWORK_RESOURCES_CACHE="${CACHE_DIR}/network_resources.txt"
 
+# Network gateway cache files
+readonly IGW_CACHE="${CACHE_DIR}/internet_gateways.txt"
+readonly SGW_CACHE="${CACHE_DIR}/service_gateways.txt"
+readonly NAT_CACHE="${CACHE_DIR}/nat_gateways.txt"
+readonly DRG_CACHE="${CACHE_DIR}/drg_attachments.txt"
+readonly LPG_CACHE="${CACHE_DIR}/local_peering_gateways.txt"
+readonly RPC_CACHE="${CACHE_DIR}/remote_peering_connections.txt"
+readonly RT_CACHE="${CACHE_DIR}/route_tables.txt"
+readonly NSG_RULES_CACHE="${CACHE_DIR}/nsg_rules.txt"
+
 # Known shortnames for subnets and NSGs
 readonly NETWORK_SHORTNAMES=("bastion" "cp" "operator" "int_lb" "pub_lb" "pods" "workers" "fss" "lustre")
 
@@ -582,14 +592,345 @@ fetch_network_resources() {
     # Write cache
     {
         echo "# Network Resources Cache"
-        echo "# Format: TYPE|NAME|CIDR_OR_STATE|ACCESS_OR_STATE|OCID"
+        echo "# Format: SUBNET|NAME|CIDR|ACCESS|STATE|OCID|RT_OCID"
+        echo "# Format: NSG|NAME||STATE|OCID"
         
-        # Process subnets
-        echo "$subnet_json" | jq -r '.data[] | "SUBNET|\(."display-name" // "N/A")|\(."cidr-block" // "N/A")|\(if ."prohibit-public-ip-on-vnic" then "Private" else "Public" end)|\(."lifecycle-state" // "N/A")|\(.id // "N/A")"' 2>/dev/null
+        # Process subnets (include route-table-id)
+        echo "$subnet_json" | jq -r '.data[] | "SUBNET|\(."display-name" // "N/A")|\(."cidr-block" // "N/A")|\(if ."prohibit-public-ip-on-vnic" then "Private" else "Public" end)|\(."lifecycle-state" // "N/A")|\(.id // "N/A")|\(."route-table-id" // "N/A")"' 2>/dev/null
         
         # Process NSGs
         echo "$nsg_json" | jq -r '.data[] | "NSG|\(."display-name" // "N/A")||\(."lifecycle-state" // "N/A")|\(.id // "N/A")"' 2>/dev/null
     } > "$NETWORK_RESOURCES_CACHE"
+}
+
+#===============================================================================
+# NETWORK GATEWAY FUNCTIONS
+#===============================================================================
+
+# Fetch and cache Internet Gateways
+fetch_internet_gateways() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$IGW_CACHE" && return 0
+    
+    log_info "Fetching Internet Gateways..."
+    
+    local result
+    result=$(oci network internet-gateway list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$IGW_CACHE"; return 1; }
+    
+    # Cache format: VCN_ID|IGW_ID|STATE
+    echo "$result" | jq -r '.data[] | "\(.["vcn-id"])|\(.id)|\(.["lifecycle-state"])"' > "$IGW_CACHE" 2>/dev/null
+    [[ ! -s "$IGW_CACHE" ]] && touch "$IGW_CACHE"
+}
+
+# Fetch and cache Service Gateways
+fetch_service_gateways() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$SGW_CACHE" && return 0
+    
+    log_info "Fetching Service Gateways..."
+    
+    local result
+    result=$(oci network service-gateway list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$SGW_CACHE"; return 1; }
+    
+    # Cache format: VCN_ID|SGW_ID|STATE
+    echo "$result" | jq -r '.data[] | "\(.["vcn-id"])|\(.id)|\(.["lifecycle-state"])"' > "$SGW_CACHE" 2>/dev/null
+    [[ ! -s "$SGW_CACHE" ]] && touch "$SGW_CACHE"
+}
+
+# Fetch and cache NAT Gateways
+fetch_nat_gateways() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$NAT_CACHE" && return 0
+    
+    log_info "Fetching NAT Gateways..."
+    
+    local result
+    result=$(oci network nat-gateway list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$NAT_CACHE"; return 1; }
+    
+    # Cache format: VCN_ID|NAT_ID|STATE
+    echo "$result" | jq -r '.data[] | "\(.["vcn-id"])|\(.id)|\(.["lifecycle-state"])"' > "$NAT_CACHE" 2>/dev/null
+    [[ ! -s "$NAT_CACHE" ]] && touch "$NAT_CACHE"
+}
+
+# Fetch and cache DRG Attachments
+fetch_drg_attachments() {
+    local compartment_id="$1"
+    
+    is_cache_fresh "$DRG_CACHE" && return 0
+    
+    log_info "Fetching DRG Attachments..."
+    
+    local result
+    result=$(oci network drg-attachment list \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null) || { touch "$DRG_CACHE"; return 1; }
+    
+    # Cache format: VCN_ID|DRG_ID|STATE
+    # Handle both DRGv1 and DRGv2 formats
+    echo "$result" | jq -r '.data[] | 
+        (if .["vcn-id"] != null then .["vcn-id"] 
+         elif .["network-details"] != null and .["network-details"]["id"] != null then .["network-details"]["id"] 
+         else null end) as $vcn |
+        select($vcn != null) |
+        "\($vcn)|\(.["drg-id"])|\(.["lifecycle-state"])"' > "$DRG_CACHE" 2>/dev/null
+    [[ ! -s "$DRG_CACHE" ]] && touch "$DRG_CACHE"
+}
+
+# Fetch and cache Local Peering Gateways
+fetch_local_peering_gateways() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$LPG_CACHE" && return 0
+    
+    log_info "Fetching Local Peering Gateways..."
+    
+    local result
+    result=$(oci network local-peering-gateway list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$LPG_CACHE"; return 1; }
+    
+    # Cache format: VCN_ID|LPG_ID|STATE|PEERING_STATUS
+    echo "$result" | jq -r '.data[] | "\(.["vcn-id"])|\(.id)|\(.["lifecycle-state"])|\(.["peering-status"])"' > "$LPG_CACHE" 2>/dev/null
+    [[ ! -s "$LPG_CACHE" ]] && touch "$LPG_CACHE"
+}
+
+# Fetch and cache Remote Peering Connections
+fetch_remote_peering_connections() {
+    local compartment_id="$1"
+    
+    is_cache_fresh "$RPC_CACHE" && return 0
+    
+    log_info "Fetching Remote Peering Connections..."
+    
+    local result
+    result=$(oci network remote-peering-connection list \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null) || { touch "$RPC_CACHE"; return 1; }
+    
+    # Cache format: DRG_ID|RPC_ID|STATE|PEERING_STATUS
+    echo "$result" | jq -r '.data[] | "\(.["drg-id"])|\(.id)|\(.["lifecycle-state"])|\(.["peering-status"])"' > "$RPC_CACHE" 2>/dev/null
+    [[ ! -s "$RPC_CACHE" ]] && touch "$RPC_CACHE"
+}
+
+# Fetch and cache Route Tables
+fetch_route_tables() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$RT_CACHE" && return 0
+    
+    log_info "Fetching Route Tables..."
+    
+    local result
+    result=$(oci network route-table list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$RT_CACHE"; return 1; }
+    
+    # Cache format: RT_ID|VCN_ID|DISPLAY_NAME|STATE|ROUTE_COUNT
+    echo "$result" | jq -r '.data[] | "\(.id)|\(.["vcn-id"])|\(.["display-name"])|\(.["lifecycle-state"])|\(.["route-rules"] | length)"' > "$RT_CACHE" 2>/dev/null
+    [[ ! -s "$RT_CACHE" ]] && touch "$RT_CACHE"
+}
+
+# Fetch and cache NSG rules for all NSGs
+fetch_nsg_rules() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$NSG_RULES_CACHE" && return 0
+    
+    log_info "Fetching NSG rules..."
+    
+    # Get all NSGs
+    local nsgs_json
+    nsgs_json=$(oci network nsg list \
+        --compartment-id "$compartment_id" \
+        --vcn-id "$vcn_ocid" \
+        --all \
+        --output json 2>/dev/null) || { touch "$NSG_RULES_CACHE"; return 1; }
+    
+    # Clear existing cache
+    > "$NSG_RULES_CACHE"
+    
+    # Get rule counts for each NSG
+    echo "$nsgs_json" | jq -r '.data[].id' 2>/dev/null | while read -r nsg_id; do
+        [[ -z "$nsg_id" ]] && continue
+        
+        local result ingress_count egress_count
+        result=$(oci network nsg rules list \
+            --nsg-id "$nsg_id" \
+            --all \
+            --output json 2>/dev/null)
+        
+        if [[ -n "$result" ]]; then
+            ingress_count=$(echo "$result" | jq '[.data[] | select(.direction=="INGRESS")] | length' 2>/dev/null) || ingress_count=0
+            egress_count=$(echo "$result" | jq '[.data[] | select(.direction=="EGRESS")] | length' 2>/dev/null) || egress_count=0
+        else
+            ingress_count=0
+            egress_count=0
+        fi
+        
+        # Cache format: NSG_ID|INGRESS_COUNT|EGRESS_COUNT
+        echo "${nsg_id}|${ingress_count:-0}|${egress_count:-0}" >> "$NSG_RULES_CACHE"
+    done
+    
+    [[ ! -s "$NSG_RULES_CACHE" ]] && touch "$NSG_RULES_CACHE"
+}
+
+# Fetch all network gateway caches
+fetch_all_network_gateways() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    [[ "$vcn_ocid" == "N/A" || -z "$vcn_ocid" ]] && return 1
+    
+    fetch_internet_gateways "$compartment_id" "$vcn_ocid"
+    fetch_service_gateways "$compartment_id" "$vcn_ocid"
+    fetch_nat_gateways "$compartment_id" "$vcn_ocid"
+    fetch_drg_attachments "$compartment_id"
+    fetch_local_peering_gateways "$compartment_id" "$vcn_ocid"
+    fetch_remote_peering_connections "$compartment_id"
+    fetch_route_tables "$compartment_id" "$vcn_ocid"
+    fetch_nsg_rules "$compartment_id" "$vcn_ocid"
+}
+
+# Check if VCN has an Internet Gateway
+has_internet_gateway() {
+    local vcn_id="$1"
+    [[ ! -f "$IGW_CACHE" ]] && { echo "false"; return; }
+    grep -q "^${vcn_id}|" "$IGW_CACHE" 2>/dev/null && echo "true" || echo "false"
+}
+
+# Check if VCN has a Service Gateway
+has_service_gateway() {
+    local vcn_id="$1"
+    [[ ! -f "$SGW_CACHE" ]] && { echo "false"; return; }
+    grep -q "^${vcn_id}|" "$SGW_CACHE" 2>/dev/null && echo "true" || echo "false"
+}
+
+# Check if VCN has a NAT Gateway
+has_nat_gateway() {
+    local vcn_id="$1"
+    [[ ! -f "$NAT_CACHE" ]] && { echo "false"; return; }
+    grep -q "^${vcn_id}|" "$NAT_CACHE" 2>/dev/null && echo "true" || echo "false"
+}
+
+# Check if VCN has a DRG Attachment
+has_drg_attachment() {
+    local vcn_id="$1"
+    [[ ! -f "$DRG_CACHE" ]] && { echo "false"; return; }
+    grep -q "^${vcn_id}|" "$DRG_CACHE" 2>/dev/null && echo "true" || echo "false"
+}
+
+# Check if VCN has a Local Peering Gateway
+has_local_peering_gateway() {
+    local vcn_id="$1"
+    [[ ! -f "$LPG_CACHE" ]] && { echo "false"; return; }
+    grep -q "^${vcn_id}|" "$LPG_CACHE" 2>/dev/null && echo "true" || echo "false"
+}
+
+# Check if VCN has a Remote Peering Connection (via DRG)
+has_remote_peering_connection() {
+    local vcn_id="$1"
+    
+    [[ ! -f "$DRG_CACHE" || ! -f "$RPC_CACHE" ]] && { echo "false"; return; }
+    
+    # Get DRG ID for this VCN
+    local drg_id
+    drg_id=$(grep "^${vcn_id}|" "$DRG_CACHE" 2>/dev/null | head -1 | cut -d'|' -f2)
+    [[ -z "$drg_id" ]] && { echo "false"; return; }
+    
+    # Check if this DRG has an RPC
+    if grep "^${drg_id}|" "$RPC_CACHE" 2>/dev/null | grep -qv "|TERMINATED|"; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+# Check if VCN has Route Tables with rules
+has_route_table() {
+    local vcn_id="$1"
+    
+    [[ ! -f "$RT_CACHE" ]] && { echo "false"; return; }
+    
+    # Check for route tables with at least one rule
+    local found="false"
+    while IFS='|' read -r _ vid _ state count; do
+        if [[ "$vid" == "$vcn_id" && "$state" == "AVAILABLE" && "$count" -gt 0 ]]; then
+            found="true"
+            break
+        fi
+    done < "$RT_CACHE"
+    echo "$found"
+}
+
+# Get route table name by ID
+get_route_table_name() {
+    local rt_id="$1"
+    
+    [[ ! -f "$RT_CACHE" ]] && { echo "N/A"; return; }
+    [[ -z "$rt_id" || "$rt_id" == "N/A" ]] && { echo "N/A"; return; }
+    
+    local name
+    name=$(grep "^${rt_id}|" "$RT_CACHE" 2>/dev/null | head -1 | cut -d'|' -f3)
+    echo "${name:-N/A}"
+}
+
+# Get route table rule count by ID
+get_route_table_rule_count() {
+    local rt_id="$1"
+    
+    [[ ! -f "$RT_CACHE" ]] && { echo "0"; return; }
+    [[ -z "$rt_id" || "$rt_id" == "N/A" ]] && { echo "0"; return; }
+    
+    local count
+    count=$(grep "^${rt_id}|" "$RT_CACHE" 2>/dev/null | head -1 | cut -d'|' -f5)
+    echo "${count:-0}"
+}
+
+# Get NSG ingress/egress counts
+get_nsg_rule_counts() {
+    local nsg_id="$1"
+    
+    [[ -z "$nsg_id" ]] && { echo "0|0"; return; }
+    [[ ! -f "$NSG_RULES_CACHE" ]] && { echo "0|0"; return; }
+    
+    local line
+    line=$(grep "^${nsg_id}|" "$NSG_RULES_CACHE" 2>/dev/null | head -1)
+    
+    if [[ -n "$line" ]]; then
+        local ingress egress
+        ingress=$(echo "$line" | cut -d'|' -f2)
+        egress=$(echo "$line" | cut -d'|' -f3)
+        echo "${ingress:-0}|${egress:-0}"
+    else
+        echo "0|0"
+    fi
 }
 
 # Find matching shortname for a resource name
@@ -612,13 +953,42 @@ get_shortname_match() {
 display_network_resources() {
     local compartment_id="$1"
     local vcn_ocid="$2"
+    local vcn_name="${3:-N/A}"
     
-    # Fetch/refresh cache
+    [[ "$vcn_ocid" == "N/A" || -z "$vcn_ocid" ]] && return 1
+    
+    # Fetch/refresh caches
     fetch_network_resources "$compartment_id" "$vcn_ocid"
+    fetch_all_network_gateways "$compartment_id" "$vcn_ocid"
     
     [[ ! -f "$NETWORK_RESOURCES_CACHE" ]] && return 1
     
     echo -e "${BOLD}${WHITE}Network Resources:${NC}"
+    
+    # Build gateway indicators for VCN
+    local has_igw has_sgw has_nat has_drg has_lpg has_rpc has_rt
+    has_igw=$(has_internet_gateway "$vcn_ocid" 2>/dev/null) || has_igw="false"
+    has_sgw=$(has_service_gateway "$vcn_ocid" 2>/dev/null) || has_sgw="false"
+    has_nat=$(has_nat_gateway "$vcn_ocid" 2>/dev/null) || has_nat="false"
+    has_drg=$(has_drg_attachment "$vcn_ocid" 2>/dev/null) || has_drg="false"
+    has_lpg=$(has_local_peering_gateway "$vcn_ocid" 2>/dev/null) || has_lpg="false"
+    has_rpc=$(has_remote_peering_connection "$vcn_ocid" 2>/dev/null) || has_rpc="false"
+    has_rt=$(has_route_table "$vcn_ocid" 2>/dev/null) || has_rt="false"
+    
+    local igw_box sgw_box nat_box drg_box lpg_box rpc_box rt_box
+    [[ "$has_igw" == "true" ]] && igw_box="${GREEN}[X]${NC}" || igw_box="${WHITE}[ ]${NC}"
+    [[ "$has_sgw" == "true" ]] && sgw_box="${GREEN}[X]${NC}" || sgw_box="${WHITE}[ ]${NC}"
+    [[ "$has_nat" == "true" ]] && nat_box="${GREEN}[X]${NC}" || nat_box="${WHITE}[ ]${NC}"
+    [[ "$has_drg" == "true" ]] && drg_box="${GREEN}[X]${NC}" || drg_box="${WHITE}[ ]${NC}"
+    [[ "$has_lpg" == "true" ]] && lpg_box="${GREEN}[X]${NC}" || lpg_box="${WHITE}[ ]${NC}"
+    [[ "$has_rpc" == "true" ]] && rpc_box="${GREEN}[X]${NC}" || rpc_box="${WHITE}[ ]${NC}"
+    [[ "$has_rt" == "true" ]] && rt_box="${GREEN}[X]${NC}" || rt_box="${WHITE}[ ]${NC}"
+    
+    local gateway_indicators="IGW:${igw_box} SGW:${sgw_box} NAT:${nat_box} DRG:${drg_box} LPG:${lpg_box} RPC:${rpc_box} RT:${rt_box}"
+    
+    # Display VCN line with gateway indicators
+    echo -e "${BOLD}${MAGENTA}VCN:${NC} ${GREEN}${vcn_name}${NC} ${WHITE}[${NC}${gateway_indicators}${WHITE}]${NC} ${WHITE}(${YELLOW}${vcn_ocid}${WHITE})${NC}"
+    echo ""
     
     # Build arrays of subnets and NSGs
     declare -A subnets_by_shortname
@@ -627,16 +997,16 @@ display_network_resources() {
     declare -a unmatched_nsgs
     declare -a subnet_shortnames
     
-    # Read subnets
-    while IFS='|' read -r type name cidr access state ocid; do
+    # Read subnets (now with route-table-id)
+    while IFS='|' read -r type name cidr access state ocid rt_ocid; do
         [[ "$type" != "SUBNET" ]] && continue
         local shortname
         shortname=$(get_shortname_match "$name")
         if [[ -n "$shortname" ]]; then
-            subnets_by_shortname[$shortname]="${name}|${cidr}|${access}|${state}|${ocid}"
+            subnets_by_shortname[$shortname]="${name}|${cidr}|${access}|${ocid}|${rt_ocid}"
             subnet_shortnames+=("$shortname")
         else
-            unmatched_subnets+=("${name}|${cidr}|${access}|${state}|${ocid}")
+            unmatched_subnets+=("${name}|${cidr}|${access}|${ocid}|${rt_ocid}")
         fi
     done < <(grep "^SUBNET|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
     
@@ -646,14 +1016,13 @@ display_network_resources() {
         local shortname
         shortname=$(get_shortname_match "$name")
         if [[ -n "$shortname" ]]; then
-            # Append to existing or create new
             if [[ -n "${nsgs_by_shortname[$shortname]:-}" ]]; then
-                nsgs_by_shortname[$shortname]="${nsgs_by_shortname[$shortname]}#${name}|${state}|${ocid}"
+                nsgs_by_shortname[$shortname]="${nsgs_by_shortname[$shortname]}#${name}|${ocid}"
             else
-                nsgs_by_shortname[$shortname]="${name}|${state}|${ocid}"
+                nsgs_by_shortname[$shortname]="${name}|${ocid}"
             fi
         else
-            unmatched_nsgs+=("${name}|${state}|${ocid}")
+            unmatched_nsgs+=("${name}|${ocid}")
         fi
     done < <(grep "^NSG|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
     
@@ -663,17 +1032,21 @@ display_network_resources() {
         local subnet_info="${subnets_by_shortname[$shortname]}"
         [[ -z "$subnet_info" ]] && continue
         
-        local name cidr access state ocid
-        IFS='|' read -r name cidr access state ocid <<< "$subnet_info"
+        local name cidr access ocid rt_ocid
+        IFS='|' read -r name cidr access ocid rt_ocid <<< "$subnet_info"
         
-        local access_color state_color
+        local access_color
         [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
-        [[ "$state" == "AVAILABLE" ]] && state_color="$GREEN" || state_color="$RED"
         
-        # Format: Subnet: name [cidr] [access] [state] (ocid)
-        # Positions: 10 + 30 + 2 + 18 + 3 + 7 + 3 + 9 + 2 = 84 before "("
-        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-18s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-            "$name" "$cidr" "$access" "$state" "$ocid"
+        # Get route table info
+        local rt_name rt_rules rt_display
+        rt_name=$(get_route_table_name "$rt_ocid")
+        rt_rules=$(get_route_table_rule_count "$rt_ocid")
+        rt_display="${rt_name} (${rt_rules})"
+        
+        # Subnet line with route table
+        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}RT:${NC} ${CYAN}%-28s${NC}${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            "$name" "$cidr" "$access" "$rt_display" "$ocid"
         
         # Display matching NSGs
         local nsg_list="${nsgs_by_shortname[$shortname]:-}"
@@ -684,36 +1057,44 @@ display_network_resources() {
             local i=0
             for nsg_entry in "${nsg_entries[@]}"; do
                 ((i++))
-                local nsg_name nsg_state nsg_ocid
-                IFS='|' read -r nsg_name nsg_state nsg_ocid <<< "$nsg_entry"
+                local nsg_name nsg_ocid
+                IFS='|' read -r nsg_name nsg_ocid <<< "$nsg_entry"
                 
-                local nsg_state_color
-                [[ "$nsg_state" == "AVAILABLE" ]] && nsg_state_color="$GREEN" || nsg_state_color="$RED"
+                # Get NSG rule counts
+                local rule_counts ingress egress rules_display
+                rule_counts=$(get_nsg_rule_counts "$nsg_ocid")
+                ingress=$(echo "$rule_counts" | cut -d'|' -f1)
+                egress=$(echo "$rule_counts" | cut -d'|' -f2)
+                rules_display="In:${ingress} Out:${egress}"
                 
                 local prefix="├─"
                 [[ $i -eq $nsg_count ]] && prefix="└─"
                 
-                # NSG line: 10 spaces + "├─ NSG: " (8 display) + 30 name = 48
-                # Need 24 spaces to reach position 72 where [state] starts
-                printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC}                        ${WHITE}[${nsg_state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                    "$nsg_name" "$nsg_state" "$nsg_ocid"
+                # NSG line with rule counts - padding 37 to align with subnet OCID
+                printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC}%-37s${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                    "$nsg_name" "$rules_display" "" "$nsg_ocid"
             done
         fi
         echo ""
     done
     
-    # Display unmatched subnets (subnets that don't match any known shortname)
+    # Display unmatched subnets
     if [[ ${#unmatched_subnets[@]} -gt 0 ]]; then
         for subnet_entry in "${unmatched_subnets[@]}"; do
-            local name cidr access state ocid
-            IFS='|' read -r name cidr access state ocid <<< "$subnet_entry"
+            local name cidr access ocid rt_ocid
+            IFS='|' read -r name cidr access ocid rt_ocid <<< "$subnet_entry"
             
-            local access_color state_color
+            local access_color
             [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
-            [[ "$state" == "AVAILABLE" ]] && state_color="$GREEN" || state_color="$RED"
             
-            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-18s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$name" "$cidr" "$access" "$state" "$ocid"
+            # Get route table info
+            local rt_name rt_rules rt_display
+            rt_name=$(get_route_table_name "$rt_ocid")
+            rt_rules=$(get_route_table_rule_count "$rt_ocid")
+            rt_display="${rt_name} (${rt_rules})"
+            
+            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}RT:${NC} ${CYAN}%-28s${NC}${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$name" "$cidr" "$access" "$rt_display" "$ocid"
             echo ""
         done
     fi
@@ -725,18 +1106,22 @@ display_network_resources() {
         local total=${#unmatched_nsgs[@]}
         for nsg_entry in "${unmatched_nsgs[@]}"; do
             ((i++))
-            local nsg_name nsg_state nsg_ocid
-            IFS='|' read -r nsg_name nsg_state nsg_ocid <<< "$nsg_entry"
+            local nsg_name nsg_ocid
+            IFS='|' read -r nsg_name nsg_ocid <<< "$nsg_entry"
             
-            local nsg_state_color
-            [[ "$nsg_state" == "AVAILABLE" ]] && nsg_state_color="$GREEN" || nsg_state_color="$RED"
+            # Get NSG rule counts
+            local rule_counts ingress egress rules_display
+            rule_counts=$(get_nsg_rule_counts "$nsg_ocid")
+            ingress=$(echo "$rule_counts" | cut -d'|' -f1)
+            egress=$(echo "$rule_counts" | cut -d'|' -f2)
+            rules_display="In:${ingress} Out:${egress}"
             
             local prefix="├─"
             [[ $i -eq $total ]] && prefix="└─"
             
-            # Same alignment as matched NSGs: 24 spaces after 30-char name
-            printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC}                        ${WHITE}[${nsg_state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$nsg_name" "$nsg_state" "$nsg_ocid"
+            # NSG line with rule counts - padding 37 to align with subnet OCID
+            printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC}%-37s${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$nsg_name" "$rules_display" "" "$nsg_ocid"
         done
         echo ""
     fi
@@ -1116,7 +1501,7 @@ display_oke_environment_header() {
     echo ""
     
     # Display network resources (subnets and NSGs grouped by shortname)
-    display_network_resources "$compartment_id" "$vcn_ocid"
+    display_network_resources "$compartment_id" "$vcn_ocid" "$vcn_name"
 }
 
 #===============================================================================
@@ -1427,9 +1812,18 @@ list_all_instances() {
     echo "Processing data..."
     echo ""
     
-    # Print table header
-    printf "${BOLD}%-28s %-15s %-11s %-10s %-95s %-12s %-12s %-40s %-10s %-18s${NC}\n" \
-        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "GPU Cluster" "Cluster St" "Clique ID" "CapTopo" "Announce"
+    # Print table header with spanning headers
+    # Column positions: DisplayName(28) Node(15) State(11) CliqueID(40) State(10) OCID(95) Name(12) State(12) State(10) Announce(18)
+    # K8s spans Node+State+CliqueID (67), OCI Instance spans State+OCID (106), GPU Mem Cluster spans Name+State (25), CapTopo spans State (10)
+    printf "${BOLD}%-28s%-67s%-125s%-31s%-12s%-11s${NC}\n" \
+    "" \
+    "┌───────────────────────────────── K8s ───────────────────────────┐" \
+    "┌──────────────────────────────────────────── OCI Instance ─────────────────────────────────────────────┐" \
+    "┌─ GPU Mem Cluster ─┐" \
+    "CapTopo" \
+    "Maintenance"
+    printf "${BOLD}%-28s %-15s %-7s %-42s %-11s %-95s %-9s %-9s %-10s %-18s${NC}\n" \
+        "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "Name" "State" "State" "Announce"
     print_separator 280
     
     # Process and collect data for sorting
@@ -1465,14 +1859,15 @@ list_all_instances() {
     
     # Sort and display
     sort -t'|' -k1,1 -k2,2 "$output_temp" | while IFS='|' read -r _ dn nn ns st io gm cs ci ct ann; do
-        local ns_color st_color ct_color ann_color
+        local ns_color st_color ct_color ann_color cs_color
         ns_color=$(color_node_state "$ns")
         st_color=$(color_oci_state "$st")
         ct_color=$(color_cap_topo_state "$ct")
         ann_color=$(color_announcement "$ann")
+        cs_color=$(color_cluster_state "$cs")
         
-        printf "%-28s %-15s ${ns_color}%-11s${NC} ${st_color}%-10s${NC} %-95s %-12s %-12s %-40s ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
-            "$dn" "$nn" "$ns" "$st" "$io" "$gm" "$cs" "$ci" "$ct" "$ann"
+        printf "%-28s %-15s ${ns_color}%-7s${NC} %-42s ${st_color}%-11s${NC} %-92s %-5s ${cs_color}%-8s${NC} ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
+            "$dn" "$nn" "$ns" "$ci" "$st" "$io" "$gm" "$cs" "$ct" "$ann"
     done
     
     echo ""
@@ -2238,9 +2633,13 @@ list_instances_by_gpu_cluster() {
     
     echo ""
     
-    # Print table header
-    printf "${BOLD}%-28s %-18s %-11s %-10s %-95s %-40s %-10s %-18s${NC}\n" \
-        "Display Name" "K8s Node" "Node State" "OCI State" "Instance OCID" "Clique ID" "CapTopo" "Announce"
+    # Print table header with spanning headers
+    # Column positions: DisplayName(28) Node(18) State(11) CliqueID(40) State(10) OCID(95) State(10) Announce(18)
+    # K8s spans Node+State+CliqueID (70), OCI Instance spans State+OCID (106), CapTopo spans State (10)
+    printf "${BOLD}%-28s %-74s %-121s %-10s %-18s${NC}\n" \
+        "" "┌─────────────────────────────────────── K8s ─────────────────────────────────────┐" "                                          ┌──────────────────────── OCI Instance ────────────────────────┐" "CapTopo" ""
+    printf "${BOLD}%-28s %-18s %-11s %-40s %-10s %-95s %-10s %-18s${NC}\n" \
+        "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "State" "Announce"
     print_separator 240
     
     # Process instances in this cluster
@@ -2265,8 +2664,8 @@ list_instances_by_gpu_cluster() {
         ct_color=$(color_cap_topo_state "$cap_topo_state")
         ann_color=$(color_announcement "$announcements")
         
-        printf "%-28s %-18s ${ns_color}%-11s${NC} ${st_color}%-10s${NC} %-95s %-40s ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
-            "$display_name" "$node_name" "$node_state" "$oci_state" "$instance_id" "$clique_id" "$cap_topo_state" "$announcements"
+        printf "%-28s %-18s ${ns_color}%-11s${NC} %-40s ${st_color}%-10s${NC} %-95s ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
+            "$display_name" "$node_name" "$node_state" "$clique_id" "$oci_state" "$instance_id" "$cap_topo_state" "$announcements"
     done
     
     echo ""
