@@ -31,6 +31,7 @@ set -o pipefail
 # Color codes (readonly to prevent accidental modification)
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
+readonly LIGHT_GREEN='\033[92m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly MAGENTA='\033[0;35m'
@@ -55,6 +56,10 @@ readonly CAPACITY_TOPOLOGY_CACHE="${CACHE_DIR}/capacity_topology_hosts.txt"
 readonly ANNOUNCEMENTS_LIST_CACHE="${CACHE_DIR}/announcements_list.json"
 readonly OKE_ENV_CACHE="${CACHE_DIR}/oke_environment.txt"
 readonly COMPUTE_CLUSTER_CACHE="${CACHE_DIR}/compute_clusters.txt"
+readonly NETWORK_RESOURCES_CACHE="${CACHE_DIR}/network_resources.txt"
+
+# Known shortnames for subnets and NSGs
+readonly NETWORK_SHORTNAMES=("bastion" "cp" "operator" "int_lb" "pub_lb" "pods" "workers" "fss" "lustre")
 
 # Global associative arrays for lookups (must use declare -gA for global scope)
 declare -gA INSTANCE_ANNOUNCEMENTS
@@ -557,6 +562,185 @@ get_oke_env_value() {
     grep "^${key}|" "$OKE_ENV_CACHE" 2>/dev/null | cut -d'|' -f2
 }
 
+# Fetch and cache all network resources (subnets and NSGs)
+fetch_network_resources() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    is_cache_fresh "$NETWORK_RESOURCES_CACHE" && return 0
+    
+    [[ "$vcn_ocid" == "N/A" || -z "$vcn_ocid" ]] && return 1
+    
+    log_info "Fetching network resources..."
+    
+    # Fetch subnets and NSGs
+    local subnet_json nsg_json
+    subnet_json=$(oci network subnet list --vcn-id "$vcn_ocid" --compartment-id "$compartment_id" --output json 2>/dev/null)
+    nsg_json=$(oci network nsg list --compartment-id "$compartment_id" --vcn-id "$vcn_ocid" --output json 2>/dev/null)
+    
+    # Write cache
+    {
+        echo "# Network Resources Cache"
+        echo "# Format: TYPE|NAME|CIDR_OR_STATE|ACCESS_OR_STATE|OCID"
+        
+        # Process subnets
+        echo "$subnet_json" | jq -r '.data[] | "SUBNET|\(."display-name" // "N/A")|\(."cidr-block" // "N/A")|\(if ."prohibit-public-ip-on-vnic" then "Private" else "Public" end)|\(."lifecycle-state" // "N/A")|\(.id // "N/A")"' 2>/dev/null
+        
+        # Process NSGs
+        echo "$nsg_json" | jq -r '.data[] | "NSG|\(."display-name" // "N/A")||\(."lifecycle-state" // "N/A")|\(.id // "N/A")"' 2>/dev/null
+    } > "$NETWORK_RESOURCES_CACHE"
+}
+
+# Find matching shortname for a resource name
+get_shortname_match() {
+    local name="$1"
+    local name_lower
+    name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    
+    local shortname
+    for shortname in "${NETWORK_SHORTNAMES[@]}"; do
+        if [[ "$name_lower" == *"$shortname"* ]]; then
+            echo "$shortname"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# Display network resources grouped by shortname
+display_network_resources() {
+    local compartment_id="$1"
+    local vcn_ocid="$2"
+    
+    # Fetch/refresh cache
+    fetch_network_resources "$compartment_id" "$vcn_ocid"
+    
+    [[ ! -f "$NETWORK_RESOURCES_CACHE" ]] && return 1
+    
+    echo -e "${BOLD}${WHITE}Network Resources:${NC}"
+    
+    # Build arrays of subnets and NSGs
+    declare -A subnets_by_shortname
+    declare -A nsgs_by_shortname
+    declare -a unmatched_subnets
+    declare -a unmatched_nsgs
+    declare -a subnet_shortnames
+    
+    # Read subnets
+    while IFS='|' read -r type name cidr access state ocid; do
+        [[ "$type" != "SUBNET" ]] && continue
+        local shortname
+        shortname=$(get_shortname_match "$name")
+        if [[ -n "$shortname" ]]; then
+            subnets_by_shortname[$shortname]="${name}|${cidr}|${access}|${state}|${ocid}"
+            subnet_shortnames+=("$shortname")
+        else
+            unmatched_subnets+=("${name}|${cidr}|${access}|${state}|${ocid}")
+        fi
+    done < <(grep "^SUBNET|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
+    
+    # Read NSGs
+    while IFS='|' read -r type name _ state ocid; do
+        [[ "$type" != "NSG" ]] && continue
+        local shortname
+        shortname=$(get_shortname_match "$name")
+        if [[ -n "$shortname" ]]; then
+            # Append to existing or create new
+            if [[ -n "${nsgs_by_shortname[$shortname]:-}" ]]; then
+                nsgs_by_shortname[$shortname]="${nsgs_by_shortname[$shortname]}#${name}|${state}|${ocid}"
+            else
+                nsgs_by_shortname[$shortname]="${name}|${state}|${ocid}"
+            fi
+        else
+            unmatched_nsgs+=("${name}|${state}|${ocid}")
+        fi
+    done < <(grep "^NSG|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
+    
+    # Display subnets with their matching NSGs
+    local shortname
+    for shortname in "${subnet_shortnames[@]}"; do
+        local subnet_info="${subnets_by_shortname[$shortname]}"
+        [[ -z "$subnet_info" ]] && continue
+        
+        local name cidr access state ocid
+        IFS='|' read -r name cidr access state ocid <<< "$subnet_info"
+        
+        local access_color state_color
+        [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
+        [[ "$state" == "AVAILABLE" ]] && state_color="$GREEN" || state_color="$RED"
+        
+        # Format: Subnet: name [cidr] [access] [state] (ocid)
+        # Positions: 10 + 30 + 2 + 18 + 3 + 7 + 3 + 9 + 2 = 84 before "("
+        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-18s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            "$name" "$cidr" "$access" "$state" "$ocid"
+        
+        # Display matching NSGs
+        local nsg_list="${nsgs_by_shortname[$shortname]:-}"
+        if [[ -n "$nsg_list" ]]; then
+            local nsg_entries
+            IFS='#' read -ra nsg_entries <<< "$nsg_list"
+            local nsg_count=${#nsg_entries[@]}
+            local i=0
+            for nsg_entry in "${nsg_entries[@]}"; do
+                ((i++))
+                local nsg_name nsg_state nsg_ocid
+                IFS='|' read -r nsg_name nsg_state nsg_ocid <<< "$nsg_entry"
+                
+                local nsg_state_color
+                [[ "$nsg_state" == "AVAILABLE" ]] && nsg_state_color="$GREEN" || nsg_state_color="$RED"
+                
+                local prefix="├─"
+                [[ $i -eq $nsg_count ]] && prefix="└─"
+                
+                # NSG line: 10 spaces + "├─ NSG: " (8 display) + 30 name = 48
+                # Need 24 spaces to reach position 72 where [state] starts
+                printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC}                        ${WHITE}[${nsg_state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                    "$nsg_name" "$nsg_state" "$nsg_ocid"
+            done
+        fi
+        echo ""
+    done
+    
+    # Display unmatched subnets (subnets that don't match any known shortname)
+    if [[ ${#unmatched_subnets[@]} -gt 0 ]]; then
+        for subnet_entry in "${unmatched_subnets[@]}"; do
+            local name cidr access state ocid
+            IFS='|' read -r name cidr access state ocid <<< "$subnet_entry"
+            
+            local access_color state_color
+            [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
+            [[ "$state" == "AVAILABLE" ]] && state_color="$GREEN" || state_color="$RED"
+            
+            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-18s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$name" "$cidr" "$access" "$state" "$ocid"
+            echo ""
+        done
+    fi
+    
+    # Display unmatched NSGs if any
+    if [[ ${#unmatched_nsgs[@]} -gt 0 ]]; then
+        echo -e "  ${BOLD}${WHITE}Unmatched NSGs:${NC}"
+        local i=0
+        local total=${#unmatched_nsgs[@]}
+        for nsg_entry in "${unmatched_nsgs[@]}"; do
+            ((i++))
+            local nsg_name nsg_state nsg_ocid
+            IFS='|' read -r nsg_name nsg_state nsg_ocid <<< "$nsg_entry"
+            
+            local nsg_state_color
+            [[ "$nsg_state" == "AVAILABLE" ]] && nsg_state_color="$GREEN" || nsg_state_color="$RED"
+            
+            local prefix="├─"
+            [[ $i -eq $total ]] && prefix="└─"
+            
+            # Same alignment as matched NSGs: 24 spaces after 30-char name
+            printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC}                        ${WHITE}[${nsg_state_color}%-9s${WHITE}]${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$nsg_name" "$nsg_state" "$nsg_ocid"
+        done
+        echo ""
+    fi
+}
+
 # Build announcement lookup tables from cached data
 build_announcement_lookup() {
     local compartment_id="$1"
@@ -827,8 +1011,6 @@ display_oke_environment_header() {
     # Read values from cache
     local tenancy_ocid compartment_name ads
     local cluster_name cluster_ocid cluster_state pod_network vcn_name vcn_ocid
-    local worker_subnet_name worker_subnet_ocid worker_nsg_name worker_nsg_ocid
-    local pod_subnet_name pod_subnet_ocid pod_nsg_name pod_nsg_ocid
     local compute_cluster_name compute_cluster_ocid
     
     tenancy_ocid=$(get_oke_env_value "TENANCY_OCID")
@@ -840,14 +1022,6 @@ display_oke_environment_header() {
     pod_network=$(get_oke_env_value "POD_NETWORK")
     vcn_name=$(get_oke_env_value "VCN_NAME")
     vcn_ocid=$(get_oke_env_value "VCN_OCID")
-    worker_subnet_name=$(get_oke_env_value "WORKER_SUBNET_NAME")
-    worker_subnet_ocid=$(get_oke_env_value "WORKER_SUBNET_OCID")
-    worker_nsg_name=$(get_oke_env_value "WORKER_NSG_NAME")
-    worker_nsg_ocid=$(get_oke_env_value "WORKER_NSG_OCID")
-    pod_subnet_name=$(get_oke_env_value "POD_SUBNET_NAME")
-    pod_subnet_ocid=$(get_oke_env_value "POD_SUBNET_OCID")
-    pod_nsg_name=$(get_oke_env_value "POD_NSG_NAME")
-    pod_nsg_ocid=$(get_oke_env_value "POD_NSG_OCID")
     compute_cluster_name=$(get_oke_env_value "COMPUTE_CLUSTER_NAME")
     compute_cluster_ocid=$(get_oke_env_value "COMPUTE_CLUSTER_OCID")
     
@@ -927,21 +1101,15 @@ display_oke_environment_header() {
     # Section separator
     echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
     
-    # Network section
-    _print_row_with_ocid "Workers Subnet:" "$worker_subnet_name" "$worker_subnet_ocid"
-    _print_row_with_ocid "Workers NSG:" "$worker_nsg_name" "$worker_nsg_ocid"
-    _print_row_with_ocid "Pods Subnet:" "$pod_subnet_name" "$pod_subnet_ocid"
-    _print_row_with_ocid "Pods NSG:" "$pod_nsg_name" "$pod_nsg_ocid"
-    
-    # Section separator
-    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
-    
     # Compute Cluster section
     _print_row_with_ocid "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_ocid"
     
     # Bottom border
     echo -e "${BOLD}${BLUE}╚${h_line}╝${NC}"
     echo ""
+    
+    # Display network resources (subnets and NSGs grouped by shortname)
+    display_network_resources "$compartment_id" "$vcn_ocid"
 }
 
 #===============================================================================
@@ -1386,19 +1554,19 @@ display_clique_summary() {
         if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" && -n "$compute_cluster_id" ]]; then
             local compute_cluster_name
             compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
-            printf "          ${BOLD}${BLUE}├─ Compute Cluster:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
+            printf "          ${BOLD}${BLUE}├─ Compute Cluster:${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "$compute_cluster_name" "$compute_cluster_id"
         fi
         
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
+            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC}           ${WHITE}%-43s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "$fabric_name" "$fabric_ocid"
         fi
         
         if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${BOLD}${GREEN}└─ Instance Config:${NC} ${WHITE}%-40s${NC} ${YELLOW}(%s)${NC}\n" \
+            printf "          ${BOLD}${GREEN}└─ Instance Config:${NC}  ${WHITE}%-40s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "$instance_config_name" "$instance_config_id"
         fi
         echo ""
