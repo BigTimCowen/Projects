@@ -19,7 +19,7 @@
 #   Requires variables.sh with COMPARTMENT_ID, REGION, and TENANCY_ID
 #
 # Author: GPU Infrastructure Team
-# Version: 2.0
+# Version: 2.1
 #
 
 set -o pipefail
@@ -49,6 +49,7 @@ readonly CACHE_DIR="${SCRIPT_DIR}/cache"
 # Cache file paths (derived from CACHE_DIR)
 readonly FABRIC_CACHE="${CACHE_DIR}/gpu_fabrics.txt"
 readonly CLUSTER_CACHE="${CACHE_DIR}/gpu_clusters.txt"
+readonly INSTANCE_CONFIG_CACHE="${CACHE_DIR}/instance_configurations.txt"
 readonly NODE_STATE_CACHE="${CACHE_DIR}/node_states.txt"
 readonly CAPACITY_TOPOLOGY_CACHE="${CACHE_DIR}/capacity_topology_hosts.txt"
 readonly ANNOUNCEMENTS_LIST_CACHE="${CACHE_DIR}/announcements_list.json"
@@ -201,18 +202,88 @@ fetch_gpu_clusters() {
         return 1
     fi
     
-    # Write cache header and data
+    # Write cache header
     {
         echo "# GPU Memory Clusters"
-        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix"
-        jq -r '.data.items[] | 
-            .["display-name"] as $name |
-            ($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}) as $match |
-            "\(.id)|\($name)|\(.["lifecycle-state"])|\($match.suffix)"' "$raw_json" 2>/dev/null
+        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId"
     } > "$CLUSTER_CACHE"
+    
+    # Get cluster IDs and fetch details for each to get instance-configuration-id
+    local cluster_ids
+    cluster_ids=$(jq -r '.data.items[]?.id // empty' "$raw_json" 2>/dev/null)
+    
+    local cluster_id
+    for cluster_id in $cluster_ids; do
+        [[ -z "$cluster_id" ]] && continue
+        
+        local cluster_detail_file
+        cluster_detail_file=$(create_temp_file) || continue
+        
+        if oci compute compute-gpu-memory-cluster get \
+                --compute-gpu-memory-cluster-id "$cluster_id" \
+                --output json > "$cluster_detail_file" 2>/dev/null; then
+            
+            # Validate JSON before processing
+            if jq -e '.data' "$cluster_detail_file" > /dev/null 2>&1; then
+                jq -r '
+                    .data["display-name"] as $name |
+                    ($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}) as $match |
+                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($match.suffix)|\(.data["instance-configuration-id"] // "N/A")"
+                ' "$cluster_detail_file" >> "$CLUSTER_CACHE" 2>/dev/null
+            fi
+        fi
+        
+        rm -f "$cluster_detail_file"
+    done
     
     rm -f "$raw_json"
     return 0
+}
+
+# Fetch and cache all instance configurations from OCI
+fetch_instance_configurations() {
+    local compartment="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    [[ -z "$compartment" ]] && { log_warn "COMPARTMENT_ID not set. Instance configurations unavailable."; return 1; }
+    
+    is_cache_fresh "$INSTANCE_CONFIG_CACHE" && return 0
+    
+    log_info "Fetching instance configurations from OCI..."
+    
+    local raw_json
+    raw_json=$(create_temp_file) || return 1
+    
+    if ! oci compute-management instance-configuration list \
+            --compartment-id "$compartment" \
+            --all \
+            --output json > "$raw_json" 2>/dev/null; then
+        rm -f "$raw_json"
+        log_warn "Failed to fetch instance configurations"
+        return 1
+    fi
+    
+    # Write cache header and data
+    {
+        echo "# Instance Configurations"
+        echo "# Format: InstanceConfigOCID|DisplayName"
+        jq -r '.data[]? | "\(.id)|\(.["display-name"] // "N/A")"' "$raw_json" 2>/dev/null
+    } > "$INSTANCE_CONFIG_CACHE"
+    
+    rm -f "$raw_json"
+    return 0
+}
+
+# Get instance configuration name from cache
+# Args: $1 = instance configuration OCID
+get_instance_config_name() {
+    local config_id="$1"
+    
+    [[ -z "$config_id" || "$config_id" == "N/A" || "$config_id" == "null" ]] && { echo "N/A"; return 1; }
+    
+    # Ensure cache is populated
+    fetch_instance_configurations
+    
+    # Lookup from cache
+    lookup_cache "$INSTANCE_CONFIG_CACHE" "$config_id" 2
 }
 
 # Fetch and cache Kubernetes node states
@@ -394,6 +465,12 @@ build_announcement_lookup() {
 # Args: $1 = cluster OCID
 get_cluster_state() {
     lookup_cache "$CLUSTER_CACHE" "$1" 3
+}
+
+# Get instance configuration ID from cluster OCID
+# Args: $1 = cluster OCID
+get_instance_config_from_cluster() {
+    lookup_cache "$CLUSTER_CACHE" "$1" 5
 }
 
 # Get node state from cache
@@ -648,6 +725,7 @@ list_all_instances() {
     # Fetch all cached data
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_instance_configurations
     
     echo -e "${BOLD}${MAGENTA}=== All GPU Instances in Compartment ===${NC}"
     echo -e "${CYAN}Compartment:${NC} $compartment_id"
@@ -803,6 +881,7 @@ display_clique_summary() {
         declare -A gpu_clusters_count
         declare -A gpu_clusters_fabrics
         declare -A gpu_clusters_states
+        declare -A gpu_clusters_instance_configs
         
         while IFS='|' read -r _ _ _ inst_ocid gm _; do
             if [[ -n "$gm" && -z "${gpu_clusters_count[$gm]:-}" ]]; then
@@ -810,6 +889,7 @@ display_clique_summary() {
                 if [[ "$gm" != "N/A" ]]; then
                     gpu_clusters_fabrics[$gm]=$(get_fabric_from_cluster "$gm")
                     gpu_clusters_states[$gm]=$(get_cluster_state "$gm")
+                    gpu_clusters_instance_configs[$gm]=$(get_instance_config_from_cluster "$gm")
                 fi
             elif [[ -n "$gm" ]]; then
                 ((gpu_clusters_count[$gm]++))
@@ -823,15 +903,17 @@ display_clique_summary() {
         local fabric_name="N/A"
         local fabric_ocid="N/A"
         local cluster_state="N/A"
+        local instance_config_id="N/A"
         
         if [[ -n "$first_gpu_mem" && "$first_gpu_mem" != "N/A" ]]; then
             IFS='|' read -r fabric_name _ fabric_ocid _ _ _ <<< "${gpu_clusters_fabrics[$first_gpu_mem]}"
             cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
+            instance_config_id="${gpu_clusters_instance_configs[$first_gpu_mem]}"
         fi
         
-        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}" >> "$summary_temp"
+        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}" >> "$summary_temp"
         
-        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states
+        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs
     done <<< "$unique_cliques"
     
     # Print summary table
@@ -839,14 +921,21 @@ display_clique_summary() {
         "Clique ID" "Nodes" "#Cl" "GPU Memory Cluster" "State"
     print_separator 200
     
-    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid
-    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid; do
+    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id; do
         printf "${CYAN}%-48s${NC} ${GREEN}%-7s${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-95s${NC} ${WHITE}%-12s${NC}\n" \
             "$clique_id" "$nodes" "$clusters" "$gpu_mem_cluster" "$cluster_state"
         
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${BOLD}${MAGENTA}└─ Fabric:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
                 "$fabric_name" "$fabric_ocid"
+        fi
+        
+        if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+            local instance_config_name
+            instance_config_name=$(get_instance_config_name "$instance_config_id")
+            printf "          ${BOLD}${YELLOW}└─ Instance Config:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" \
+                "$instance_config_name" "$instance_config_id"
         fi
         echo ""
     done < "$summary_temp"
@@ -882,6 +971,10 @@ list_all_cliques() {
         --region "${EFFECTIVE_REGION:-$REGION}" \
         --all \
         --output json 2>/dev/null | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"' > "$oci_data"
+    
+    # Fetch GPU cluster data for instance config lookup
+    fetch_gpu_clusters
+    fetch_instance_configurations
     
     local clique_id
     while read -r clique_id; do
@@ -926,6 +1019,18 @@ list_all_cliques() {
             cluster_node_count=$(echo "${cluster_nodes[$mem_cluster]}" | wc -l)
             echo -e "${BOLD}${GREEN}  GPU Mem Cluster: $mem_cluster${NC} ${CYAN}(Nodes: $cluster_node_count)${NC}"
             
+            # Show instance configuration for this cluster
+            if [[ "$mem_cluster" != "N/A" ]]; then
+                local instance_config_id
+                instance_config_id=$(get_instance_config_from_cluster "$mem_cluster")
+                if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+                    local instance_config_name
+                    instance_config_name=$(get_instance_config_name "$instance_config_id")
+                    echo -e "    ${BOLD}${YELLOW}Instance Config:${NC} ${WHITE}$instance_config_name${NC}"
+                    echo -e "                    ${CYAN}$instance_config_id${NC}"
+                fi
+            fi
+            
             while IFS='|' read -r node ocid; do
                 echo -e "    ${WHITE}$node${NC} - ${YELLOW}$ocid${NC}"
             done <<< "${cluster_nodes[$mem_cluster]}"
@@ -962,6 +1067,10 @@ list_cliques_summary() {
         --all \
         --output json 2>/dev/null | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"' > "$oci_data"
     
+    # Fetch GPU cluster data for instance config lookup
+    fetch_gpu_clusters
+    fetch_instance_configurations
+    
     echo ""
     printf "${BOLD}%-40s %-15s %-20s${NC}\n" "Clique ID" "Total Nodes" "Memory Clusters"
     print_separator 75
@@ -981,6 +1090,7 @@ list_cliques_summary() {
         ')
         
         declare -A mem_clusters
+        declare -A mem_cluster_instance_configs
         local ocid
         while read -r ocid; do
             [[ -z "$ocid" ]] && continue
@@ -988,6 +1098,9 @@ list_cliques_summary() {
             gpu_mem_cluster=$(grep "^${ocid}|" "$oci_data" 2>/dev/null | cut -d'|' -f4)
             gpu_mem_cluster="${gpu_mem_cluster:-N/A}"
             mem_clusters[$gpu_mem_cluster]=1
+            if [[ "$gpu_mem_cluster" != "N/A" && -z "${mem_cluster_instance_configs[$gpu_mem_cluster]:-}" ]]; then
+                mem_cluster_instance_configs[$gpu_mem_cluster]=$(get_instance_config_from_cluster "$gpu_mem_cluster")
+            fi
         done <<< "$clique_data"
         
         local cluster_list
@@ -995,7 +1108,21 @@ list_cliques_summary() {
         
         printf "${CYAN}%-40s${NC} ${GREEN}%-15s${NC} ${YELLOW}%-20s${NC}\n" "$clique_id" "$node_count" "$cluster_list"
         
-        unset mem_clusters
+        # Show instance configurations for each cluster
+        local mc
+        for mc in $(echo "${!mem_clusters[@]}" | tr ' ' '\n' | sort); do
+            if [[ "$mc" != "N/A" && -n "${mem_cluster_instance_configs[$mc]:-}" ]]; then
+                local ic="${mem_cluster_instance_configs[$mc]}"
+                if [[ "$ic" != "N/A" && "$ic" != "null" && -n "$ic" ]]; then
+                    local short_mc="...${mc: -12}"
+                    local ic_name
+                    ic_name=$(get_instance_config_name "$ic")
+                    printf "  ${BOLD}${YELLOW}└─ ${short_mc} Instance Config:${NC} ${WHITE}%-40s${NC} ${CYAN}%s${NC}\n" "$ic_name" "$ic"
+                fi
+            fi
+        done
+        
+        unset mem_clusters mem_cluster_instance_configs
     done <<< "$cliques"
     
     rm -f "$oci_data"
@@ -1011,6 +1138,7 @@ get_node_info() {
     # Fetch all required cache data upfront
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_instance_configurations
     fetch_node_states
     fetch_capacity_topology
     build_announcement_lookup "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
@@ -1070,11 +1198,13 @@ get_node_info() {
     
     # Get GPU memory cluster and fabric details
     local cluster_state="N/A"
+    local instance_config_id="N/A"
     local fabric_name="N/A" fabric_ocid="N/A" fabric_state="N/A"
     local fabric_avail_hosts="N/A" fabric_total_hosts="N/A"
     
     if [[ "$gpu_memory_cluster" != "N/A" && "$gpu_memory_cluster" != "null" ]]; then
         cluster_state=$(get_cluster_state "$gpu_memory_cluster")
+        instance_config_id=$(get_instance_config_from_cluster "$gpu_memory_cluster")
         local fabric_info
         fabric_info=$(get_fabric_from_cluster "$gpu_memory_cluster")
         IFS='|' read -r fabric_name _ fabric_ocid fabric_state fabric_avail_hosts fabric_total_hosts <<< "$fabric_info"
@@ -1139,6 +1269,13 @@ get_node_info() {
         local cluster_state_color
         cluster_state_color=$(color_cluster_state "$cluster_state")
         echo -e "  ${WHITE}Cluster State:${NC}     ${cluster_state_color}${cluster_state}${NC}"
+        
+        if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+            local instance_config_name
+            instance_config_name=$(get_instance_config_name "$instance_config_id")
+            echo -e "  ${WHITE}Instance Config:${NC}   ${WHITE}$instance_config_name${NC}"
+            echo -e "                     ${CYAN}$instance_config_id${NC}"
+        fi
     else
         echo -e "  ${YELLOW}No GPU Memory Cluster assigned${NC}"
     fi
@@ -1261,6 +1398,18 @@ get_node_info() {
             
             echo -e "  ${BOLD}${BLUE}GPU Memory Cluster: ${short_cluster}${NC} (${cluster_node_count} nodes)"
             
+            # Show instance configuration for this cluster
+            if [[ "$mem_cluster" != "N/A" ]]; then
+                local ic
+                ic=$(get_instance_config_from_cluster "$mem_cluster")
+                if [[ "$ic" != "N/A" && "$ic" != "null" && -n "$ic" ]]; then
+                    local ic_name
+                    ic_name=$(get_instance_config_name "$ic")
+                    echo -e "    ${BOLD}${YELLOW}Instance Config:${NC} ${WHITE}$ic_name${NC}"
+                    echo -e "                    ${CYAN}$ic${NC}"
+                fi
+            fi
+            
             while IFS='|' read -r node ocid; do
                 local is_current=""
                 [[ "$ocid" == "$instance_id" ]] && is_current=" ${MAGENTA}← current${NC}"
@@ -1289,6 +1438,7 @@ list_instances_by_gpu_cluster() {
     
     fetch_gpu_fabrics
     fetch_gpu_clusters
+    fetch_instance_configurations
     fetch_node_states
     fetch_capacity_topology
     build_announcement_lookup "$compartment_id"
@@ -1304,6 +1454,16 @@ list_instances_by_gpu_cluster() {
     local cluster_state_color
     cluster_state_color=$(color_cluster_state "$cluster_state")
     echo -e "${CYAN}Cluster State:${NC} ${cluster_state_color}${cluster_state}${NC}"
+    
+    # Get and display instance configuration
+    local instance_config_id
+    instance_config_id=$(get_instance_config_from_cluster "$gpu_cluster")
+    if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+        local instance_config_name
+        instance_config_name=$(get_instance_config_name "$instance_config_id")
+        echo -e "${CYAN}Instance Configuration:${NC} ${WHITE}$instance_config_name${NC}"
+        echo -e "                        ${YELLOW}$instance_config_id${NC}"
+    fi
     
     local fabric_info
     fabric_info=$(get_fabric_from_cluster "$gpu_cluster")
