@@ -37,6 +37,7 @@ readonly BLUE='\033[0;34m'
 readonly MAGENTA='\033[0;35m'
 readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
+readonly ORANGE='\033[38;5;208m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m' # No Color
 
@@ -180,8 +181,8 @@ fetch_gpu_fabrics() {
     # Write cache header and data
     {
         echo "# GPU Memory Fabrics"
-        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|AvailableHosts|TotalHosts"
-        jq -r '.data.items[] | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["available-host-count"])|\(.["total-host-count"])"' "$raw_json" 2>/dev/null
+        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts"
+        jq -r '.data.items[] | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["healthy-host-count"] // 0)|\(.["available-host-count"] // 0)|\(.["total-host-count"] // 0)"' "$raw_json" 2>/dev/null
     } > "$FABRIC_CACHE"
     
     rm -f "$raw_json"
@@ -1146,26 +1147,30 @@ list_fabrics_without_clusters() {
             fabric_line=$(grep -v '^#' "$FABRIC_CACHE" | grep "|${fabric_suffix}|" | head -n1)
             
             if [[ -n "$fabric_line" ]]; then
-                local fabric_name fabric_ocid fabric_state avail_hosts total_hosts
-                IFS='|' read -r fabric_name _ fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_line"
-                echo "${fabric_name}|${fabric_ocid}|${fabric_state}|${avail_hosts}/${total_hosts}" >> "$temp_output"
+                # Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
+                local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts
+                IFS='|' read -r fabric_name _ fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts <<< "$fabric_line"
+                echo "${fabric_name}|${fabric_ocid}|${fabric_state}|${healthy_hosts}|${avail_hosts}|${total_hosts}" >> "$temp_output"
             fi
         fi
     done <<< "$all_fabric_suffixes"
     
     if [[ "$found_unused" == "true" ]]; then
-        # Print header
-        printf "${BOLD}%-40s %-105s %-13s %-15s${NC}\n" \
-            "Fabric Display Name" "GPU Memory Fabric OCID" "State" "Hosts"
-        print_separator 170
+        # Print header - aligned with clique summary
+        printf "${BOLD}%-48s %-8s %-6s %-6s %-12s${NC}\n" \
+            "Fabric Display Name" "Healthy" "Avail" "Total" "State"
+        print_separator 96
         
         # Print data rows
-        local fabric_name fabric_ocid fabric_state hosts
-        while IFS='|' read -r fabric_name fabric_ocid fabric_state hosts; do
+        local fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts
+        while IFS='|' read -r fabric_name fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts; do
             local state_color
             state_color=$(color_fabric_state "$fabric_state")
-            printf "${CYAN}%-40s${NC} ${WHITE}%-105s${NC} ${state_color}%-13s${NC} ${YELLOW}%-15s${NC}\n" \
-                "$fabric_name" "$fabric_ocid" "$fabric_state" "$hosts"
+            printf "${CYAN}%-48s${NC} ${YELLOW}%-8s${NC} ${WHITE}%-6s${NC} ${WHITE}%-6s${NC} ${state_color}%-12s${NC}\n" \
+                "$fabric_name" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_state"
+            printf "          ${BOLD}${ORANGE}└─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Fabric:" "$fabric_name" "$fabric_ocid"
+            echo ""
         done < "$temp_output"
     else
         echo -e "${GREEN}All fabrics have active clusters${NC}"
@@ -1527,47 +1532,61 @@ display_clique_summary() {
         local cluster_state="N/A"
         local instance_config_id="N/A"
         local compute_cluster_id="N/A"
+        local healthy_hosts="N/A"
+        local available_hosts="N/A"
+        local total_hosts="N/A"
         
         if [[ -n "$first_gpu_mem" && "$first_gpu_mem" != "N/A" ]]; then
-            IFS='|' read -r fabric_name _ fabric_ocid _ _ _ <<< "${gpu_clusters_fabrics[$first_gpu_mem]}"
+            # Fabric format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
+            local fabric_line="${gpu_clusters_fabrics[$first_gpu_mem]}"
+            IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts <<< "$fabric_line"
             cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
             instance_config_id="${gpu_clusters_instance_configs[$first_gpu_mem]}"
             compute_cluster_id="${gpu_clusters_compute_clusters[$first_gpu_mem]}"
         fi
         
-        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id
-        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}" >> "$summary_temp"
+        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts
+        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}" >> "$summary_temp"
         
         unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs gpu_clusters_compute_clusters
     done <<< "$unique_cliques"
     
     # Print summary table
-    printf "${BOLD}%-48s %-7s %-4s %-106s %-18s${NC}\n" \
-        "Clique ID" "Nodes" "#Cl" "GPU Memory Cluster" "State"
-    print_separator 200
+    # Clique ID, then counts, then State - GPU Memory Cluster moved to tree below
+    printf "${BOLD}%-48s %-6s %-8s %-6s %-6s %-4s %-12s${NC}\n" \
+        "Clique ID" "K8s" "Healthy" "Avail" "Total" "#Cl" "State"
+    print_separator 96
     
-    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id
-    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id; do
-        printf "${CYAN}%-48s${NC} ${GREEN}%-7s${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-95s${NC} ${WHITE}%-12s${NC}\n" \
-            "$clique_id" "$nodes" "$clusters" "$gpu_mem_cluster" "$cluster_state"
+    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts
+    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts; do
+        printf "${CYAN}%-48s${NC} ${GREEN}%-6s${NC} ${YELLOW}%-8s${NC} ${WHITE}%-6s${NC} ${WHITE}%-6s${NC} ${YELLOW}%-4s${NC} ${WHITE}%-12s${NC}\n" \
+            "$clique_id" "$nodes" "$healthy_hosts" "$available_hosts" "$total_hosts" "$clusters" "$cluster_state"
+        
+        # GPU Memory Cluster
+        if [[ "$gpu_mem_cluster" != "N/A" && "$gpu_mem_cluster" != "null" && -n "$gpu_mem_cluster" ]]; then
+            local gpu_cluster_name
+            gpu_cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
+            printf "          ${BOLD}${MAGENTA}├─${NC} ${BOLD}${MAGENTA}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "GPU Mem Cluster:" "$gpu_cluster_name" "$gpu_mem_cluster"
+        fi
         
         if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" && -n "$compute_cluster_id" ]]; then
             local compute_cluster_name
             compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
-            printf "          ${BOLD}${BLUE}├─ Compute Cluster:${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$compute_cluster_name" "$compute_cluster_id"
+            printf "          ${BOLD}${BLUE}├─${NC} ${BOLD}${BLUE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_id"
         fi
         
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${BOLD}${MAGENTA}├─ Fabric:${NC}           ${WHITE}%-43s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$fabric_name" "$fabric_ocid"
+            printf "          ${BOLD}${ORANGE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Fabric:" "$fabric_name" "$fabric_ocid"
         fi
         
         if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${BOLD}${GREEN}└─ Instance Config:${NC}  ${WHITE}%-40s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$instance_config_name" "$instance_config_id"
+            printf "          ${BOLD}${GREEN}└─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Instance Config:" "$instance_config_name" "$instance_config_id"
         fi
         echo ""
     done < "$summary_temp"
@@ -1832,14 +1851,15 @@ get_node_info() {
     local cluster_state="N/A"
     local instance_config_id="N/A"
     local fabric_name="N/A" fabric_ocid="N/A" fabric_state="N/A"
-    local fabric_avail_hosts="N/A" fabric_total_hosts="N/A"
+    local fabric_healthy_hosts="N/A" fabric_avail_hosts="N/A" fabric_total_hosts="N/A"
     
     if [[ "$gpu_memory_cluster" != "N/A" && "$gpu_memory_cluster" != "null" ]]; then
         cluster_state=$(get_cluster_state "$gpu_memory_cluster")
         instance_config_id=$(get_instance_config_from_cluster "$gpu_memory_cluster")
         local fabric_info
         fabric_info=$(get_fabric_from_cluster "$gpu_memory_cluster")
-        IFS='|' read -r fabric_name _ fabric_ocid fabric_state fabric_avail_hosts fabric_total_hosts <<< "$fabric_info"
+        # Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
+        IFS='|' read -r fabric_name _ fabric_ocid fabric_state fabric_healthy_hosts fabric_avail_hosts fabric_total_hosts <<< "$fabric_info"
     fi
     
     # Get clique size
@@ -1923,7 +1943,9 @@ get_node_info() {
         fabric_state_color=$(color_fabric_state "$fabric_state")
         echo -e "  ${WHITE}Fabric State:${NC}      ${fabric_state_color}${fabric_state}${NC}"
         
-        echo -e "  ${WHITE}Host Capacity:${NC}     ${fabric_avail_hosts}/${fabric_total_hosts} available"
+        echo -e "  ${WHITE}Healthy Hosts:${NC}     ${YELLOW}${fabric_healthy_hosts}${NC}"
+        echo -e "  ${WHITE}Available Hosts:${NC}   ${fabric_avail_hosts}"
+        echo -e "  ${WHITE}Total Hosts:${NC}       ${fabric_total_hosts}"
     else
         echo -e "  ${YELLOW}No GPU Memory Fabric information available${NC}"
     fi
@@ -2099,8 +2121,9 @@ list_instances_by_gpu_cluster() {
     
     local fabric_info
     fabric_info=$(get_fabric_from_cluster "$gpu_cluster")
-    local fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts
-    IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state avail_hosts total_hosts <<< "$fabric_info"
+    # Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts
+    local fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts
+    IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts <<< "$fabric_info"
     
     if [[ "$fabric_name" != "N/A" ]]; then
         echo ""
@@ -2110,7 +2133,9 @@ list_instances_by_gpu_cluster() {
         local fabric_state_color
         fabric_state_color=$(color_fabric_state "$fabric_state")
         echo -e "${CYAN}Fabric State:${NC}    ${fabric_state_color}${fabric_state}${NC}"
-        echo -e "${CYAN}Host Capacity:${NC}   ${avail_hosts}/${total_hosts} available"
+        echo -e "${CYAN}Healthy Hosts:${NC}   ${YELLOW}${healthy_hosts}${NC}"
+        echo -e "${CYAN}Available Hosts:${NC} ${avail_hosts}"
+        echo -e "${CYAN}Total Hosts:${NC}     ${total_hosts}"
     fi
     
     echo ""
