@@ -47,7 +47,7 @@ readonly CACHE_MAX_AGE=3600  # 1 hour in seconds
 
 # Script directory and cache paths
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly CACHE_DIR="${SCRIPT_DIR}/cache"
+readonly CACHE_DIR="${HOME}/cache"
 
 # Cache file paths (derived from CACHE_DIR)
 readonly FABRIC_CACHE="${CACHE_DIR}/gpu_fabrics.txt"
@@ -472,6 +472,30 @@ fetch_oke_environment() {
     pod_network=$(echo "$cluster_json" | jq -r '.data[0]["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
     vcn_ocid=$(echo "$cluster_json" | jq -r '.data[0]["vcn-id"] // "N/A"')
     
+    # Get cluster addons/plugins if we have a cluster OCID
+    local cluster_addons=""
+    if [[ "$cluster_ocid" != "N/A" && "$cluster_ocid" != "null" && -n "$cluster_ocid" ]]; then
+        # Use OCI CE cluster list-addons to get installed addons
+        local addons_json
+        addons_json=$(oci ce cluster list-addons --cluster-id "$cluster_ocid" --all 2>/dev/null)
+        
+        if [[ -n "$addons_json" ]]; then
+            # Extract active addon names with versions and join with commas
+            local addon_lines
+            addon_lines=$(echo "$addons_json" | jq -r '.data[] | select(.["lifecycle-state"] == "ACTIVE") | .name + " (" + (.["current-installed-version"] // "N/A") + ")"' 2>/dev/null)
+            
+            if [[ -n "$addon_lines" ]]; then
+                # Join lines with ", "
+                cluster_addons=$(echo "$addon_lines" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+            else
+                cluster_addons="None installed"
+            fi
+        else
+            cluster_addons="Unable to retrieve"
+        fi
+    fi
+    [[ -z "$cluster_addons" ]] && cluster_addons="N/A"
+    
     # Get VCN name
     local vcn_name="N/A"
     if [[ "$vcn_ocid" != "N/A" && "$vcn_ocid" != "null" && -n "$vcn_ocid" ]]; then
@@ -552,6 +576,7 @@ fetch_oke_environment() {
         echo "CLUSTER_NAME|${cluster_name}"
         echo "CLUSTER_OCID|${cluster_ocid}"
         echo "CLUSTER_STATE|${cluster_state}"
+        echo "CLUSTER_ADDONS|${cluster_addons}"
         echo "POD_NETWORK|${pod_network}"
         echo "VCN_NAME|${vcn_name}"
         echo "VCN_OCID|${vcn_ocid}"
@@ -1403,7 +1428,7 @@ display_oke_environment_header() {
     
     # Read values from cache
     local tenancy_ocid compartment_name ads
-    local cluster_name cluster_ocid cluster_state pod_network vcn_name vcn_ocid
+    local cluster_name cluster_ocid cluster_state cluster_addons pod_network vcn_name vcn_ocid
     local compute_cluster_name compute_cluster_ocid
     
     tenancy_ocid=$(get_oke_env_value "TENANCY_OCID")
@@ -1412,6 +1437,7 @@ display_oke_environment_header() {
     cluster_name=$(get_oke_env_value "CLUSTER_NAME")
     cluster_ocid=$(get_oke_env_value "CLUSTER_OCID")
     cluster_state=$(get_oke_env_value "CLUSTER_STATE")
+    cluster_addons=$(get_oke_env_value "CLUSTER_ADDONS")
     pod_network=$(get_oke_env_value "POD_NETWORK")
     vcn_name=$(get_oke_env_value "VCN_NAME")
     vcn_ocid=$(get_oke_env_value "VCN_OCID")
@@ -1489,6 +1515,7 @@ display_oke_environment_header() {
     printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${WHITE}%s${NC} ${GREEN}[%s]${NC} ${YELLOW}(%s)${NC}%${cluster_padding}s${BOLD}${BLUE}║${NC}\n" "OKE Cluster:" "$cluster_name" "$cluster_state" "$cluster_ocid" ""
     
     _print_row "Pod Network:" "$pod_network"
+    _print_row "Cluster Addons:" "$cluster_addons"
     _print_row_with_ocid "VCN:" "$vcn_name" "$vcn_ocid"
     
     # Section separator
