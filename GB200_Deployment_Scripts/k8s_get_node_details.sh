@@ -37,6 +37,7 @@ readonly BLUE='\033[0;34m'
 readonly MAGENTA='\033[0;35m'
 readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
+readonly GRAY='\033[0;90m'
 readonly ORANGE='\033[38;5;208m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m' # No Color
@@ -1587,8 +1588,8 @@ list_fabrics_without_clusters() {
                     FAILED|ERROR) update_state_color="$RED" ;;
                 esac
                 
-                printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}%-18s${NC} ${firmware_color}current: %-10s target: %-10s${NC} ${update_state_color}[%s]${NC}\n" \
-                    "Firmware:" "$current_short" "$target_short" "$firmware_update_state"
+                printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
+                    "$firmware_update_state" "$current_short" "$target_short"
             fi
             echo ""
         done < "$temp_output"
@@ -2051,8 +2052,8 @@ display_clique_summary() {
                     FAILED|ERROR) update_state_color="$RED" ;;
                 esac
                 
-                printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${firmware_color}current: %-10s target: %-10s${NC} ${update_state_color}[%s]${NC}\n" \
-                    "Firmware:" "$current_short" "$target_short" "$firmware_update_state"
+                printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
+                    "$firmware_update_state" "$current_short" "$target_short"
             fi
         fi
         
@@ -2683,6 +2684,698 @@ list_instances_by_gpu_cluster() {
 }
 
 #===============================================================================
+# GPU MEMORY FABRIC & CLUSTER MANAGEMENT
+#===============================================================================
+
+# Global arrays for interactive selection
+declare -gA FABRIC_INDEX_MAP      # f1 -> fabric_ocid
+declare -gA CLUSTER_INDEX_MAP     # g1 -> cluster_ocid
+declare -gA IC_INDEX_MAP          # i1 -> instance_config_ocid
+declare -gA CC_INDEX_MAP          # c1 -> compute_cluster_ocid
+
+# Display interactive management menu
+display_gpu_management_menu() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    # Clear index maps
+    FABRIC_INDEX_MAP=()
+    CLUSTER_INDEX_MAP=()
+    IC_INDEX_MAP=()
+    CC_INDEX_MAP=()
+    
+    # Fetch all required data
+    fetch_gpu_fabrics
+    fetch_gpu_clusters
+    fetch_instance_configurations
+    fetch_compute_clusters
+    
+    # Get compartment name
+    local compartment_name="N/A"
+    if [[ -n "$compartment_id" ]]; then
+        compartment_name=$(oci iam compartment get --compartment-id "$compartment_id" --query 'data.name' --raw-output 2>/dev/null) || compartment_name="N/A"
+    fi
+    
+    # Get availability domain from compute clusters (first one found)
+    local availability_domain="N/A"
+    if [[ -f "$COMPUTE_CLUSTER_CACHE" ]]; then
+        availability_domain=$(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null | head -1 | cut -d'|' -f3)
+        [[ -z "$availability_domain" ]] && availability_domain="N/A"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${MAGENTA}║                                              GPU MEMORY FABRIC & CLUSTER MANAGEMENT                                                                   ║${NC}"
+    echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # ========== ENVIRONMENT INFO ==========
+    echo -e "${BOLD}${WHITE}Environment:${NC}"
+    echo -e "  ${CYAN}Region:${NC}              ${WHITE}${region}${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${availability_domain}${NC}"
+    echo -e "  ${CYAN}Compartment:${NC}         ${WHITE}${compartment_name}${NC}"
+    echo -e "                       ${YELLOW}${compartment_id}${NC}"
+    echo ""
+    
+    # ========== GPU MEMORY FABRICS WITH LINKED CLUSTERS ==========
+    echo -e "${BOLD}${ORANGE}═══ GPU Memory Fabrics & Clusters ═══${NC}"
+    echo ""
+    
+    # Header for fabrics - aligned columns (no firmware)
+    printf "${BOLD}%-5s %-45s %-12s %8s %6s%6s  %s${NC}\n" \
+        "ID" "Display Name" "State" "Healthy" "Avail" "Total" "OCID"
+    print_separator 158
+    
+    local fabric_idx=0
+    local cluster_idx=0
+    
+    if [[ -f "$FABRIC_CACHE" ]]; then
+        while IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_fw target_fw fw_state; do
+            [[ "$fabric_name" =~ ^#.*$ ]] && continue
+            [[ -z "$fabric_ocid" ]] && continue
+            
+            ((fabric_idx++))
+            local fid="f${fabric_idx}"
+            FABRIC_INDEX_MAP[$fid]="$fabric_ocid"
+            
+            # Color state
+            local state_color
+            case "$fabric_state" in
+                AVAILABLE) state_color="$GREEN" ;;
+                *) state_color="$RED" ;;
+            esac
+            
+            # Color available hosts
+            local avail_color="$WHITE"
+            [[ "$avail_hosts" != "0" && "$avail_hosts" != "N/A" ]] && avail_color="$LIGHT_GREEN"
+            
+            # Print fabric line: main info with OCID on same line
+            printf "${YELLOW}%-5s${NC} ${CYAN}%-45s${NC} ${state_color}%-12s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC}${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
+                "$fid" "$fabric_name" "$fabric_state" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_ocid"
+            
+            # Find and display ACTIVE clusters for this fabric
+            local clusters_found=0
+            if [[ -f "$CLUSTER_CACHE" ]]; then
+                # Collect clusters for this fabric
+                local cluster_lines=()
+                while IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size; do
+                    [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
+                    [[ -z "$cluster_ocid" ]] && continue
+                    [[ "$cluster_state" != "ACTIVE" ]] && continue
+                    [[ "$cluster_fabric_suffix" != "$fabric_suffix" ]] && continue
+                    
+                    cluster_lines+=("$cluster_ocid|$cluster_name|$cluster_state|$cluster_fabric_suffix|$instance_config_id|$compute_cluster_id|$cluster_size")
+                done < <(grep -v '^#' "$CLUSTER_CACHE" 2>/dev/null)
+                
+                local num_clusters=${#cluster_lines[@]}
+                local cluster_i=0
+                
+                for cluster_line in "${cluster_lines[@]}"; do
+                    ((cluster_i++))
+                    ((cluster_idx++))
+                    ((clusters_found++))
+                    
+                    local cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size
+                    IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size <<< "$cluster_line"
+                    
+                    local gid="g${cluster_idx}"
+                    CLUSTER_INDEX_MAP[$gid]="$cluster_ocid"
+                    
+                    # Get instance config name (full name, no truncation)
+                    local ic_name="N/A"
+                    [[ "$instance_config_id" != "N/A" && -n "$instance_config_id" ]] && ic_name=$(get_instance_config_name "$instance_config_id")
+                    
+                    # Get compute cluster name
+                    local cc_name="N/A"
+                    [[ "$compute_cluster_id" != "N/A" && -n "$compute_cluster_id" ]] && cc_name=$(get_compute_cluster_name "$compute_cluster_id")
+                    
+                    # Tree connector
+                    local connector="├──"
+                    local continuation="│"
+                    [[ $cluster_i -eq $num_clusters ]] && { connector="└──"; continuation=" "; }
+                    
+                    # Cluster line 1: ID, Name, State (aligned), Size (aligned with Total), OCID on same line
+                    printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-37s${NC} ${GREEN}%-12s${NC} %8s %6s${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
+                        "$gid" "$cluster_name" "$cluster_state" "" "" "$cluster_size" "$cluster_ocid"
+                    
+                    # Cluster line 2: Instance Configuration (full name)
+                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Instance Config: ${GREEN}%s${NC}\n" "$ic_name"
+                    
+                    # Cluster line 3: Compute Cluster
+                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Compute Cluster: ${BLUE}%s${NC}\n" "$cc_name"
+                done
+            fi
+            
+            # Show message if no active clusters for this fabric
+            if [[ $clusters_found -eq 0 ]]; then
+                printf "     ${WHITE}└──${NC} ${GRAY}(no active clusters)${NC}\n"
+            fi
+            
+            echo ""
+        done < <(grep -v '^#' "$FABRIC_CACHE" 2>/dev/null)
+    fi
+    
+    [[ $fabric_idx -eq 0 ]] && echo -e "  ${YELLOW}No GPU Memory Fabrics found${NC}"
+    echo ""
+    
+    # ========== INSTANCE CONFIGURATIONS ==========
+    echo -e "${BOLD}${GREEN}═══ Instance Configurations ═══${NC}"
+    echo ""
+    printf "${BOLD}%-5s %-60s %s${NC}\n" "ID" "Instance Configuration Name" "OCID"
+    print_separator 140
+    
+    local ic_idx=0
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        while IFS='|' read -r ic_ocid ic_name; do
+            [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$ic_ocid" ]] && continue
+            
+            ((ic_idx++))
+            local iid="i${ic_idx}"
+            IC_INDEX_MAP[$iid]="$ic_ocid"
+            
+            printf "${YELLOW}%-5s${NC} ${WHITE}%-60s${NC} ${CYAN}%s${NC}\n" \
+                "$iid" "$ic_name" "$ic_ocid"
+        done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+    fi
+    
+    [[ $ic_idx -eq 0 ]] && echo -e "  ${YELLOW}No Instance Configurations found${NC}"
+    echo ""
+    
+    # ========== COMPUTE CLUSTERS ==========
+    echo -e "${BOLD}${BLUE}═══ Compute Clusters ═══${NC}"
+    echo ""
+    printf "${BOLD}%-5s %-60s %s${NC}\n" "ID" "Compute Cluster Name" "OCID"
+    print_separator 140
+    
+    local cc_idx=0
+    if [[ -f "$COMPUTE_CLUSTER_CACHE" ]]; then
+        while IFS='|' read -r cc_ocid cc_name cc_ad; do
+            [[ "$cc_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$cc_ocid" ]] && continue
+            
+            ((cc_idx++))
+            local cid="c${cc_idx}"
+            CC_INDEX_MAP[$cid]="$cc_ocid"
+            
+            printf "${YELLOW}%-5s${NC} ${WHITE}%-60s${NC} ${CYAN}%s${NC}\n" \
+                "$cid" "$cc_name" "$cc_ocid"
+        done < <(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null)
+    fi
+    
+    [[ $cc_idx -eq 0 ]] && echo -e "  ${YELLOW}No Compute Clusters found${NC}"
+    echo ""
+}
+
+# Interactive prompt for GPU management
+interactive_gpu_management() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        display_gpu_management_menu
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo -e "  ${GREEN}create${NC}  - Create a new GPU Memory Cluster on a Fabric"
+        echo -e "  ${YELLOW}update${NC}  - Update an existing GPU Memory Cluster (size/instance config)"
+        echo -e "  ${CYAN}view${NC}    - View details of a fabric (f#) or cluster (g#)"
+        echo -e "  ${MAGENTA}refresh${NC} - Refresh data from OCI"
+        echo -e "  ${RED}quit${NC}    - Exit management mode"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter command or ID (f#/g#/i#/c#): ${NC}"
+        
+        local input
+        read -r input
+        
+        case "$input" in
+            create|CREATE)
+                create_gpu_memory_cluster_interactive
+                ;;
+            update|UPDATE)
+                update_gpu_memory_cluster_interactive
+                ;;
+            view|VIEW)
+                echo -n -e "${CYAN}Enter ID to view (f#/g#): ${NC}"
+                read -r view_id
+                view_gpu_resource "$view_id"
+                ;;
+            refresh|REFRESH)
+                echo -e "${YELLOW}Refreshing cache...${NC}"
+                rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+                ;;
+            quit|QUIT|q|Q|exit|EXIT)
+                echo -e "${GREEN}Exiting GPU management mode${NC}"
+                break
+                ;;
+            f[0-9]*|g[0-9]*|i[0-9]*|c[0-9]*)
+                view_gpu_resource "$input"
+                ;;
+            *)
+                [[ -n "$input" ]] && echo -e "${RED}Unknown command: $input${NC}"
+                ;;
+        esac
+        
+        echo ""
+        echo -e "${CYAN}Press Enter to continue...${NC}"
+        read -r
+    done
+}
+
+# View details of a fabric or cluster
+view_gpu_resource() {
+    local resource_id="$1"
+    
+    case "$resource_id" in
+        f[0-9]*)
+            local fabric_ocid="${FABRIC_INDEX_MAP[$resource_id]:-}"
+            if [[ -z "$fabric_ocid" ]]; then
+                echo -e "${RED}Invalid fabric ID: $resource_id${NC}"
+                return 1
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${ORANGE}=== GPU Memory Fabric Details ===${NC}"
+            echo -e "${WHITE}Fabric OCID:${NC} ${YELLOW}$fabric_ocid${NC}"
+            echo ""
+            
+            # Fetch full details
+            local fabric_json
+            fabric_json=$(oci compute compute-gpu-memory-fabric get \
+                --compute-gpu-memory-fabric-id "$fabric_ocid" \
+                --output json 2>/dev/null)
+            
+            if [[ -n "$fabric_json" ]]; then
+                echo "$fabric_json" | jq -r '
+                    .data | 
+                    "Display Name:      \(.["display-name"] // "N/A")",
+                    "State:             \(.["lifecycle-state"] // "N/A")",
+                    "Healthy Hosts:     \(.["healthy-host-count"] // 0)",
+                    "Available Hosts:   \(.["available-host-count"] // 0)",
+                    "Total Hosts:       \(.["total-host-count"] // 0)",
+                    "Current Firmware:  \(.["current-firmware-bundle-id"] // "N/A")",
+                    "Target Firmware:   \(.["target-firmware-bundle-id"] // "N/A")",
+                    "Firmware State:    \(.["firmware-update-state"] // "N/A")",
+                    "Time Created:      \(.["time-created"] // "N/A")"
+                '
+            else
+                echo -e "${RED}Failed to fetch fabric details${NC}"
+            fi
+            ;;
+            
+        g[0-9]*)
+            local cluster_ocid="${CLUSTER_INDEX_MAP[$resource_id]:-}"
+            if [[ -z "$cluster_ocid" ]]; then
+                echo -e "${RED}Invalid cluster ID: $resource_id${NC}"
+                return 1
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${MAGENTA}=== GPU Memory Cluster Details ===${NC}"
+            echo -e "${WHITE}Cluster OCID:${NC} ${YELLOW}$cluster_ocid${NC}"
+            echo ""
+            
+            # Fetch full details
+            local cluster_json
+            cluster_json=$(oci compute compute-gpu-memory-cluster get \
+                --compute-gpu-memory-cluster-id "$cluster_ocid" \
+                --output json 2>/dev/null)
+            
+            if [[ -n "$cluster_json" ]]; then
+                local ic_id cc_id fabric_id
+                ic_id=$(echo "$cluster_json" | jq -r '.data["instance-configuration-id"] // "N/A"')
+                cc_id=$(echo "$cluster_json" | jq -r '.data["compute-cluster-id"] // "N/A"')
+                fabric_id=$(echo "$cluster_json" | jq -r '.data["gpu-memory-fabric-id"] // "N/A"')
+                
+                local ic_name cc_name
+                ic_name=$(get_instance_config_name "$ic_id")
+                cc_name=$(get_compute_cluster_name "$cc_id")
+                
+                echo "$cluster_json" | jq -r '
+                    .data | 
+                    "Display Name:           \(.["display-name"] // "N/A")",
+                    "State:                  \(.["lifecycle-state"] // "N/A")",
+                    "Size:                   \(.["size"] // 0)",
+                    "Availability Domain:    \(.["availability-domain"] // "N/A")",
+                    "Time Created:           \(.["time-created"] // "N/A")"
+                '
+                echo "Instance Configuration: $ic_name"
+                echo "                        $ic_id"
+                echo "Compute Cluster:        $cc_name"
+                echo "                        $cc_id"
+                echo "GPU Memory Fabric:      $fabric_id"
+            else
+                echo -e "${RED}Failed to fetch cluster details${NC}"
+            fi
+            ;;
+            
+        i[0-9]*)
+            local ic_ocid="${IC_INDEX_MAP[$resource_id]:-}"
+            if [[ -z "$ic_ocid" ]]; then
+                echo -e "${RED}Invalid instance config ID: $resource_id${NC}"
+                return 1
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${GREEN}=== Instance Configuration Details ===${NC}"
+            echo -e "${WHITE}Config OCID:${NC} ${YELLOW}$ic_ocid${NC}"
+            echo ""
+            
+            oci compute-management instance-configuration get \
+                --instance-configuration-id "$ic_ocid" \
+                --output json 2>/dev/null | jq -r '
+                    .data | 
+                    "Display Name:    \(.["display-name"] // "N/A")",
+                    "Time Created:    \(.["time-created"] // "N/A")",
+                    "Compartment:     \(.["compartment-id"] // "N/A")"
+                '
+            ;;
+            
+        c[0-9]*)
+            local cc_ocid="${CC_INDEX_MAP[$resource_id]:-}"
+            if [[ -z "$cc_ocid" ]]; then
+                echo -e "${RED}Invalid compute cluster ID: $resource_id${NC}"
+                return 1
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${BLUE}=== Compute Cluster Details ===${NC}"
+            echo -e "${WHITE}Cluster OCID:${NC} ${YELLOW}$cc_ocid${NC}"
+            echo ""
+            
+            oci compute compute-cluster get \
+                --compute-cluster-id "$cc_ocid" \
+                --output json 2>/dev/null | jq -r '
+                    .data | 
+                    "Display Name:         \(.["display-name"] // "N/A")",
+                    "State:                \(.["lifecycle-state"] // "N/A")",
+                    "Availability Domain:  \(.["availability-domain"] // "N/A")",
+                    "Time Created:         \(.["time-created"] // "N/A")"
+                '
+            ;;
+            
+        *)
+            echo -e "${RED}Invalid resource ID format. Use f#, g#, i#, or c#${NC}"
+            return 1
+            ;;
+    esac
+}
+
+# Create GPU Memory Cluster interactively
+create_gpu_memory_cluster_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══ Create GPU Memory Cluster ═══${NC}"
+    echo ""
+    
+    # Select Fabric
+    echo -n -e "${CYAN}Select GPU Memory Fabric (f#): ${NC}"
+    local fabric_input
+    read -r fabric_input
+    
+    local fabric_ocid="${FABRIC_INDEX_MAP[$fabric_input]:-}"
+    if [[ -z "$fabric_ocid" ]]; then
+        echo -e "${RED}Invalid fabric selection: $fabric_input${NC}"
+        return 1
+    fi
+    
+    # Get fabric suffix for display name
+    local fabric_suffix="${fabric_ocid: -5}"
+    local default_display_name="fabric-${fabric_suffix}"
+    
+    echo -e "${WHITE}Selected Fabric:${NC} ${YELLOW}$fabric_ocid${NC}"
+    echo ""
+    
+    # Select Compute Cluster
+    echo -n -e "${CYAN}Select Compute Cluster (c#): ${NC}"
+    local cc_input
+    read -r cc_input
+    
+    local cc_ocid="${CC_INDEX_MAP[$cc_input]:-}"
+    if [[ -z "$cc_ocid" ]]; then
+        echo -e "${RED}Invalid compute cluster selection: $cc_input${NC}"
+        return 1
+    fi
+    
+    # Get AD from compute cluster
+    local cc_ad
+    cc_ad=$(oci compute compute-cluster get \
+        --compute-cluster-id "$cc_ocid" \
+        --query 'data."availability-domain"' \
+        --raw-output 2>/dev/null)
+    
+    echo -e "${WHITE}Selected Compute Cluster:${NC} ${YELLOW}$cc_ocid${NC}"
+    echo -e "${WHITE}Availability Domain:${NC} ${MAGENTA}$cc_ad${NC}"
+    echo ""
+    
+    # Select Instance Configuration
+    echo -n -e "${CYAN}Select Instance Configuration (i#): ${NC}"
+    local ic_input
+    read -r ic_input
+    
+    local ic_ocid="${IC_INDEX_MAP[$ic_input]:-}"
+    if [[ -z "$ic_ocid" ]]; then
+        echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+        return 1
+    fi
+    
+    echo -e "${WHITE}Selected Instance Config:${NC} ${YELLOW}$ic_ocid${NC}"
+    echo ""
+    
+    # Enter Size
+    echo -n -e "${CYAN}Enter cluster size (number of instances): ${NC}"
+    local cluster_size
+    read -r cluster_size
+    
+    if ! [[ "$cluster_size" =~ ^[0-9]+$ ]] || [[ "$cluster_size" -lt 1 ]]; then
+        echo -e "${RED}Invalid size: must be a positive integer${NC}"
+        return 1
+    fi
+    
+    # Enter Display Name
+    echo -n -e "${CYAN}Enter display name [${default_display_name}]: ${NC}"
+    local display_name
+    read -r display_name
+    display_name="${display_name:-$default_display_name}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Confirm Creation ═══${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}         $display_name"
+    echo -e "  ${CYAN}Availability Domain:${NC}  $cc_ad"
+    echo -e "  ${CYAN}Compartment ID:${NC}       $compartment_id"
+    echo -e "  ${CYAN}Compute Cluster:${NC}      $cc_ocid"
+    echo -e "  ${CYAN}Instance Config:${NC}      $ic_ocid"
+    echo -e "  ${CYAN}GPU Memory Fabric:${NC}    $fabric_ocid"
+    echo -e "  ${CYAN}Size:${NC}                 $cluster_size"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (yes/no): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${RED}Creation cancelled${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Creating GPU Memory Cluster...${NC}"
+    
+    # Create the cluster
+    local result
+    result=$(oci compute compute-gpu-memory-cluster create \
+        --availability-domain "$cc_ad" \
+        --compartment-id "$compartment_id" \
+        --compute-cluster-id "$cc_ocid" \
+        --instance-configuration-id "$ic_ocid" \
+        --gpu-memory-fabric-id "$fabric_ocid" \
+        --size "$cluster_size" \
+        --display-name "$display_name" \
+        --output json 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}GPU Memory Cluster creation initiated successfully!${NC}"
+        echo ""
+        local new_cluster_id
+        new_cluster_id=$(echo "$result" | jq -r '.data.id // "N/A"')
+        local new_cluster_state
+        new_cluster_state=$(echo "$result" | jq -r '.data["lifecycle-state"] // "N/A"')
+        
+        echo -e "${WHITE}New Cluster OCID:${NC}  ${YELLOW}$new_cluster_id${NC}"
+        echo -e "${WHITE}Initial State:${NC}     ${CYAN}$new_cluster_state${NC}"
+        
+        # Invalidate cluster cache
+        rm -f "$CLUSTER_CACHE"
+    else
+        echo -e "${RED}Failed to create GPU Memory Cluster:${NC}"
+        echo "$result"
+        return 1
+    fi
+}
+
+# Update GPU Memory Cluster interactively
+update_gpu_memory_cluster_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    
+    echo ""
+    echo -e "${BOLD}${YELLOW}═══ Update GPU Memory Cluster ═══${NC}"
+    echo ""
+    
+    # Select Cluster
+    echo -n -e "${CYAN}Select GPU Memory Cluster to update (g#): ${NC}"
+    local cluster_input
+    read -r cluster_input
+    
+    local cluster_ocid="${CLUSTER_INDEX_MAP[$cluster_input]:-}"
+    if [[ -z "$cluster_ocid" ]]; then
+        echo -e "${RED}Invalid cluster selection: $cluster_input${NC}"
+        return 1
+    fi
+    
+    # Get current cluster details
+    local cluster_json
+    cluster_json=$(oci compute compute-gpu-memory-cluster get \
+        --compute-gpu-memory-cluster-id "$cluster_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$cluster_json" ]]; then
+        echo -e "${RED}Failed to fetch cluster details${NC}"
+        return 1
+    fi
+    
+    local current_name current_size current_ic current_state
+    current_name=$(echo "$cluster_json" | jq -r '.data["display-name"] // "N/A"')
+    current_size=$(echo "$cluster_json" | jq -r '.data["size"] // 0')
+    current_ic=$(echo "$cluster_json" | jq -r '.data["instance-configuration-id"] // "N/A"')
+    current_state=$(echo "$cluster_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    
+    local current_ic_name
+    current_ic_name=$(get_instance_config_name "$current_ic")
+    
+    echo ""
+    echo -e "${WHITE}Current Cluster Details:${NC}"
+    echo -e "  ${CYAN}Name:${NC}                 $current_name"
+    echo -e "  ${CYAN}State:${NC}                $current_state"
+    echo -e "  ${CYAN}Current Size:${NC}         $current_size"
+    echo -e "  ${CYAN}Instance Config:${NC}      $current_ic_name"
+    echo -e "                        ${YELLOW}$current_ic${NC}"
+    echo ""
+    
+    # Update options
+    echo -e "${WHITE}What would you like to update?${NC}"
+    echo -e "  ${GREEN}1${NC} - Size only"
+    echo -e "  ${GREEN}2${NC} - Instance Configuration only"
+    echo -e "  ${GREEN}3${NC} - Both Size and Instance Configuration"
+    echo -e "  ${RED}0${NC} - Cancel"
+    echo ""
+    echo -n -e "${CYAN}Select option: ${NC}"
+    local option
+    read -r option
+    
+    local new_size=""
+    local new_ic=""
+    
+    case "$option" in
+        1)
+            echo -n -e "${CYAN}Enter new size (current: $current_size): ${NC}"
+            read -r new_size
+            if ! [[ "$new_size" =~ ^[0-9]+$ ]] || [[ "$new_size" -lt 1 ]]; then
+                echo -e "${RED}Invalid size: must be a positive integer${NC}"
+                return 1
+            fi
+            ;;
+        2)
+            echo -n -e "${CYAN}Select new Instance Configuration (i#): ${NC}"
+            local ic_input
+            read -r ic_input
+            new_ic="${IC_INDEX_MAP[$ic_input]:-}"
+            if [[ -z "$new_ic" ]]; then
+                echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+                return 1
+            fi
+            ;;
+        3)
+            echo -n -e "${CYAN}Enter new size (current: $current_size): ${NC}"
+            read -r new_size
+            if ! [[ "$new_size" =~ ^[0-9]+$ ]] || [[ "$new_size" -lt 1 ]]; then
+                echo -e "${RED}Invalid size: must be a positive integer${NC}"
+                return 1
+            fi
+            
+            echo -n -e "${CYAN}Select new Instance Configuration (i#): ${NC}"
+            local ic_input
+            read -r ic_input
+            new_ic="${IC_INDEX_MAP[$ic_input]:-}"
+            if [[ -z "$new_ic" ]]; then
+                echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+                return 1
+            fi
+            ;;
+        0)
+            echo -e "${RED}Update cancelled${NC}"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            return 1
+            ;;
+    esac
+    
+    # Build update command
+    local update_cmd="oci compute compute-gpu-memory-cluster update --compute-gpu-memory-cluster-id $cluster_ocid"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Confirm Update ═══${NC}"
+    echo -e "  ${CYAN}Cluster:${NC}     $current_name"
+    echo -e "  ${CYAN}Cluster OCID:${NC} $cluster_ocid"
+    
+    if [[ -n "$new_size" ]]; then
+        echo -e "  ${CYAN}New Size:${NC}    $current_size → ${GREEN}$new_size${NC}"
+        update_cmd="$update_cmd --size $new_size"
+    fi
+    
+    if [[ -n "$new_ic" ]]; then
+        local new_ic_name
+        new_ic_name=$(get_instance_config_name "$new_ic")
+        echo -e "  ${CYAN}New IC:${NC}      $current_ic_name → ${GREEN}$new_ic_name${NC}"
+        update_cmd="$update_cmd --instance-configuration-id $new_ic"
+    fi
+    
+    echo ""
+    echo -n -e "${YELLOW}Proceed with update? (yes/no): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${RED}Update cancelled${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Updating GPU Memory Cluster...${NC}"
+    
+    # Execute update
+    local result
+    result=$(eval "$update_cmd --output json" 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}GPU Memory Cluster update initiated successfully!${NC}"
+        echo ""
+        local updated_state
+        updated_state=$(echo "$result" | jq -r '.data["lifecycle-state"] // "N/A"')
+        echo -e "${WHITE}Current State:${NC} ${CYAN}$updated_state${NC}"
+        
+        # Invalidate cluster cache
+        rm -f "$CLUSTER_CACHE"
+    else
+        echo -e "${RED}Failed to update GPU Memory Cluster:${NC}"
+        echo "$result"
+        return 1
+    fi
+}
+
+#===============================================================================
 # HELP AND USAGE
 #===============================================================================
 
@@ -2713,6 +3406,12 @@ show_help() {
     echo "  --list-cluster <gpu-cluster-id>"
     echo "    List all instances in a specific GPU memory cluster with fabric details"
     echo ""
+    echo -e "${BOLD}GPU Management:${NC}"
+    echo "  --manage            Interactive GPU Memory Fabric & Cluster management mode"
+    echo "                      - View fabrics (f#), clusters (g#), instance configs (i#), compute clusters (c#)"
+    echo "                      - Create new GPU Memory Clusters"
+    echo "                      - Update existing GPU Memory Clusters (size, instance configuration)"
+    echo ""
     echo -e "${BOLD}Interactive Features:${NC}"
     echo "  When listing GPU instances, if orphan instances (running in OCI but not in K8s)"
     echo "  are found, you will be prompted to select one to view its console history."
@@ -2724,6 +3423,7 @@ show_help() {
     echo "  $0 --region us-ashburn-1                              # Use different region"
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
     echo "  $0 --cliques-summary                                  # Summary table of cliques with fabric"
+    echo "  $0 --manage                                           # Interactive GPU fabric/cluster management"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx                 # Basic node info"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --labels        # Show labels"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --clique        # Show clique info + fabric"
@@ -2814,6 +3514,9 @@ main() {
                 exit 1
             fi
             list_instances_by_gpu_cluster "$2" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
+            ;;
+        --manage)
+            interactive_gpu_management
             ;;
         --help|-h)
             show_help
