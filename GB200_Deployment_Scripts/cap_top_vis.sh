@@ -335,6 +335,32 @@ display_summary() {
         echo ""
     fi
     
+    # Lifecycle details breakdown
+    if [[ -f "$BARE_METAL_HOSTS_CACHE" ]]; then
+        print_separator 80
+        echo -e "${BOLD}${WHITE}Lifecycle Details:${NC}"
+        echo ""
+        local details_breakdown
+        details_breakdown=$(echo "$hosts_arr" | jq -r '
+            group_by(.["lifecycle-details"]) |
+            sort_by(-length) |
+            .[] |
+            "\(.[0]["lifecycle-details"] // "N/A"):\(length)"
+        ' 2>/dev/null)
+        
+        while IFS=: read -r detail count; do
+            [[ -z "$detail" ]] && continue
+            local detail_color="$WHITE"
+            case "$detail" in
+                AVAILABLE)      detail_color="$GREEN" ;;
+                DEGRADED|MAINTENANCE*) detail_color="$YELLOW" ;;
+                FAILED|ERROR*)  detail_color="$RED" ;;
+            esac
+            printf "  ${detail_color}%-25s${NC} ${WHITE}%6d${NC}  ${GRAY}(%5.1f%%)${NC}\n" "${detail}:" "$count" "$(echo "scale=1; $count * 100 / $total_hosts" | bc 2>/dev/null || echo "0")"
+        done <<< "$details_breakdown"
+        echo ""
+    fi
+    
     echo -e "${GRAY}Note: Capacity topology data refreshes every 15 minutes${NC}"
     echo ""
 }
@@ -488,16 +514,22 @@ display_tree() {
                     local instance_info=""
                     if [[ -n "$instance_id" ]]; then
                         local instance_short="${instance_id##*.}"
-                        instance_info=" ${GREEN}→ Instance: ${instance_short}${NC}"
+                        instance_info=" ${GREEN}→ ${instance_short}${NC}"
                     fi
                     
-                    # Format details
+                    # Format details with color
                     local details_info=""
                     if [[ -n "$host_details" && "$host_details" != "null" ]]; then
-                        details_info=" ${GRAY}(${host_details})${NC}"
+                        local details_color="$WHITE"
+                        case "$host_details" in
+                            AVAILABLE)          details_color="$GREEN" ;;
+                            DEGRADED|MAINTENANCE*) details_color="$YELLOW" ;;
+                            FAILED|ERROR*|UNHEALTHY) details_color="$RED" ;;
+                        esac
+                        details_info=" ${details_color}[${host_details}]${NC}"
                     fi
                     
-                    echo -e "   ${island_child_prefix}${block_child_prefix}${host_prefix} ${WHITE}🖥️  ${host_short}${NC} ${host_state_color}[${host_state}]${NC} ${MAGENTA}${host_shape}${NC}${instance_info}${details_info}"
+                    echo -e "   ${island_child_prefix}${block_child_prefix}${host_prefix} ${WHITE}🖥️  ${host_short}${NC} ${host_state_color}[${host_state}]${NC}${details_info} ${MAGENTA}${host_shape}${NC}${instance_info}"
                 done <<< "$hosts_for_block"
             else
                 # Show host count summary
@@ -506,8 +538,18 @@ display_tree() {
                 block_inactive=$(jq --arg block "$block_id" '[.[] | select(.["compute-network-block-id"] == $block and .["lifecycle-state"] == "INACTIVE")] | length' "$hosts_tmp" 2>/dev/null) || block_inactive=0
                 block_total_hosts=$(jq --arg block "$block_id" '[.[] | select(.["compute-network-block-id"] == $block)] | length' "$hosts_tmp" 2>/dev/null) || block_total_hosts=0
                 
+                # Get lifecycle-details breakdown
+                local details_summary
+                details_summary=$(jq -r --arg block "$block_id" '
+                    [.[] | select(.["compute-network-block-id"] == $block)] |
+                    group_by(.["lifecycle-details"]) |
+                    map({detail: .[0]["lifecycle-details"] // "N/A", count: length}) |
+                    map("\(.count) \(.detail)") |
+                    join(", ")
+                ' "$hosts_tmp" 2>/dev/null)
+                
                 if [[ $block_total_hosts -gt 0 ]]; then
-                    echo -e "   ${island_child_prefix}${block_child_prefix}└── ${GRAY}Hosts: ${block_total_hosts} total (${NC}${GREEN}${block_active} active${NC}${GRAY}, ${NC}${YELLOW}${block_inactive} inactive${NC}${GRAY})${NC}"
+                    echo -e "   ${island_child_prefix}${block_child_prefix}└── ${GRAY}Hosts: ${block_total_hosts} (${NC}${GREEN}${block_active} active${NC}${GRAY}, ${NC}${YELLOW}${block_inactive} inactive${NC}${GRAY}) │ Details: ${details_summary}${NC}"
                 fi
             fi
         done <<< "$blocks_for_island"
@@ -549,22 +591,39 @@ display_tree() {
                 local instance_info=""
                 if [[ -n "$instance_id" ]]; then
                     local instance_short="${instance_id##*.}"
-                    instance_info=" ${GREEN}→ Instance: ${instance_short}${NC}"
+                    instance_info=" ${GREEN}→ ${instance_short}${NC}"
                 fi
                 
-                # Format details
+                # Format details with color
                 local details_info=""
                 if [[ -n "$host_details" && "$host_details" != "null" ]]; then
-                    details_info=" ${GRAY}(${host_details})${NC}"
+                    local details_color="$WHITE"
+                    case "$host_details" in
+                        AVAILABLE)          details_color="$GREEN" ;;
+                        DEGRADED|MAINTENANCE*) details_color="$YELLOW" ;;
+                        FAILED|ERROR*|UNHEALTHY) details_color="$RED" ;;
+                    esac
+                    details_info=" ${details_color}[${host_details}]${NC}"
                 fi
                 
-                echo -e "       ${host_prefix} ${WHITE}🖥️  ${host_short}${NC} ${host_state_color}[${host_state}]${NC} ${MAGENTA}${host_shape}${NC}${instance_info}${details_info}"
+                echo -e "       ${host_prefix} ${WHITE}🖥️  ${host_short}${NC} ${host_state_color}[${host_state}]${NC}${details_info} ${MAGENTA}${host_shape}${NC}${instance_info}"
             done <<< "$unassigned_hosts"
         else
             local unassigned_active unassigned_inactive
             unassigned_active=$(jq '[.[] | select(.["compute-network-block-id"] == null and .["lifecycle-state"] == "ACTIVE")] | length' "$hosts_tmp" 2>/dev/null) || unassigned_active=0
             unassigned_inactive=$(jq '[.[] | select(.["compute-network-block-id"] == null and .["lifecycle-state"] == "INACTIVE")] | length' "$hosts_tmp" 2>/dev/null) || unassigned_inactive=0
-            echo -e "       └── ${GRAY}Hosts: ${unassigned_count} total (${NC}${GREEN}${unassigned_active} active${NC}${GRAY}, ${NC}${YELLOW}${unassigned_inactive} inactive${NC}${GRAY})${NC}"
+            
+            # Get lifecycle-details breakdown for unassigned
+            local unassigned_details
+            unassigned_details=$(jq -r '
+                [.[] | select(.["compute-network-block-id"] == null)] |
+                group_by(.["lifecycle-details"]) |
+                map({detail: .[0]["lifecycle-details"] // "N/A", count: length}) |
+                map("\(.count) \(.detail)") |
+                join(", ")
+            ' "$hosts_tmp" 2>/dev/null)
+            
+            echo -e "       └── ${GRAY}Hosts: ${unassigned_count} (${NC}${GREEN}${unassigned_active} active${NC}${GRAY}, ${NC}${YELLOW}${unassigned_inactive} inactive${NC}${GRAY}) │ Details: ${unassigned_details}${NC}"
         fi
     fi
     
@@ -624,6 +683,14 @@ find_instance() {
     local host_state_color
     host_state_color=$(color_lifecycle_state "$host_state")
     
+    # Color for lifecycle-details
+    local details_color="$WHITE"
+    case "$host_details" in
+        AVAILABLE)          details_color="$GREEN" ;;
+        DEGRADED|MAINTENANCE*) details_color="$YELLOW" ;;
+        FAILED|ERROR*|UNHEALTHY) details_color="$RED" ;;
+    esac
+    
     echo -e "${BOLD}${WHITE}Instance Location in Topology:${NC}"
     echo ""
     echo -e "  ${CYAN}HPC Island:${NC}     ${YELLOW}${hpc_island_id}${NC}"
@@ -631,8 +698,8 @@ find_instance() {
     echo -e "  ${CYAN}Host ID:${NC}        ${YELLOW}${host_id}${NC}"
     echo ""
     echo -e "  ${CYAN}Host State:${NC}     ${host_state_color}${host_state}${NC}"
+    echo -e "  ${CYAN}Lifecycle Detail:${NC} ${details_color}${host_details}${NC}"
     echo -e "  ${CYAN}Shape:${NC}          ${WHITE}${host_shape}${NC}"
-    echo -e "  ${CYAN}Details:${NC}        ${WHITE}${host_details}${NC}"
     echo ""
 }
 
