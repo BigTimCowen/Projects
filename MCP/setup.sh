@@ -69,7 +69,7 @@ print_main_menu() {
     echo -e "  ${MAGENTA}7)${NC} Test All"
     echo -e "  ${MAGENTA}8)${NC} Send Test Message"
     echo ""
-    echo -e "  ${BOLD}0)${NC} Exit"
+    echo -e "  ${BOLD}0)${NC} Exit ${DIM}(or Enter)${NC}"
     echo ""
 }
 
@@ -79,6 +79,7 @@ print_llm_menu() {
     echo -e "${CYAN}${BOLD}                    LLM API Configuration${NC}"
     echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
     echo ""
+    echo -e "  ${BOLD}Configure:${NC}"
     echo -e "  ${GREEN}1)${NC} Claude (Anthropic)       ${GREEN}2)${NC} ChatGPT (OpenAI)"
     echo -e "  ${GREEN}3)${NC} Oracle GenAI             ${GREEN}4)${NC} Grok (xAI)"
     echo -e "  ${GREEN}5)${NC} Gemini (Google)          ${GREEN}6)${NC} Mistral"
@@ -86,8 +87,16 @@ print_llm_menu() {
     echo -e "  ${GREEN}9)${NC} Azure OpenAI             ${GREEN}10)${NC} AWS Bedrock"
     echo -e "  ${GREEN}11)${NC} Cohere                   ${GREEN}12)${NC} Perplexity"
     echo ""
+    echo -e "  ${BOLD}Test (t + number):${NC}"
+    echo -e "  ${YELLOW}t1)${NC} Test Claude              ${YELLOW}t2)${NC} Test OpenAI"
+    echo -e "  ${YELLOW}t3)${NC} Test Oracle GenAI        ${YELLOW}t4)${NC} Test Grok"
+    echo -e "  ${YELLOW}t5)${NC} Test Gemini              ${YELLOW}t6)${NC} Test Mistral"
+    echo -e "  ${YELLOW}t7)${NC} Test Groq                ${YELLOW}t8)${NC} Test Ollama"
+    echo -e "  ${YELLOW}t9)${NC} Test Azure OpenAI        ${YELLOW}t10)${NC} Test Bedrock"
+    echo -e "  ${YELLOW}t11)${NC} Test Cohere              ${YELLOW}t12)${NC} Test Perplexity"
+    echo ""
     echo -e "  ${RED}99)${NC} Clear All API Config"
-    echo -e "  ${BOLD}0)${NC} Back to Main Menu"
+    echo -e "  ${BOLD}0)${NC} Back ${DIM}(or Enter)${NC}"
     echo ""
 }
 
@@ -383,10 +392,14 @@ PYEOF
 
         echo ""
         echo -e "  ${BOLD}══════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "  Select: ${GREEN}[1]${NC} kubectl  ${YELLOW}[2]${NC} oci  ${CYAN}[3]${NC} helm  ${MAGENTA}[4]${NC} bash  ${BLUE}[5]${NC} scripts  │  ${BOLD}[6]${NC} timeout  ${BOLD}[7]${NC} edit  ${BOLD}[8]${NC} upgrade  ${BOLD}[0]${NC} back"
+        echo -e "  Select: ${GREEN}[1]${NC} kubectl  ${YELLOW}[2]${NC} oci  ${CYAN}[3]${NC} helm  ${MAGENTA}[4]${NC} bash  ${BLUE}[5]${NC} scripts  │  ${BOLD}[6]${NC} timeout  ${BOLD}[7]${NC} edit  ${BOLD}[8]${NC} upgrade  ${BOLD}[0]${NC} back ${DIM}(or Enter)${NC}"
         echo ""
         
         read -p "mcp-config> " choice
+        
+        # Empty input goes back
+        [[ -z "$choice" ]] && return
+        
         case $choice in
             1) modify_allowlist "kubectl" "${GREEN}" ;;
             2) modify_allowlist "oci" "${YELLOW}" ;;
@@ -429,9 +442,12 @@ upgrade_allowlist_patterns() {
     echo "  1) Upgrade OCI patterns (read-only infrastructure commands)"
     echo "  2) Upgrade bash patterns (operational monitoring commands)"
     echo "  3) Upgrade ALL patterns"
-    echo "  0) Cancel"
+    echo -e "  0) Cancel ${DIM}(or Enter)${NC}"
     echo ""
     read -p "Select: " upgrade_choice
+    
+    # Empty input cancels
+    [[ -z "$upgrade_choice" ]] && return
     
     case $upgrade_choice in
         1) upgrade_oci_patterns ;;
@@ -854,10 +870,14 @@ else:
 PYEOF
 
         echo ""
-        echo -e "  ${GREEN}[a]${NC} Add pattern    ${RED}[r]${NC} Remove by number    ${BOLD}[0]${NC} Back"
+        echo -e "  ${GREEN}[a]${NC} Add pattern    ${RED}[r]${NC} Remove by number    ${BOLD}[0]${NC} Back ${DIM}(or Enter)${NC}"
         echo ""
         
         read -p "${list_type}> " action
+        
+        # Empty input goes back
+        [[ -z "$action" ]] && return
+        
         case $action in
             a|A|add)
                 echo ""
@@ -968,10 +988,14 @@ else:
 PYEOF
 
         echo ""
-        echo -e "  ${GREEN}[a]${NC} Add script    ${RED}[r]${NC} Remove script    ${BOLD}[0]${NC} Back"
+        echo -e "  ${GREEN}[a]${NC} Add script    ${RED}[r]${NC} Remove script    ${BOLD}[0]${NC} Back ${DIM}(or Enter)${NC}"
         echo ""
         
         read -p "scripts> " action
+        
+        # Empty input goes back
+        [[ -z "$action" ]] && return
+        
         case $action in
             a|A|add)
                 echo ""
@@ -1029,19 +1053,27 @@ configure_claude() {
     # Check if we have an existing key
     local existing_key=$(get_config "claude_api_key")
     if [[ -n "$existing_key" ]]; then
+        local current_model=$(get_config "claude_model")
+        current_model="${current_model:-claude-sonnet-4-20250514}"
         echo ""
         echo -e "Current key: ${GREEN}${existing_key:0:12}...${existing_key: -4}${NC}"
+        echo -e "Current model: ${CYAN}${current_model}${NC}"
         echo ""
         echo "  1) Update API key"
         echo "  2) Select model"
         echo "  3) List available models"
-        echo "  0) Back"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
         read -p "Choice: " subchoice
+        
+        # Empty input goes back
+        [[ -z "$subchoice" ]] && return
         
         case $subchoice in
             1) ;; # Continue to key entry below
             2) select_claude_model "$existing_key"; return ;;
             3) list_claude_models "$existing_key"; return ;;
+            t|T) test_llm_claude; return ;;
             *) return ;;
         esac
     fi
@@ -1067,47 +1099,52 @@ configure_claude() {
     log_test "Testing"
     local model=$(get_config "claude_model")
     model="${model:-claude-sonnet-4-20250514}"
+    local endpoint="https://api.anthropic.com/v1/messages"
+    local cmd="curl -s -X POST $endpoint -H 'x-api-key: ${key:0:10}...' -H 'anthropic-version: 2023-06-01' -d '{\"model\":\"$model\",\"max_tokens\":5,\"messages\":[...]}'"
     
-    RESP=$(curl -s --connect-timeout 10 -X POST https://api.anthropic.com/v1/messages \
+    RESP=$(curl -s --connect-timeout 10 -X POST "$endpoint" \
         -H "Content-Type: application/json" -H "x-api-key: $key" -H "anthropic-version: 2023-06-01" \
         -d "{\"model\":\"$model\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" 2>&1)
     
     if echo "$RESP" | grep -q '"content"'; then
         log_ok "Valid"
         save_config "claude_api_key" "$key"
-        save_config "claude_endpoint" "https://api.anthropic.com/v1/messages"
+        save_config "claude_endpoint" "$endpoint"
         log_ok "Saved"
         echo ""
         read -p "Select model now? (y/n) [y]: " do_model
         [[ "${do_model:-y}" =~ ^[Yy] ]] && select_claude_model "$key"
     elif echo "$RESP" | grep -q "authentication_error\|invalid.*api.*key\|Invalid API"; then
         log_fail "Invalid API key"
+        show_error_details "Claude" "$cmd" "$RESP"
     elif echo "$RESP" | grep -q "credit\|balance\|billing\|payment"; then
         log_fail "Key valid but no credits - add funds at console.anthropic.com"
+        show_error_details "Claude" "$cmd" "$RESP"
         echo ""
         read -p "Save key anyway? (y/n) [n]: " save_anyway
         if [[ "$save_anyway" =~ ^[Yy] ]]; then
             save_config "claude_api_key" "$key"
-            save_config "claude_endpoint" "https://api.anthropic.com/v1/messages"
+            save_config "claude_endpoint" "$endpoint"
             log_ok "Saved (add credits to use)"
         fi
     elif echo "$RESP" | grep -q "Could not resolve\|Connection refused\|timed out"; then
         log_fail "Network error - cannot reach api.anthropic.com"
+        show_error_details "Claude" "$cmd" "$RESP"
         echo ""
         read -p "Save key anyway? (y/n) [n]: " save_anyway
         if [[ "$save_anyway" =~ ^[Yy] ]]; then
             save_config "claude_api_key" "$key"
-            save_config "claude_endpoint" "https://api.anthropic.com/v1/messages"
+            save_config "claude_endpoint" "$endpoint"
             log_ok "Saved (verify connectivity)"
         fi
     else
         log_fail "Test failed"
-        echo -e "${DIM}Response: ${RESP:0:200}${NC}"
+        show_error_details "Claude" "$cmd" "$RESP"
         echo ""
         read -p "Save key anyway? (y/n) [n]: " save_anyway
         if [[ "$save_anyway" =~ ^[Yy] ]]; then
             save_config "claude_api_key" "$key"
-            save_config "claude_endpoint" "https://api.anthropic.com/v1/messages"
+            save_config "claude_endpoint" "$endpoint"
             log_ok "Saved"
         fi
     fi
@@ -1276,12 +1313,43 @@ configure_openai() {
     echo ""
     echo -e "${BOLD}=== OpenAI API (ChatGPT) ===${NC}"
     echo "Get key: https://platform.openai.com/api-keys"
+    
+    local existing_key=$(get_config "openai_api_key")
+    if [[ -n "$existing_key" ]]; then
+        local current_model=$(get_config "openai_model")
+        current_model="${current_model:-gpt-4}"
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo -e "Current model: ${CYAN}${current_model}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo "  2) Change model"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            2) 
+                read -p "Model [gpt-4]: " model
+                model="${model:-gpt-4}"
+                save_config "openai_model" "$model"
+                log_ok "Model set to $model"
+                return ;;
+            t|T) test_llm_openai; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key (sk-...)"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.openai.com/v1/models"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.openai.com/v1/models -H "Authorization: Bearer $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" -H "Authorization: Bearer $key" 2>&1)
     
     if echo "$RESP" | grep -q '"data"'; then
         log_ok "Valid"
@@ -1290,6 +1358,7 @@ configure_openai() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "OpenAI" "$cmd" "$RESP"
     fi
 }
 
@@ -1312,29 +1381,35 @@ configure_oracle() {
     fi
     
     # Check if already configured
-    local existing_comp=$(get_config "oracle_compartment_id")
-    local existing_region=$(get_config "oracle_region")
-    local existing_model=$(get_config "oracle_model")
+    local existing_comp=$(get_config "oci_genai_compartment")
+    [[ -z "$existing_comp" ]] && existing_comp=$(get_config "oracle_compartment_id")
+    local existing_region=$(get_config "oci_genai_region")
+    [[ -z "$existing_region" ]] && existing_region=$(get_config "oracle_region")
+    local existing_model=$(get_config "oci_genai_model")
+    [[ -z "$existing_model" ]] && existing_model=$(get_config "oracle_model")
     
     if [[ -n "$existing_comp" ]]; then
         echo ""
         echo -e "Current config:"
-        echo -e "  Region: ${GREEN}$existing_region${NC}"
+        echo -e "  Region: ${GREEN}${existing_region:-us-chicago-1}${NC}"
         echo -e "  Compartment: ${GREEN}${existing_comp:0:40}...${NC}"
         [[ -n "$existing_model" ]] && echo -e "  Model: ${GREEN}$existing_model${NC}"
         echo ""
         echo "  1) Update configuration"
         echo "  2) List available models"
         echo "  3) Select model"
-        echo "  4) Test inference"
-        echo "  0) Back"
+        echo -e "  ${YELLOW}t) Test inference${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
         read -p "Choice: " subchoice
+        
+        # Empty input goes back
+        [[ -z "$subchoice" ]] && return
         
         case $subchoice in
             1) ;; # Continue to config below
-            2) list_oracle_models "$existing_comp" "$existing_region"; return ;;
-            3) select_oracle_model "$existing_comp" "$existing_region"; return ;;
-            4) test_oracle_inference "$existing_comp" "$existing_region" "$existing_model"; return ;;
+            2) list_oracle_models "$existing_comp" "${existing_region:-us-chicago-1}"; return ;;
+            3) select_oracle_model "$existing_comp" "${existing_region:-us-chicago-1}"; return ;;
+            t|T|4) test_llm_oracle; return ;;
             *) return ;;
         esac
     fi
@@ -1359,13 +1434,15 @@ configure_oracle() {
     read -p "OCID: " comp
     [[ -z "$comp" ]] && { log_warn "Cancelled"; return; }
     
+    local cmd="oci generative-ai model-collection list-models --compartment-id $comp --region $REGION"
     log_test "Testing GenAI access"
     RESP=$(oci generative-ai model-collection list-models --compartment-id "$comp" --region "$REGION" 2>&1)
     
     if echo "$RESP" | grep -q '"items"'; then
         log_ok "Valid"
-        save_config "oracle_compartment_id" "$comp"
-        save_config "oracle_region" "$REGION"
+        save_config "oci_genai_compartment" "$comp"
+        save_config "oci_genai_region" "$REGION"
+        save_config "oci_genai_endpoint" "https://inference.generativeai.$REGION.oci.oraclecloud.com"
         log_ok "Saved"
         
         # Count models
@@ -1380,11 +1457,13 @@ configure_oracle() {
         echo ""
         echo -e "${YELLOW}Add this policy in OCI Console → Identity → Policies:${NC}"
         echo -e "${CYAN}Allow group <your-group> to manage generative-ai-family in tenancy${NC}"
+        show_error_details "OCI GenAI" "$cmd" "$RESP"
     elif echo "$RESP" | grep -q "NotFound\|not found"; then
         log_fail "Compartment not found"
+        show_error_details "OCI GenAI" "$cmd" "$RESP"
     else
         log_fail "Failed"
-        echo -e "${DIM}${RESP:0:200}${NC}"
+        show_error_details "OCI GenAI" "$cmd" "$RESP"
     fi
 }
 
@@ -1599,12 +1678,33 @@ configure_grok() {
     echo ""
     echo -e "${BOLD}=== Grok API (xAI) ===${NC}"
     echo "Get key: https://console.x.ai/"
+    
+    local existing_key=$(get_config "grok_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_grok; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.x.ai/v1/models"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.x.ai/v1/models -H "Authorization: Bearer $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" -H "Authorization: Bearer $key" 2>&1)
     
     if echo "$RESP" | grep -q '"data"\|"id"'; then
         log_ok "Valid"
@@ -1613,6 +1713,7 @@ configure_grok() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Grok" "$cmd" "$RESP"
     fi
 }
 
@@ -1620,12 +1721,33 @@ configure_gemini() {
     echo ""
     echo -e "${BOLD}=== Gemini API (Google) ===${NC}"
     echo "Get key: https://aistudio.google.com/apikey"
+    
+    local existing_key=$(get_config "gemini_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_gemini; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://generativelanguage.googleapis.com/v1/models?key=${key:0:10}..."
+    local cmd="curl -s '$endpoint'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 "https://generativelanguage.googleapis.com/v1/models?key=$key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "https://generativelanguage.googleapis.com/v1/models?key=$key" 2>&1)
     
     if echo "$RESP" | grep -q '"models"'; then
         log_ok "Valid"
@@ -1634,6 +1756,7 @@ configure_gemini() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Gemini" "$cmd" "$RESP"
     fi
 }
 
@@ -1641,12 +1764,33 @@ configure_mistral() {
     echo ""
     echo -e "${BOLD}=== Mistral API ===${NC}"
     echo "Get key: https://console.mistral.ai/api-keys/"
+    
+    local existing_key=$(get_config "mistral_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_mistral; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.mistral.ai/v1/models"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.mistral.ai/v1/models -H "Authorization: Bearer $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" -H "Authorization: Bearer $key" 2>&1)
     
     if echo "$RESP" | grep -q '"data"'; then
         log_ok "Valid"
@@ -1655,6 +1799,7 @@ configure_mistral() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Mistral" "$cmd" "$RESP"
     fi
 }
 
@@ -1662,12 +1807,33 @@ configure_groq() {
     echo ""
     echo -e "${BOLD}=== Groq API ===${NC}"
     echo "Get key: https://console.groq.com/keys"
+    
+    local existing_key=$(get_config "groq_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_groq; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key (gsk_...)"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.groq.com/openai/v1/models"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.groq.com/openai/v1/models -H "Authorization: Bearer $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" -H "Authorization: Bearer $key" 2>&1)
     
     if echo "$RESP" | grep -q '"data"'; then
         log_ok "Valid"
@@ -1676,26 +1842,51 @@ configure_groq() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Groq" "$cmd" "$RESP"
     fi
 }
 
 configure_ollama() {
     echo ""
     echo -e "${BOLD}=== Ollama (Local) ===${NC}"
+    
+    local existing_url=$(get_config "ollama_url")
+    [[ -z "$existing_url" ]] && existing_url=$(get_config "ollama_endpoint")
+    if [[ -n "$existing_url" ]]; then
+        echo ""
+        echo -e "Current URL: ${GREEN}$existing_url${NC}"
+        echo ""
+        echo "  1) Update URL"
+        echo -e "  ${YELLOW}t) Test connection${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_ollama; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read -p "Ollama URL [http://localhost:11434]: " url
     url="${url:-http://localhost:11434}"
     
+    local endpoint="$url/api/tags"
+    local cmd="curl -s --connect-timeout 5 '$endpoint'"
+    
     log_test "Testing connection"
-    RESP=$(curl -s --connect-timeout 5 "$url/api/tags" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 5 "$endpoint" 2>&1)
     
     if echo "$RESP" | grep -q '"models"'; then
         log_ok "Connected"
+        save_config "ollama_url" "$url"
         save_config "ollama_endpoint" "$url"
         echo "Models:"
         echo "$RESP" | python3 -c "import sys,json; [print(f'  - {m[\"name\"]}') for m in json.load(sys.stdin).get('models',[])]" 2>/dev/null
         log_ok "Saved"
     else
         log_fail "Cannot connect to $url"
+        show_error_details "Ollama" "$cmd" "$RESP"
     fi
 }
 
@@ -1703,23 +1894,48 @@ configure_azure_openai() {
     echo ""
     echo -e "${BOLD}=== Azure OpenAI ===${NC}"
     echo "Get from: Azure Portal > Azure OpenAI > Keys and Endpoint"
+    
+    local existing_key=$(get_config "azure_openai_api_key")
+    [[ -z "$existing_key" ]] && existing_key=$(get_config "azure_openai_key")
+    local existing_endpoint=$(get_config "azure_openai_endpoint")
+    if [[ -n "$existing_key" && -n "$existing_endpoint" ]]; then
+        echo ""
+        echo -e "Current endpoint: ${GREEN}$existing_endpoint${NC}"
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${NC}"
+        echo ""
+        echo "  1) Update configuration"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_azure; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read -p "Endpoint (https://xxx.openai.azure.com): " endpoint
     read_api_key "API key"
     local key="$REPLY"
     read -p "Deployment name: " deployment
     [[ -z "$key" || -z "$endpoint" ]] && { log_warn "Cancelled"; return; }
     
+    local test_url="$endpoint/openai/deployments?api-version=2023-05-15"
+    local cmd="curl -s '$test_url' -H 'api-key: ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 "$endpoint/openai/deployments?api-version=2023-05-15" -H "api-key: $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$test_url" -H "api-key: $key" 2>&1)
     
     if echo "$RESP" | grep -q '"data"\|"value"'; then
         log_ok "Valid"
         save_config "azure_openai_endpoint" "$endpoint"
-        save_config "azure_openai_key" "$key"
+        save_config "azure_openai_api_key" "$key"
         save_config "azure_openai_deployment" "$deployment"
         log_ok "Saved"
     else
         log_fail "Invalid configuration"
+        show_error_details "Azure OpenAI" "$cmd" "$RESP"
     fi
 }
 
@@ -1732,24 +1948,48 @@ configure_bedrock() {
         log_fail "AWS CLI not installed"; return
     fi
     
+    local existing_region=$(get_config "bedrock_region")
+    if [[ -n "$existing_region" ]]; then
+        echo ""
+        echo -e "Current region: ${GREEN}$existing_region${NC}"
+        echo ""
+        echo "  1) Update region"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_bedrock; return ;;
+            *) return ;;
+        esac
+    fi
+    
     log_test "Checking AWS config"
-    if aws sts get-caller-identity &>/dev/null; then
+    local cmd="aws sts get-caller-identity"
+    RESP=$(aws sts get-caller-identity 2>&1)
+    if echo "$RESP" | grep -q '"Account"'; then
         log_ok "OK"
     else
-        log_fail "Run: aws configure"; return
+        log_fail "Run: aws configure"
+        show_error_details "AWS" "$cmd" "$RESP"
+        return
     fi
     
     read -p "AWS Region [us-east-1]: " region
     region="${region:-us-east-1}"
     
+    cmd="aws bedrock list-foundation-models --region $region"
     log_test "Testing Bedrock access"
-    if aws bedrock list-foundation-models --region "$region" &>/dev/null; then
+    RESP=$(aws bedrock list-foundation-models --region "$region" 2>&1)
+    if echo "$RESP" | grep -q '"modelSummaries"'; then
         log_ok "Valid"
         save_config "bedrock_region" "$region"
         save_config "bedrock_enabled" "true"
         log_ok "Saved"
     else
         log_fail "Access denied"
+        show_error_details "AWS Bedrock" "$cmd" "$RESP"
     fi
 }
 
@@ -1757,12 +1997,33 @@ configure_cohere() {
     echo ""
     echo -e "${BOLD}=== Cohere API ===${NC}"
     echo "Get key: https://dashboard.cohere.com/api-keys"
+    
+    local existing_key=$(get_config "cohere_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_cohere; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.cohere.ai/v1/models"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.cohere.ai/v1/models -H "Authorization: Bearer $key" 2>/dev/null)
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" -H "Authorization: Bearer $key" 2>&1)
     
     if echo "$RESP" | grep -q '"models"'; then
         log_ok "Valid"
@@ -1771,6 +2032,7 @@ configure_cohere() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Cohere" "$cmd" "$RESP"
     fi
 }
 
@@ -1778,14 +2040,35 @@ configure_perplexity() {
     echo ""
     echo -e "${BOLD}=== Perplexity API ===${NC}"
     echo "Get key: https://www.perplexity.ai/settings/api"
+    
+    local existing_key=$(get_config "perplexity_api_key")
+    if [[ -n "$existing_key" ]]; then
+        echo ""
+        echo -e "Current key: ${GREEN}${existing_key:0:10}...${existing_key: -4}${NC}"
+        echo ""
+        echo "  1) Update API key"
+        echo -e "  ${YELLOW}t) Test API${NC}"
+        echo -e "  0) Back ${DIM}(or Enter)${NC}"
+        read -p "Choice: " subchoice
+        [[ -z "$subchoice" ]] && return
+        case $subchoice in
+            1) ;; # continue
+            t|T) test_llm_perplexity; return ;;
+            *) return ;;
+        esac
+    fi
+    
     read_api_key "API key (pplx_...)"
     local key="$REPLY"
     [[ -z "$key" ]] && { log_warn "Cancelled"; return; }
     
+    local endpoint="https://api.perplexity.ai/chat/completions"
+    local cmd="curl -s $endpoint -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"llama-3.1-sonar-small-128k-online\",...}'"
+    
     log_test "Testing"
-    RESP=$(curl -s --connect-timeout 10 https://api.perplexity.ai/chat/completions \
+    RESP=$(curl -s --connect-timeout 10 "$endpoint" \
         -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
-        -d '{"model":"llama-3.1-sonar-small-128k-online","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' 2>/dev/null)
+        -d '{"model":"llama-3.1-sonar-small-128k-online","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' 2>&1)
     
     if echo "$RESP" | grep -q '"choices"'; then
         log_ok "Valid"
@@ -1794,6 +2077,7 @@ configure_perplexity() {
         log_ok "Saved"
     else
         log_fail "Invalid key"
+        show_error_details "Perplexity" "$cmd" "$RESP"
     fi
 }
 
@@ -1953,6 +2237,382 @@ clear_api_config() {
 }
 
 # ============================================================================
+# LLM Test Functions
+# ============================================================================
+
+# Helper to show error details
+show_error_details() {
+    local provider="$1"
+    local cmd="$2"
+    local response="$3"
+    
+    echo ""
+    echo -e "${RED}${BOLD}═══ Test Failed: $provider ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}Command:${NC}"
+    echo -e "${DIM}$cmd${NC}"
+    echo ""
+    echo -e "${YELLOW}Response:${NC}"
+    echo -e "${DIM}${response:0:500}${NC}"
+    [[ ${#response} -gt 500 ]] && echo -e "${DIM}... (truncated)${NC}"
+    echo ""
+}
+
+test_llm_claude() {
+    echo ""
+    echo -e "${BOLD}Testing Claude API...${NC}"
+    
+    local key=$(get_config "claude_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 1 first."; return; }
+    
+    local model=$(get_config "claude_model")
+    model="${model:-claude-sonnet-4-20250514}"
+    local endpoint="https://api.anthropic.com/v1/messages"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'x-api-key: ${key:0:10}...' -H 'anthropic-version: 2023-06-01' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $key" \
+        -H "anthropic-version: 2023-06-01" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"content"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['text'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Claude" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_openai() {
+    echo ""
+    echo -e "${BOLD}Testing OpenAI API...${NC}"
+    
+    local key=$(get_config "openai_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 2 first."; return; }
+    
+    local model=$(get_config "openai_model")
+    model="${model:-gpt-4}"
+    local endpoint="https://api.openai.com/v1/chat/completions"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "OpenAI" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_oracle() {
+    echo ""
+    echo -e "${BOLD}Testing OCI GenAI...${NC}"
+    
+    local compartment=$(get_config "oci_genai_compartment")
+    local endpoint=$(get_config "oci_genai_endpoint")
+    local model=$(get_config "oci_genai_model")
+    
+    [[ -z "$compartment" ]] && { log_warn "No compartment configured. Run option 3 first."; return; }
+    [[ -z "$endpoint" ]] && endpoint="https://inference.generativeai.us-chicago-1.oci.oraclecloud.com"
+    [[ -z "$model" ]] && model="meta.llama-3.3-70b-instruct"
+    
+    local cmd="oci generative-ai-inference chat --compartment-id $compartment --serving-mode '{\"modelId\":\"$model\",\"servingType\":\"ON_DEMAND\"}' --chat-request '{\"apiFormat\":\"GENERIC\",\"messages\":[{\"role\":\"USER\",\"content\":[{\"type\":\"TEXT\",\"text\":\"Say hello\"}]}],\"maxTokens\":10}' --endpoint $endpoint"
+    
+    log_test "Calling $model"
+    local RESP=$(oci generative-ai-inference chat \
+        --compartment-id "$compartment" \
+        --serving-mode "{\"modelId\":\"$model\",\"servingType\":\"ON_DEMAND\"}" \
+        --chat-request "{\"apiFormat\":\"GENERIC\",\"messages\":[{\"role\":\"USER\",\"content\":[{\"type\":\"TEXT\",\"text\":\"Say hello\"}]}],\"maxTokens\":10}" \
+        --endpoint "$endpoint" 2>&1)
+    
+    if echo "$RESP" | grep -q '"chat-response"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['data']['chat-response']['choices'][0]['message']['content'][0]['text'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "OCI GenAI" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_grok() {
+    echo ""
+    echo -e "${BOLD}Testing Grok API...${NC}"
+    
+    local key=$(get_config "grok_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 4 first."; return; }
+    
+    local model=$(get_config "grok_model")
+    model="${model:-grok-beta}"
+    local endpoint="https://api.x.ai/v1/chat/completions"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Grok" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_gemini() {
+    echo ""
+    echo -e "${BOLD}Testing Gemini API...${NC}"
+    
+    local key=$(get_config "gemini_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 5 first."; return; }
+    
+    local model=$(get_config "gemini_model")
+    model="${model:-gemini-pro}"
+    local endpoint="https://generativelanguage.googleapis.com/v1/models/$model:generateContent?key=$key"
+    
+    local cmd="curl -s -X POST 'https://generativelanguage.googleapis.com/v1/models/$model:generateContent?key=${key:0:10}...' -H 'Content-Type: application/json' -d '{\"contents\":[{\"parts\":[{\"text\":\"Say hello\"}]}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -d "{\"contents\":[{\"parts\":[{\"text\":\"Say hello\"}]}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"candidates"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['candidates'][0]['content']['parts'][0]['text'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Gemini" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_mistral() {
+    echo ""
+    echo -e "${BOLD}Testing Mistral API...${NC}"
+    
+    local key=$(get_config "mistral_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 6 first."; return; }
+    
+    local model=$(get_config "mistral_model")
+    model="${model:-mistral-small-latest}"
+    local endpoint="https://api.mistral.ai/v1/chat/completions"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Mistral" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_groq() {
+    echo ""
+    echo -e "${BOLD}Testing Groq API...${NC}"
+    
+    local key=$(get_config "groq_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 7 first."; return; }
+    
+    local model=$(get_config "groq_model")
+    model="${model:-llama-3.3-70b-versatile}"
+    local endpoint="https://api.groq.com/openai/v1/chat/completions"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Groq" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_ollama() {
+    echo ""
+    echo -e "${BOLD}Testing Ollama...${NC}"
+    
+    local url=$(get_config "ollama_url")
+    url="${url:-http://localhost:11434}"
+    local model=$(get_config "ollama_model")
+    model="${model:-llama3}"
+    local endpoint="$url/api/generate"
+    
+    local cmd="curl -s -X POST $endpoint -d '{\"model\":\"$model\",\"prompt\":\"Say hello\",\"stream\":false}'"
+    
+    log_test "Calling $model at $url"
+    local RESP=$(curl -s --connect-timeout 10 -X POST "$endpoint" \
+        -d "{\"model\":\"$model\",\"prompt\":\"Say hello\",\"stream\":false}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"response"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['response'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}${text:0:100}${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Ollama" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_azure() {
+    echo ""
+    echo -e "${BOLD}Testing Azure OpenAI...${NC}"
+    
+    local key=$(get_config "azure_openai_api_key")
+    local endpoint=$(get_config "azure_openai_endpoint")
+    local deployment=$(get_config "azure_openai_deployment")
+    
+    [[ -z "$key" || -z "$endpoint" || -z "$deployment" ]] && { log_warn "Not fully configured. Run option 9 first."; return; }
+    
+    local url="$endpoint/openai/deployments/$deployment/chat/completions?api-version=2024-02-15-preview"
+    local cmd="curl -s -X POST '$url' -H 'Content-Type: application/json' -H 'api-key: ${key:0:10}...' -d '{\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $deployment"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -H "api-key: $key" \
+        -d "{\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Azure OpenAI" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_bedrock() {
+    echo ""
+    echo -e "${BOLD}Testing AWS Bedrock...${NC}"
+    
+    local region=$(get_config "bedrock_region")
+    local model=$(get_config "bedrock_model")
+    
+    region="${region:-us-east-1}"
+    model="${model:-anthropic.claude-3-sonnet-20240229-v1:0}"
+    
+    command -v aws &>/dev/null || { log_warn "AWS CLI not installed"; return; }
+    
+    local cmd="aws bedrock-runtime invoke-model --region $region --model-id $model --body '{\"anthropic_version\":\"bedrock-2023-05-31\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}' /tmp/bedrock_test.json"
+    
+    log_test "Calling $model in $region"
+    local RESP=$(aws bedrock-runtime invoke-model \
+        --region "$region" \
+        --model-id "$model" \
+        --body "{\"anthropic_version\":\"bedrock-2023-05-31\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" \
+        /tmp/bedrock_test.json 2>&1)
+    
+    if [[ -f /tmp/bedrock_test.json ]]; then
+        local text=$(cat /tmp/bedrock_test.json | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['text'])" 2>/dev/null)
+        if [[ -n "$text" ]]; then
+            log_ok "Success"
+            echo -e "  Response: ${GREEN}$text${NC}"
+            rm -f /tmp/bedrock_test.json
+            return
+        fi
+    fi
+    
+    log_fail "Failed"
+    show_error_details "AWS Bedrock" "$cmd" "$RESP"
+    rm -f /tmp/bedrock_test.json
+}
+
+test_llm_cohere() {
+    echo ""
+    echo -e "${BOLD}Testing Cohere API...${NC}"
+    
+    local key=$(get_config "cohere_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 11 first."; return; }
+    
+    local model=$(get_config "cohere_model")
+    model="${model:-command-r}"
+    local endpoint="https://api.cohere.ai/v1/chat"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"message\":\"Say hello\"}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"message\":\"Say hello\"}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"text"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['text'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}${text:0:100}${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Cohere" "$cmd" "$RESP"
+    fi
+}
+
+test_llm_perplexity() {
+    echo ""
+    echo -e "${BOLD}Testing Perplexity API...${NC}"
+    
+    local key=$(get_config "perplexity_api_key")
+    [[ -z "$key" ]] && { log_warn "No API key configured. Run option 12 first."; return; }
+    
+    local model=$(get_config "perplexity_model")
+    model="${model:-llama-3.1-sonar-small-128k-online}"
+    local endpoint="https://api.perplexity.ai/chat/completions"
+    
+    local cmd="curl -s -X POST $endpoint -H 'Content-Type: application/json' -H 'Authorization: Bearer ${key:0:10}...' -d '{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
+    
+    log_test "Calling $model"
+    local RESP=$(curl -s --connect-timeout 15 -X POST "$endpoint" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $key" \
+        -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" 2>&1)
+    
+    if echo "$RESP" | grep -q '"choices"'; then
+        local text=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+        log_ok "Success"
+        echo -e "  Response: ${GREEN}$text${NC}"
+    else
+        log_fail "Failed"
+        show_error_details "Perplexity" "$cmd" "$RESP"
+    fi
+}
+
+# ============================================================================
 # LLM Submenu
 # ============================================================================
 
@@ -1960,6 +2620,10 @@ llm_submenu() {
     while true; do
         print_llm_menu
         read -p "llm> " choice
+        
+        # Empty input goes back
+        [[ -z "$choice" ]] && return
+        
         case $choice in
             1) configure_claude ;;
             2) configure_openai ;;
@@ -1973,6 +2637,18 @@ llm_submenu() {
             10) configure_bedrock ;;
             11) configure_cohere ;;
             12) configure_perplexity ;;
+            t1|T1) test_llm_claude ;;
+            t2|T2) test_llm_openai ;;
+            t3|T3) test_llm_oracle ;;
+            t4|T4) test_llm_grok ;;
+            t5|T5) test_llm_gemini ;;
+            t6|T6) test_llm_mistral ;;
+            t7|T7) test_llm_groq ;;
+            t8|T8) test_llm_ollama ;;
+            t9|T9) test_llm_azure ;;
+            t10|T10) test_llm_bedrock ;;
+            t11|T11) test_llm_cohere ;;
+            t12|T12) test_llm_perplexity ;;
             99) clear_api_config ;;
             0|b|back) return ;;
             *) echo "Invalid option" ;;
@@ -2238,38 +2914,56 @@ send_test_message() {
             echo ""
             
             local serving_mode="{\"servingType\":\"ON_DEMAND\",\"modelId\":\"$MODEL\"}"
+            local resp=""
             
             # Determine API format based on model vendor
             if [[ "$MODEL" == cohere.* ]]; then
                 # Cohere format
-                oci generative-ai-inference chat-result chat \
+                resp=$(oci generative-ai-inference chat-result chat \
                     --region "${REGION:-us-chicago-1}" \
                     --compartment-id "$COMP" \
                     --serving-mode "$serving_mode" \
-                    --chat-request "{\"apiFormat\":\"COHERE\",\"message\":\"$msg\",\"maxTokens\":100}" 2>&1 | \
-                    python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('chat-response',{}).get('text',d))" 2>/dev/null || log_fail "Failed"
+                    --chat-request "{\"apiFormat\":\"COHERE\",\"message\":\"$msg\",\"maxTokens\":100}" 2>&1)
             else
                 # GENERIC format for Meta, xAI, and others
-                oci generative-ai-inference chat-result chat \
+                resp=$(oci generative-ai-inference chat-result chat \
                     --region "${REGION:-us-chicago-1}" \
                     --compartment-id "$COMP" \
                     --serving-mode "$serving_mode" \
-                    --chat-request "{\"apiFormat\":\"GENERIC\",\"messages\":[{\"role\":\"USER\",\"content\":[{\"type\":\"TEXT\",\"text\":\"$msg\"}]}],\"maxTokens\":100}" 2>&1 | \
-                    python3 -c "
+                    --chat-request "{\"apiFormat\":\"GENERIC\",\"messages\":[{\"role\":\"USER\",\"content\":[{\"type\":\"TEXT\",\"text\":\"$msg\"}]}],\"maxTokens\":100}" 2>&1)
+            fi
+            
+            # Check if response is JSON
+            if echo "$resp" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+                # Valid JSON - parse response
+                echo "$resp" | python3 -c "
 import sys,json
-try:
-    d=json.load(sys.stdin)
-    cr=d.get('data',{}).get('chat-response',{})
-    if 'choices' in cr:
-        for c in cr.get('choices',[]):
-            for content in c.get('message',{}).get('content',[]):
-                if content.get('type')=='TEXT':
-                    print(content.get('text',''))
-    else:
-        print(json.dumps(cr,indent=2))
-except Exception as e:
-    print(f'Error: {e}')
-" 2>/dev/null || log_fail "Failed"
+d=json.load(sys.stdin)
+cr=d.get('data',{}).get('chat-response',{})
+if 'text' in cr:
+    print(cr['text'])
+elif 'choices' in cr:
+    for c in cr.get('choices',[]):
+        for content in c.get('message',{}).get('content',[]):
+            if content.get('type')=='TEXT':
+                print(content.get('text',''))
+else:
+    print(json.dumps(cr,indent=2))
+"
+            else
+                # Not JSON - show error
+                log_fail "API Error"
+                echo ""
+                if echo "$resp" | grep -qi "NotAuthorized\|not authorized"; then
+                    echo -e "${YELLOW}Check IAM policy: Allow group <group> to use generative-ai-family in tenancy${NC}"
+                elif echo "$resp" | grep -qi "ModelNotFound\|InvalidParameter\|not found"; then
+                    echo -e "${YELLOW}Model '$MODEL' may not be available in region $REGION${NC}"
+                    echo "Try: Oracle GenAI menu > List models > Select a different model"
+                elif echo "$resp" | grep -qi "ServiceError\|error"; then
+                    echo -e "${RED}${resp:0:300}${NC}"
+                else
+                    echo -e "${DIM}${resp:0:300}${NC}"
+                fi
             fi
             ;;
         4)
@@ -2838,6 +3532,10 @@ main() {
     while true; do
         print_main_menu
         read -p "> " choice
+        
+        # Empty input exits
+        [[ -z "$choice" ]] && { echo "Bye!"; exit 0; }
+        
         case $choice in
             1) do_install ;;
             2) do_uninstall ;;
