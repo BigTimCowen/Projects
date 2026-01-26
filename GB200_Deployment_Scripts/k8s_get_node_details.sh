@@ -77,6 +77,12 @@ readonly NETWORK_SHORTNAMES=("bastion" "cp" "operator" "int_lb" "pub_lb" "pods" 
 declare -gA INSTANCE_ANNOUNCEMENTS
 declare -gA GPU_MEM_CLUSTER_ANNOUNCEMENTS
 
+# Global arrays for interactive GPU management selection
+declare -gA FABRIC_INDEX_MAP      # f1 -> fabric_ocid
+declare -gA CLUSTER_INDEX_MAP     # g1 -> cluster_ocid
+declare -gA IC_INDEX_MAP          # i1 -> instance_config_ocid
+declare -gA CC_INDEX_MAP          # c1 -> compute_cluster_ocid
+
 # Effective compartment/region (set in main after parsing args)
 EFFECTIVE_COMPARTMENT_ID=""
 EFFECTIVE_REGION=""
@@ -1348,6 +1354,7 @@ color_node_state() {
     case "$1" in
         Ready)    echo "$GREEN" ;;
         NotReady) echo "$RED" ;;
+        -)        echo "$GRAY" ;;
         *)        echo "$YELLOW" ;;
     esac
 }
@@ -1550,7 +1557,8 @@ list_fabrics_without_clusters() {
     all_fabric_suffixes=$(grep -v '^#' "$FABRIC_CACHE" | cut -d'|' -f2)
     
     local used_fabric_suffixes
-    used_fabric_suffixes=$(grep -v '^#' "$CLUSTER_CACHE" | grep "|ACTIVE|" | cut -d'|' -f4 | sort -u)
+    # Include ACTIVE, UPDATING, and SCALING states when determining fabrics with clusters
+    used_fabric_suffixes=$(grep -v '^#' "$CLUSTER_CACHE" | grep -E "\|ACTIVE\||\|UPDATING\||\|SCALING\|" | cut -d'|' -f4 | sort -u)
     
     local found_unused=false
     local temp_output
@@ -1859,16 +1867,22 @@ list_all_instances() {
     while IFS='|' read -r display_name status instance_ocid gpu_mem; do
         [[ -z "$instance_ocid" ]] && continue
         
-        local k8s_info
+        local k8s_info node_name clique_id node_state
         k8s_info=$(grep "^${instance_ocid}|" "$k8s_temp" 2>/dev/null)
-        [[ -z "$k8s_info" ]] && continue
         
-        local node_name clique_id
-        IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+        if [[ -n "$k8s_info" ]]; then
+            # Instance is in Kubernetes
+            IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+            node_state=$(get_node_state_cached "$instance_ocid")
+        else
+            # Instance is NOT in Kubernetes (orphan)
+            node_name="-"
+            clique_id="-"
+            node_state="-"
+        fi
         
         # Get various states
-        local node_state cluster_state cap_topo_state announcements
-        node_state=$(get_node_state_cached "$instance_ocid")
+        local cluster_state cap_topo_state announcements
         cluster_state="N/A"
         [[ "$gpu_mem" != "N/A" ]] && cluster_state=$(get_cluster_state "$gpu_mem")
         cap_topo_state=$(get_capacity_topology_state "$instance_ocid")
@@ -2714,22 +2728,17 @@ list_instances_by_gpu_cluster() {
 # GPU MEMORY FABRIC & CLUSTER MANAGEMENT
 #===============================================================================
 
-# Global arrays for interactive selection
-declare -gA FABRIC_INDEX_MAP      # f1 -> fabric_ocid
-declare -gA CLUSTER_INDEX_MAP     # g1 -> cluster_ocid
-declare -gA IC_INDEX_MAP          # i1 -> instance_config_ocid
-declare -gA CC_INDEX_MAP          # c1 -> compute_cluster_ocid
-
 # Display interactive management menu
 display_gpu_management_menu() {
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     local region="${EFFECTIVE_REGION:-$REGION}"
     
-    # Clear index maps
-    FABRIC_INDEX_MAP=()
-    CLUSTER_INDEX_MAP=()
-    IC_INDEX_MAP=()
-    CC_INDEX_MAP=()
+    # Clear and re-initialize index maps as associative arrays
+    unset FABRIC_INDEX_MAP CLUSTER_INDEX_MAP IC_INDEX_MAP CC_INDEX_MAP 2>/dev/null
+    declare -gA FABRIC_INDEX_MAP=()
+    declare -gA CLUSTER_INDEX_MAP=()
+    declare -gA IC_INDEX_MAP=()
+    declare -gA CC_INDEX_MAP=()
     
     # Fetch all required data
     fetch_gpu_fabrics
@@ -2803,12 +2812,13 @@ display_gpu_management_menu() {
             # Find and display ACTIVE clusters for this fabric
             local clusters_found=0
             if [[ -f "$CLUSTER_CACHE" ]]; then
-                # Collect clusters for this fabric
+                # Collect clusters for this fabric (include ACTIVE, UPDATING, SCALING states)
                 local cluster_lines=()
                 while IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size; do
                     [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
                     [[ -z "$cluster_ocid" ]] && continue
-                    [[ "$cluster_state" != "ACTIVE" ]] && continue
+                    # Include ACTIVE, UPDATING, and SCALING states
+                    [[ "$cluster_state" != "ACTIVE" && "$cluster_state" != "UPDATING" && "$cluster_state" != "SCALING" ]] && continue
                     [[ "$cluster_fabric_suffix" != "$fabric_suffix" ]] && continue
                     
                     cluster_lines+=("$cluster_ocid|$cluster_name|$cluster_state|$cluster_fabric_suffix|$instance_config_id|$compute_cluster_id|$cluster_size")
@@ -2841,8 +2851,17 @@ display_gpu_management_menu() {
                     local continuation="│"
                     [[ $cluster_i -eq $num_clusters ]] && { connector="└──"; continuation=" "; }
                     
+                    # Determine state color
+                    local state_color="$GREEN"
+                    case "$cluster_state" in
+                        ACTIVE) state_color="$GREEN" ;;
+                        UPDATING|SCALING) state_color="$YELLOW" ;;
+                        FAILED|INACTIVE) state_color="$RED" ;;
+                        CREATING) state_color="$CYAN" ;;
+                    esac
+                    
                     # Cluster line 1: ID, Name, State (aligned), Size (aligned with Total), OCID on same line
-                    printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-37s${NC} ${GREEN}%-12s${NC} %8s %6s${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
+                    printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-37s${NC} ${state_color}%-12s${NC} %8s %6s${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
                         "$gid" "$cluster_name" "$cluster_state" "" "" "$cluster_size" "$cluster_ocid"
                     
                     # Cluster line 2: Instance Configuration (full name)
@@ -3249,12 +3268,92 @@ update_gpu_memory_cluster_interactive() {
     echo -e "${BOLD}${YELLOW}═══ Update GPU Memory Cluster ═══${NC}"
     echo ""
     
+    # List available GPU Memory Clusters
+    echo -e "${WHITE}Available GPU Memory Clusters:${NC}"
+    echo ""
+    printf "${BOLD}%-6s %-35s %-10s %6s  %-40s %8s %6s %6s${NC}\n" \
+        "ID" "Cluster Name" "State" "Size" "Fabric" "Healthy" "Avail" "Total"
+    print_separator 130
+    
+    # Collect cluster lines for sorting
+    local cluster_lines_temp
+    cluster_lines_temp=$(mktemp)
+    local has_clusters=false
+    
+    for gid in "${!CLUSTER_INDEX_MAP[@]}"; do
+        local cluster_ocid="${CLUSTER_INDEX_MAP[$gid]}"
+        [[ -z "$cluster_ocid" ]] && continue
+        
+        has_clusters=true
+        
+        # Get cluster info from cache
+        local cluster_line
+        cluster_line=$(grep "^${cluster_ocid}|" "$CLUSTER_CACHE" 2>/dev/null | head -1)
+        
+        if [[ -n "$cluster_line" ]]; then
+            local c_name c_state c_fabric_suffix c_size
+            IFS='|' read -r _ c_name c_state c_fabric_suffix _ _ c_size <<< "$cluster_line"
+            
+            # Get fabric info from suffix
+            local fabric_name="N/A" f_healthy="N/A" f_avail="N/A" f_total="N/A"
+            if [[ -n "$c_fabric_suffix" ]]; then
+                local fabric_line
+                fabric_line=$(grep -v '^#' "$FABRIC_CACHE" 2>/dev/null | grep "|${c_fabric_suffix}|" | head -1)
+                if [[ -n "$fabric_line" ]]; then
+                    IFS='|' read -r fabric_name _ _ _ f_healthy f_avail f_total _ _ _ <<< "$fabric_line"
+                fi
+            fi
+            
+            # Store for sorting: gid_num|gid|name|state|size|fabric|healthy|avail|total
+            local gid_num="${gid#g}"
+            echo "${gid_num}|${gid}|${c_name}|${c_state}|${c_size}|${fabric_name}|${f_healthy}|${f_avail}|${f_total}" >> "$cluster_lines_temp"
+        fi
+    done
+    
+    # Sort and display
+    sort -t'|' -k1 -n "$cluster_lines_temp" | while IFS='|' read -r _ gid c_name c_state c_size fabric_name f_healthy f_avail f_total; do
+        # Color state
+        local state_color
+        case "$c_state" in
+            ACTIVE) state_color="${GREEN}" ;;
+            UPDATING|SCALING) state_color="${YELLOW}" ;;
+            *) state_color="${RED}" ;;
+        esac
+        
+        # Color available - highlight if > 0
+        local avail_color="${WHITE}"
+        [[ "$f_avail" != "N/A" && "$f_avail" != "0" ]] && avail_color="${LIGHT_GREEN}"
+        
+        printf "${YELLOW}%-6s${NC} ${MAGENTA}%-35s${NC} ${state_color}%-10s${NC} %6s  ${CYAN}%-40s${NC} %8s ${avail_color}%6s${NC} %6s\n" \
+            "$gid" "$c_name" "$c_state" "$c_size" "$fabric_name" "$f_healthy" "$f_avail" "$f_total"
+    done
+    
+    rm -f "$cluster_lines_temp"
+    
+    if [[ "$has_clusters" != "true" ]]; then
+        echo -e "  ${YELLOW}No GPU Memory Clusters available${NC}"
+        return 1
+    fi
+    
+    echo ""
+    
     # Select Cluster
     echo -n -e "${CYAN}Select GPU Memory Cluster to update (g#): ${NC}"
     local cluster_input
     read -r cluster_input
     
-    local cluster_ocid="${CLUSTER_INDEX_MAP[$cluster_input]:-}"
+    # Validate input is not empty
+    if [[ -z "$cluster_input" ]]; then
+        echo -e "${RED}No cluster selected${NC}"
+        return 1
+    fi
+    
+    # Check if cluster exists in the map (safely access associative array)
+    local cluster_ocid=""
+    if [[ -n "${CLUSTER_INDEX_MAP[$cluster_input]+x}" ]]; then
+        cluster_ocid="${CLUSTER_INDEX_MAP[$cluster_input]}"
+    fi
+    
     if [[ -z "$cluster_ocid" ]]; then
         echo -e "${RED}Invalid cluster selection: $cluster_input${NC}"
         return 1
@@ -3271,11 +3370,28 @@ update_gpu_memory_cluster_interactive() {
         return 1
     fi
     
-    local current_name current_size current_ic current_state
+    local current_name current_size current_ic current_state fabric_id
     current_name=$(echo "$cluster_json" | jq -r '.data["display-name"] // "N/A"')
     current_size=$(echo "$cluster_json" | jq -r '.data["size"] // 0')
     current_ic=$(echo "$cluster_json" | jq -r '.data["instance-configuration-id"] // "N/A"')
     current_state=$(echo "$cluster_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    fabric_id=$(echo "$cluster_json" | jq -r '.data["gpu-memory-fabric-id"] // "N/A"')
+    
+    # Get fabric info for capacity display
+    local fabric_healthy="N/A" fabric_avail="N/A" fabric_total="N/A" fabric_name="N/A"
+    if [[ "$fabric_id" != "N/A" && -n "$fabric_id" ]]; then
+        local fabric_json
+        fabric_json=$(oci compute compute-gpu-memory-fabric get \
+            --compute-gpu-memory-fabric-id "$fabric_id" \
+            --output json 2>/dev/null)
+        
+        if [[ -n "$fabric_json" ]]; then
+            fabric_name=$(echo "$fabric_json" | jq -r '.data["display-name"] // "N/A"')
+            fabric_healthy=$(echo "$fabric_json" | jq -r '.data["healthy-host-count"] // 0')
+            fabric_avail=$(echo "$fabric_json" | jq -r '.data["available-host-count"] // 0')
+            fabric_total=$(echo "$fabric_json" | jq -r '.data["total-host-count"] // 0')
+        fi
+    fi
     
     local current_ic_name
     current_ic_name=$(get_instance_config_name "$current_ic")
@@ -3287,6 +3403,12 @@ update_gpu_memory_cluster_interactive() {
     echo -e "  ${CYAN}Current Size:${NC}         $current_size"
     echo -e "  ${CYAN}Instance Config:${NC}      $current_ic_name"
     echo -e "                        ${YELLOW}$current_ic${NC}"
+    echo ""
+    echo -e "${WHITE}Fabric Capacity:${NC}"
+    echo -e "  ${CYAN}Fabric:${NC}               $fabric_name"
+    echo -e "  ${CYAN}Healthy Hosts:${NC}        ${GREEN}$fabric_healthy${NC}"
+    echo -e "  ${CYAN}Available Hosts:${NC}      ${YELLOW}$fabric_avail${NC}"
+    echo -e "  ${CYAN}Total Hosts:${NC}          $fabric_total"
     echo ""
     
     # Update options
@@ -3305,7 +3427,8 @@ update_gpu_memory_cluster_interactive() {
     
     case "$option" in
         1)
-            echo -n -e "${CYAN}Enter new size (current: $current_size): ${NC}"
+            echo -e "${WHITE}Current: ${CYAN}$current_size${NC} | Fabric: Healthy=${GREEN}$fabric_healthy${NC} Avail=${YELLOW}$fabric_avail${NC} Total=$fabric_total${NC}"
+            echo -n -e "${CYAN}Enter new size: ${NC}"
             read -r new_size
             if ! [[ "$new_size" =~ ^[0-9]+$ ]] || [[ "$new_size" -lt 1 ]]; then
                 echo -e "${RED}Invalid size: must be a positive integer${NC}"
@@ -3323,7 +3446,8 @@ update_gpu_memory_cluster_interactive() {
             fi
             ;;
         3)
-            echo -n -e "${CYAN}Enter new size (current: $current_size): ${NC}"
+            echo -e "${WHITE}Current: ${CYAN}$current_size${NC} | Fabric: Healthy=${GREEN}$fabric_healthy${NC} Avail=${YELLOW}$fabric_avail${NC} Total=$fabric_total${NC}"
+            echo -n -e "${CYAN}Enter new size: ${NC}"
             read -r new_size
             if ! [[ "$new_size" =~ ^[0-9]+$ ]] || [[ "$new_size" -lt 1 ]]; then
                 echo -e "${RED}Invalid size: must be a positive integer${NC}"
@@ -3350,23 +3474,19 @@ update_gpu_memory_cluster_interactive() {
     esac
     
     # Build update command
-    local update_cmd="oci compute compute-gpu-memory-cluster update --compute-gpu-memory-cluster-id $cluster_ocid"
-    
     echo ""
     echo -e "${BOLD}${WHITE}═══ Confirm Update ═══${NC}"
-    echo -e "  ${CYAN}Cluster:${NC}     $current_name"
+    echo -e "  ${CYAN}Cluster:${NC}      $current_name"
     echo -e "  ${CYAN}Cluster OCID:${NC} $cluster_ocid"
     
     if [[ -n "$new_size" ]]; then
-        echo -e "  ${CYAN}New Size:${NC}    $current_size → ${GREEN}$new_size${NC}"
-        update_cmd="$update_cmd --size $new_size"
+        echo -e "  ${CYAN}Size:${NC}         $current_size → ${GREEN}$new_size${NC}"
     fi
     
     if [[ -n "$new_ic" ]]; then
         local new_ic_name
         new_ic_name=$(get_instance_config_name "$new_ic")
-        echo -e "  ${CYAN}New IC:${NC}      $current_ic_name → ${GREEN}$new_ic_name${NC}"
-        update_cmd="$update_cmd --instance-configuration-id $new_ic"
+        echo -e "  ${CYAN}Instance Config:${NC} $current_ic_name → ${GREEN}$new_ic_name${NC}"
     fi
     
     echo ""
@@ -3382,16 +3502,41 @@ update_gpu_memory_cluster_interactive() {
     echo ""
     echo -e "${GREEN}Updating GPU Memory Cluster...${NC}"
     
-    # Execute update
+    # Build and execute update command
     local result
-    result=$(eval "$update_cmd --output json" 2>&1)
+    local cmd_args="--compute-gpu-memory-cluster-id $cluster_ocid"
     
-    if [[ $? -eq 0 ]]; then
+    [[ -n "$new_size" ]] && cmd_args="$cmd_args --size $new_size"
+    [[ -n "$new_ic" ]] && cmd_args="$cmd_args --instance-configuration-id $new_ic"
+    
+    result=$(oci compute compute-gpu-memory-cluster update $cmd_args --output json 2>&1)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
         echo -e "${GREEN}GPU Memory Cluster update initiated successfully!${NC}"
         echo ""
-        local updated_state
-        updated_state=$(echo "$result" | jq -r '.data["lifecycle-state"] // "N/A"')
-        echo -e "${WHITE}Current State:${NC} ${CYAN}$updated_state${NC}"
+        
+        # Parse the response - handle both .data and direct response formats
+        local updated_state updated_size updated_name
+        updated_state=$(echo "$result" | jq -r 'if .data then .data["lifecycle-state"] else .["lifecycle-state"] end // "N/A"' 2>/dev/null)
+        updated_size=$(echo "$result" | jq -r 'if .data then .data["size"] else .["size"] end // "N/A"' 2>/dev/null)
+        updated_name=$(echo "$result" | jq -r 'if .data then .data["display-name"] else .["display-name"] end // "N/A"' 2>/dev/null)
+        
+        # Fallback if jq fails
+        [[ -z "$updated_state" || "$updated_state" == "null" ]] && updated_state="N/A"
+        [[ -z "$updated_size" || "$updated_size" == "null" ]] && updated_size="N/A"
+        [[ -z "$updated_name" || "$updated_name" == "null" ]] && updated_name="$current_name"
+        
+        # Display with color based on state
+        echo -e "${WHITE}Cluster:${NC}  ${MAGENTA}${updated_name}${NC}"
+        case "$updated_state" in
+            ACTIVE)           echo -e "${WHITE}State:${NC}    ${GREEN}${updated_state}${NC}" ;;
+            UPDATING|SCALING) echo -e "${WHITE}State:${NC}    ${YELLOW}${updated_state}${NC}" ;;
+            FAILED|INACTIVE)  echo -e "${WHITE}State:${NC}    ${RED}${updated_state}${NC}" ;;
+            CREATING)         echo -e "${WHITE}State:${NC}    ${CYAN}${updated_state}${NC}" ;;
+            *)                echo -e "${WHITE}State:${NC}    ${WHITE}${updated_state}${NC}" ;;
+        esac
+        echo -e "${WHITE}Size:${NC}     ${CYAN}${updated_size}${NC}"
         
         # Invalidate cluster cache
         rm -f "$CLUSTER_CACHE"
