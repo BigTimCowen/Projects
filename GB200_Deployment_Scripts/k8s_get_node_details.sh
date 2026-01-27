@@ -113,6 +113,50 @@ log_info() {
     echo "$1" >&2
 }
 
+# Action log file for tracking changes (create, update, delete operations)
+ACTION_LOG_FILE="${ACTION_LOG_FILE:-./k8s_nodes_actions_$(date +%Y%m%d).log}"
+
+# Log action to file and display command on screen
+# Args: $1 = action type (e.g., REBOOT, TERMINATE), $2 = command being executed
+log_action() {
+    local action_type="$1"
+    local command="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Display command on screen
+    echo ""
+    echo -e "${YELLOW}Executing:${NC}"
+    echo -e "${GRAY}$command${NC}"
+    echo ""
+    
+    # Log to file
+    {
+        echo "========================================"
+        echo "Timestamp: $timestamp"
+        echo "Action: $action_type"
+        echo "Command: $command"
+        echo "========================================"
+        echo ""
+    } >> "$ACTION_LOG_FILE" 2>/dev/null
+}
+
+# Log action result to file
+# Args: $1 = result (SUCCESS/FAILED), $2 = optional details
+log_action_result() {
+    local result="$1"
+    local details="${2:-}"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    {
+        echo "Result: $result"
+        [[ -n "$details" ]] && echo "Details: $details"
+        echo "Completed: $timestamp"
+        echo ""
+    } >> "$ACTION_LOG_FILE" 2>/dev/null
+}
+
 # Check if a value is a valid OCID (not empty, not N/A, not null)
 # Args: $1 = value to check
 # Returns: 0 if valid, 1 if invalid
@@ -2036,63 +2080,254 @@ list_fabrics_without_clusters() {
     rm -f "$temp_output"
 }
 
-# Get console history for an instance
+#===============================================================================
+# UNIFIED CONSOLE HISTORY FUNCTION
+# Single function for capturing and displaying console history
+# Used by both CLI (--console-history) and interactive modes
+#===============================================================================
+
+# Capture and display console history for an instance
+# Args: 
+#   $1 = instance OCID (required)
+#   $2 = region (optional, defaults to EFFECTIVE_REGION or REGION)
+#   $3 = instance display name (optional, for display purposes)
+#   $4 = auto_cleanup - "true" to delete history after display (default: "true")
+#   $5 = interactive - "true" for interactive prompts (default: "false")
+#
+# Returns: 0 on success, 1 on failure
+# Output: Console history content to stdout
+#
+fetch_and_display_console_history() {
+    local instance_ocid="$1"
+    local region="${2:-${EFFECTIVE_REGION:-$REGION}}"
+    local instance_name="${3:-$instance_ocid}"
+    local auto_cleanup="${4:-true}"
+    local interactive="${5:-false}"
+    
+    # Validate required args
+    if [[ -z "$instance_ocid" ]]; then
+        echo -e "${RED}Error: Instance OCID required${NC}" >&2
+        return 1
+    fi
+    
+    if [[ -z "$region" ]]; then
+        echo -e "${RED}Error: Region not set${NC}" >&2
+        return 1
+    fi
+    
+    local console_history_id=""
+    local capture_cmd=""
+    local status_cmd=""
+    local content_cmd=""
+    
+    # ========== STEP 1: Capture Console History ==========
+    echo ""
+    echo -e "${YELLOW}Capturing console history...${NC}"
+    echo ""
+    
+    capture_cmd="oci --region \"$region\" compute console-history capture --instance-id \"$instance_ocid\" --output json"
+    echo -e "${GRAY}Command: ${capture_cmd}${NC}"
+    echo ""
+    
+    local capture_result
+    capture_result=$(oci --region "$region" compute console-history capture \
+        --instance-id "$instance_ocid" \
+        --output json 2>&1)
+    local capture_exit=$?
+    
+    if [[ $capture_exit -ne 0 ]]; then
+        echo -e "${RED}✗ Failed to capture console history${NC}"
+        echo -e "${GRAY}Exit code: $capture_exit${NC}"
+        echo -e "${GRAY}Output: $capture_result${NC}"
+        return 1
+    fi
+    
+    console_history_id=$(echo "$capture_result" | jq -r '.data.id // empty' 2>/dev/null)
+    
+    if [[ -z "$console_history_id" ]]; then
+        echo -e "${RED}✗ Failed to get console history ID from response${NC}"
+        echo -e "${GRAY}Response: $capture_result${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}✓ Console history capture initiated${NC}"
+    echo -e "  ${CYAN}History ID:${NC} ${YELLOW}$console_history_id${NC}"
+    echo ""
+    
+    # ========== STEP 2: Wait for Capture to Complete ==========
+    echo -e "${YELLOW}Waiting for capture to complete...${NC}"
+    
+    status_cmd="oci --region \"$region\" compute console-history get --instance-console-history-id \"$console_history_id\" --output json"
+    echo -e "${GRAY}Polling command: ${status_cmd}${NC}"
+    echo ""
+    
+    local max_wait=60
+    local wait_count=0
+    local capture_state="REQUESTED"
+    local status_json=""
+    
+    while [[ "$capture_state" != "SUCCEEDED" && "$capture_state" != "FAILED" && $wait_count -lt $max_wait ]]; do
+        sleep 2
+        ((wait_count+=2))
+        
+        status_json=$(oci --region "$region" compute console-history get \
+            --instance-console-history-id "$console_history_id" \
+            --output json 2>/dev/null)
+        
+        capture_state=$(echo "$status_json" | jq -r '.data["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+        echo -ne "\r  ${YELLOW}Status:${NC} ${WHITE}${capture_state}${NC} (${wait_count}s)    "
+    done
+    echo ""
+    
+    if [[ "$capture_state" != "SUCCEEDED" ]]; then
+        echo ""
+        echo -e "${RED}✗ Console history capture failed or timed out${NC}"
+        echo -e "  ${CYAN}Final State:${NC} ${YELLOW}$capture_state${NC}"
+        
+        # Cleanup on failure if we have an ID
+        if [[ -n "$console_history_id" && "$auto_cleanup" == "true" ]]; then
+            oci --region "$region" compute console-history delete \
+                --instance-console-history-id "$console_history_id" \
+                --force 2>/dev/null
+        fi
+        return 1
+    fi
+    
+    # Show final status details
+    echo ""
+    echo -e "${GREEN}✓ Console history capture completed${NC}"
+    echo -e "  ${CYAN}Lifecycle State:${NC} ${GREEN}$capture_state${NC}"
+    
+    # Extract additional details from status_json
+    local time_created availability_domain
+    time_created=$(echo "$status_json" | jq -r '.data["time-created"] // "N/A"' 2>/dev/null)
+    availability_domain=$(echo "$status_json" | jq -r '.data["availability-domain"] // "N/A"' 2>/dev/null)
+    echo -e "  ${CYAN}Time Created:${NC}    ${WHITE}${time_created}${NC}"
+    echo -e "  ${CYAN}AD:${NC}              ${WHITE}${availability_domain}${NC}"
+    echo ""
+    
+    # ========== STEP 3: Fetch Console History Content ==========
+    echo -e "${BOLD}${MAGENTA}─── Console Output ───────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    content_cmd="oci --region \"$region\" compute console-history get-content --instance-console-history-id \"$console_history_id\" --length 10000000 --file -"
+    echo -e "${GRAY}Command: ${content_cmd}${NC}"
+    echo ""
+    
+    # Use temp file for reliability
+    local temp_output temp_error
+    temp_output=$(mktemp)
+    temp_error=$(mktemp)
+    
+    # Capture the raw command output for display if empty
+    local raw_output
+    raw_output=$(oci --region "$region" compute console-history get-content \
+        --instance-console-history-id "$console_history_id" \
+        --length 10000000 \
+        --file "$temp_output" 2>&1)
+    local fetch_exit=$?
+    
+    echo -e "${BOLD}${MAGENTA}─── Output ───────────────────────────────────────────────────────────────────────${NC}"
+    
+    if [[ $fetch_exit -eq 0 ]]; then
+        if [[ -s "$temp_output" ]]; then
+            cat "$temp_output"
+        else
+            echo -e "${YELLOW}(Console history is empty - no serial console output captured)${NC}"
+            echo ""
+            echo -e "${WHITE}OCI CLI raw output:${NC}"
+            if [[ -n "$raw_output" ]]; then
+                echo -e "${GRAY}${raw_output}${NC}"
+            else
+                echo -e "${GRAY}(no output returned)${NC}"
+            fi
+            echo ""
+            echo -e "${WHITE}Note: This can happen if:${NC}"
+            echo -e "${GRAY}  - The instance has not produced any serial console output${NC}"
+            echo -e "${GRAY}  - Serial console logging is not enabled on the instance${NC}"
+            echo -e "${GRAY}  - The instance was recently created/rebooted${NC}"
+        fi
+    else
+        echo -e "${RED}Failed to fetch console history content${NC}"
+        echo -e "${GRAY}Exit code: $fetch_exit${NC}"
+        echo -e "${WHITE}OCI CLI output:${NC}"
+        echo -e "${GRAY}${raw_output}${NC}"
+        if [[ -s "$temp_error" ]]; then
+            echo -e "${WHITE}Stderr:${NC}"
+            cat "$temp_error"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── End of Console Output ────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # ========== STEP 4: Save Option (Interactive Only) ==========
+    if [[ "$interactive" == "true" && -s "$temp_output" ]]; then
+        echo -n -e "${CYAN}Save to file? [y/N]: ${NC}"
+        local save_choice
+        read -r save_choice
+        
+        if [[ "$save_choice" =~ ^[Yy] ]]; then
+            local safe_name
+            safe_name=$(echo "$instance_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+            local filename="${safe_name}_console_$(date +%Y%m%d_%H%M%S).log"
+            
+            echo -n -e "${CYAN}Filename [${filename}]: ${NC}"
+            local custom_filename
+            read -r custom_filename
+            [[ -n "$custom_filename" ]] && filename="$custom_filename"
+            
+            if cp "$temp_output" "$filename" 2>/dev/null; then
+                echo -e "${GREEN}✓ Console output saved to: ${WHITE}$(pwd)/${filename}${NC}"
+            else
+                echo -e "${RED}Failed to save console output${NC}"
+            fi
+        fi
+        echo ""
+    fi
+    
+    # Cleanup temp files
+    rm -f "$temp_output" "$temp_error"
+    
+    # ========== STEP 5: Cleanup Console History ==========
+    if [[ "$auto_cleanup" == "true" ]]; then
+        echo -e "${GRAY}Cleaning up console history...${NC}"
+        local delete_cmd="oci --region \"$region\" compute console-history delete --instance-console-history-id \"$console_history_id\" --force"
+        echo -e "${GRAY}Command: ${delete_cmd}${NC}"
+        
+        if oci --region "$region" compute console-history delete \
+            --instance-console-history-id "$console_history_id" \
+            --force 2>/dev/null; then
+            echo -e "${GREEN}✓ Console history deleted${NC}"
+        else
+            echo -e "${YELLOW}⚠ Failed to delete console history (may need manual cleanup)${NC}"
+            echo -e "${GRAY}History ID: ${console_history_id}${NC}"
+        fi
+    else
+        echo -e "${WHITE}Console history retained:${NC} ${YELLOW}$console_history_id${NC}"
+    fi
+    
+    echo ""
+    return 0
+}
+
+# CLI wrapper for console history (--console-history flag)
 # Args: $1 = instance OCID
 get_console_history() {
     local instance_ocid="$1"
     local region="${EFFECTIVE_REGION:-$REGION}"
     
-    [[ -z "$instance_ocid" ]] && { log_error "Instance OCID required"; return 1; }
-    [[ -z "$region" ]] && { log_error "REGION not set"; return 1; }
-    
     echo ""
-    echo -e "${BOLD}${CYAN}=== Console History for Instance ===${NC}"
-    echo -e "${YELLOW}Instance OCID:${NC} $instance_ocid"
-    echo -e "${YELLOW}Region:${NC} $region"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                              CONSOLE HISTORY                                       ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
+    echo -e "${WHITE}Instance OCID:${NC} ${YELLOW}$instance_ocid${NC}"
+    echo -e "${WHITE}Region:${NC}        ${WHITE}$region${NC}"
     
-    log_info "Capturing console history (this may take a moment)..."
-    
-    local console_history_id
-    console_history_id=$(oci --region "$region" compute console-history capture \
-        --instance-id "$instance_ocid" 2>/dev/null | jq -r '.data.id // empty')
-    
-    if [[ -z "$console_history_id" ]]; then
-        log_error "Failed to capture console history"
-        return 1
-    fi
-    
-    echo -e "${GREEN}Console history captured: ${console_history_id}${NC}"
-    echo ""
-    
-    # Wait a moment for the capture to complete
-    sleep 2
-    
-    # Fetch and display the console history
-    echo -e "${BOLD}${MAGENTA}--- Console Output (last 10MB) ---${NC}"
-    print_separator 80
-    
-    oci compute console-history get-content \
-        --instance-console-history-id "$console_history_id" \
-        --length 10000000 \
-        --file - 2>/dev/null
-    
-    print_separator 80
-    echo -e "${BOLD}${MAGENTA}--- End of Console Output ---${NC}"
-    echo ""
-    
-    # Delete the console history to clean up
-    log_info "Cleaning up console history..."
-    if oci compute console-history delete \
-        --instance-console-history-id "$console_history_id" \
-        --force 2>/dev/null; then
-        echo -e "${GREEN}✓ Console history deleted: ${console_history_id}${NC}"
-    else
-        echo -e "${YELLOW}⚠ Failed to delete console history: ${console_history_id}${NC}"
-    fi
-    echo ""
-    
-    return 0
+    # Call unified function with auto_cleanup=true, interactive=false
+    fetch_and_display_console_history "$instance_ocid" "$region" "$instance_ocid" "true" "false"
 }
 
 # List instances not in Kubernetes with interactive console history option
@@ -3036,6 +3271,41 @@ get_node_info() {
         node_state_color=$(color_node_state "$node_state")
         echo -e "  ${WHITE}Node State:${NC}        ${node_state_color}${node_state}${NC}"
         
+        # Check cordon/drain status
+        local node_json
+        node_json=$(kubectl get node "$node_name" -o json 2>/dev/null)
+        local is_unschedulable
+        is_unschedulable=$(echo "$node_json" | jq -r '.spec.unschedulable // false' 2>/dev/null)
+        
+        # Get pod count on this node
+        local pod_count
+        pod_count=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$node_name",status.phase=Running -o json 2>/dev/null | jq '.items | length' 2>/dev/null)
+        [[ -z "$pod_count" ]] && pod_count="0"
+        
+        # Get daemonset pod count
+        local ds_pod_count
+        ds_pod_count=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$node_name",status.phase=Running -o json 2>/dev/null | \
+            jq '[.items[] | select(.metadata.ownerReferences[]?.kind == "DaemonSet")] | length' 2>/dev/null)
+        [[ -z "$ds_pod_count" ]] && ds_pod_count="0"
+        
+        # Determine scheduling status
+        local sched_status="Schedulable"
+        local sched_color="$GREEN"
+        if [[ "$is_unschedulable" == "true" ]]; then
+            # Check if drained (cordoned + only daemonset pods)
+            local non_ds_pods=$((pod_count - ds_pod_count))
+            if [[ $non_ds_pods -le 0 ]]; then
+                sched_status="Drained"
+                sched_color="$RED"
+            else
+                sched_status="Cordoned"
+                sched_color="$YELLOW"
+            fi
+        fi
+        
+        echo -e "  ${WHITE}Schedule Status:${NC}   ${sched_color}${sched_status}${NC}"
+        echo -e "  ${WHITE}Running Pods:${NC}      ${CYAN}${pod_count}${NC} ${GRAY}(${ds_pod_count} DaemonSet)${NC}"
+        
         echo -e "  ${WHITE}Kubelet Version:${NC}   $kubelet_version"
         echo -e "  ${WHITE}OS Image:${NC}          $os_image"
         echo -e "  ${WHITE}Kernel:${NC}            $kernel_version"
@@ -3630,11 +3900,12 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}4${NC}) ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
         echo -e "  ${GREEN}5${NC}) ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
         echo -e "  ${GREEN}6${NC}) ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
+        echo -e "  ${GREEN}7${NC}) ${WHITE}GPU Instance Tagging${NC}          - Manage ComputeInstanceHostActions namespace and tags"
         echo ""
         echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-6, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-7, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3664,6 +3935,9 @@ interactive_management_main_menu() {
             6)
                 manage_compute_clusters
                 ;;
+            7)
+                manage_gpu_instance_tagging
+                ;;
             c|C|cache|CACHE)
                 display_cache_stats
                 ;;
@@ -3673,7 +3947,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-6, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-7, c, or q.${NC}"
                 ;;
         esac
     done
@@ -5408,23 +5682,29 @@ manage_compute_instances() {
         # Clear any old temp file
         rm -f /tmp/instance_map_$$
         
-        # Fetch K8s nodes once for lookup (include taints)
+        # Fetch K8s nodes once for lookup (include taints and unschedulable status)
         local k8s_nodes_json
         k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null)
         
-        # Build lookup: providerID|nodeName|readyStatus|newNodeTaint
+        # Fetch pods per node
+        local pods_per_node
+        pods_per_node=$(kubectl get pods --all-namespaces --field-selector=status.phase=Running -o json 2>/dev/null | \
+            jq -r '.items[] | .spec.nodeName' 2>/dev/null | sort | uniq -c | awk '{print $2"|"$1}')
+        
+        # Build lookup: providerID|nodeName|readyStatus|newNodeTaint|unschedulable
         local k8s_lookup
         k8s_lookup=$(echo "$k8s_nodes_json" | jq -r '
             .items[] | 
             (.spec.taints // [] | map(select(.key == "newNode")) | if length > 0 then .[0].effect else "N/A" end) as $newNodeTaint |
-            "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\($newNodeTaint)"
+            (.spec.unschedulable // false) as $unschedulable |
+            "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\($newNodeTaint)|\($unschedulable)"
         ' 2>/dev/null)
         
         # Display instances table
         echo -e "${BOLD}${WHITE}═══ Instances ═══${NC}"
         echo ""
-        printf "${BOLD}%-5s %-32s %-12s %-8s %-12s %-26s %-12s %-20s %s${NC}\n" \
-            "ID" "Display Name" "State" "K8s" "newNode" "Shape" "Avail Domain" "Created" "Instance OCID"
+        printf "${BOLD}%-5s %-32s %-12s %-8s %-8s %-5s %-26s %-15s %-16s %s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "Cordon" "Pods" "Shape" "Avail Domain" "Created" "Instance OCID"
         print_separator 240
         
         # Sort by time-created (ascending - oldest first, newest last)
@@ -5449,19 +5729,23 @@ manage_compute_instances() {
                 *) state_color="$WHITE" ;;
             esac
             
-            # Check if in K8s and get taint info
+            # Check if in K8s and get taint/cordon info
             local k8s_status="No"
             local k8s_color="$YELLOW"
-            local new_node_taint="N/A"
-            local new_node_color="$GRAY"
+            local cordon_status="-"
+            local cordon_color="$GRAY"
+            local pod_count="-"
+            local pod_color="$GRAY"
+            local k8s_node_name=""
             
             local k8s_match
             k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
             
             if [[ -n "$k8s_match" ]]; then
-                local k8s_ready
+                local k8s_ready unschedulable
+                k8s_node_name=$(echo "$k8s_match" | cut -d'|' -f2)
                 k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
-                new_node_taint=$(echo "$k8s_match" | cut -d'|' -f4)
+                unschedulable=$(echo "$k8s_match" | cut -d'|' -f5)
                 
                 if [[ "$k8s_ready" == "True" ]]; then
                     k8s_status="Ready"
@@ -5471,11 +5755,24 @@ manage_compute_instances() {
                     k8s_color="$RED"
                 fi
                 
-                # Color the taint
-                if [[ "$new_node_taint" != "N/A" ]]; then
-                    new_node_color="$YELLOW"
+                # Check cordon status
+                if [[ "$unschedulable" == "true" ]]; then
+                    cordon_status="Cordon"
+                    cordon_color="$YELLOW"
                 else
-                    new_node_color="$GRAY"
+                    cordon_status="-"
+                    cordon_color="$GRAY"
+                fi
+                
+                # Get pod count for this node
+                local node_pods
+                node_pods=$(echo "$pods_per_node" | grep "^${k8s_node_name}|" | cut -d'|' -f2)
+                if [[ -n "$node_pods" ]]; then
+                    pod_count="$node_pods"
+                    pod_color="$CYAN"
+                else
+                    pod_count="0"
+                    pod_color="$GRAY"
                 fi
             fi
             
@@ -5492,8 +5789,8 @@ manage_compute_instances() {
                 time_display="${time_display/T/ }"
             fi
             
-            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${new_node_color}%-12s${NC} %-26s %-12s ${GRAY}%-20s${NC} ${GRAY}%s${NC}\n" \
-                "$iid" "$name_trunc" "$state" "$k8s_status" "$new_node_taint" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-8s${NC} ${pod_color}%-5s${NC} %-26s %-15s ${GRAY}%-16s${NC} ${GRAY}%s${NC}\n" \
+                "$iid" "$name_trunc" "$state" "$k8s_status" "$cordon_status" "$pod_count" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
         done
         
         # Read map from temp file
@@ -5547,14 +5844,21 @@ manage_compute_instances() {
                     echo -e "${RED}Invalid instance ID: $input${NC}"
                     sleep 1
                 else
-                    display_instance_details "$instance_ocid"
-                    instance_actions_menu "$instance_ocid"
+                    # Loop to handle refresh requests
+                    while true; do
+                        display_instance_details "$instance_ocid"
+                        local ret=$?
+                        [[ $ret -ne 2 ]] && break  # Exit loop unless refresh requested
+                    done
                 fi
                 ;;
             ocid1.instance.*)
-                # Direct OCID input
-                display_instance_details "$input"
-                instance_actions_menu "$input"
+                # Direct OCID input - loop to handle refresh requests
+                while true; do
+                    display_instance_details "$input"
+                    local ret=$?
+                    [[ $ret -ne 2 ]] && break  # Exit loop unless refresh requested
+                done
                 ;;
             *)
                 echo -e "${RED}Unknown command: $input${NC}"
@@ -6193,9 +6497,9 @@ display_instance_details() {
     local region="${EFFECTIVE_REGION:-$REGION}"
     
     echo ""
-    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${CYAN}                                                         INSTANCE DETAILS                                                                               ${NC}"
-    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                           INSTANCE DETAILS                                                     ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     
     # Fetch instance details
     local instance_json
@@ -6205,6 +6509,139 @@ display_instance_details() {
         echo -e "${RED}Failed to fetch instance details${NC}"
         return 1
     fi
+    
+    # ========== CACHE VNIC AND VOLUME DATA (fetch once) ==========
+    echo -ne "${GRAY}Loading instance data...${NC}"
+    
+    # Cache VNIC attachments
+    local cached_vnic_attachments
+    cached_vnic_attachments=$(oci compute vnic-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    # Get availability domain for boot volume query
+    local ad_for_query
+    ad_for_query=$(echo "$instance_json" | jq -r '.data["availability-domain"] // "N/A"')
+    
+    # Cache boot volume attachments
+    local cached_boot_vol_attachments
+    cached_boot_vol_attachments=$(oci compute boot-volume-attachment list \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$ad_for_query" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    # Cache block volume attachments
+    local cached_block_vol_attachments
+    cached_block_vol_attachments=$(oci compute volume-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    # Pre-fetch all individual VNIC details and build lookup JSON
+    local cached_vnic_details="{}"
+    local cached_subnet_names="{}"
+    local cached_nsg_names="{}"
+    local all_subnet_ids=""
+    local all_nsg_ids=""
+    
+    if [[ -n "$cached_vnic_attachments" ]]; then
+        local vnic_ids
+        vnic_ids=$(echo "$cached_vnic_attachments" | jq -r '.data[]["vnic-id"] // empty' 2>/dev/null)
+        for vnic_id in $vnic_ids; do
+            [[ -z "$vnic_id" ]] && continue
+            local vnic_data
+            vnic_data=$(oci network vnic get --vnic-id "$vnic_id" --output json 2>/dev/null)
+            if [[ -n "$vnic_data" ]]; then
+                cached_vnic_details=$(echo "$cached_vnic_details" | jq --arg id "$vnic_id" --argjson data "$vnic_data" '. + {($id): $data}' 2>/dev/null)
+                # Collect subnet and NSG IDs for batch lookup
+                local subnet_id nsg_list
+                subnet_id=$(echo "$vnic_data" | jq -r '.data["subnet-id"] // empty' 2>/dev/null)
+                [[ -n "$subnet_id" ]] && all_subnet_ids="$all_subnet_ids $subnet_id"
+                nsg_list=$(echo "$vnic_data" | jq -r '.data["nsg-ids"] // [] | .[]' 2>/dev/null)
+                [[ -n "$nsg_list" ]] && all_nsg_ids="$all_nsg_ids $nsg_list"
+            fi
+        done
+    fi
+    echo -ne "\r${GRAY}Loading instance data.. ${NC}"
+    
+    # Pre-fetch subnet names and route tables
+    for subnet_id in $(echo "$all_subnet_ids" | tr ' ' '\n' | sort -u); do
+        [[ -z "$subnet_id" ]] && continue
+        local subnet_json subnet_name rt_id rt_name
+        subnet_json=$(oci network subnet get --subnet-id "$subnet_id" --output json 2>/dev/null)
+        if [[ -n "$subnet_json" ]]; then
+            subnet_name=$(echo "$subnet_json" | jq -r '.data["display-name"] // "-"')
+            rt_id=$(echo "$subnet_json" | jq -r '.data["route-table-id"] // empty')
+            rt_name="-"
+            if [[ -n "$rt_id" ]]; then
+                rt_name=$(oci network route-table get --rt-id "$rt_id" --query 'data."display-name"' --raw-output 2>/dev/null) || rt_name="-"
+            fi
+            cached_subnet_names=$(echo "$cached_subnet_names" | jq --arg id "$subnet_id" --arg name "$subnet_name" --arg rt "$rt_name" '. + {($id): {"name": $name, "rt": $rt}}' 2>/dev/null)
+        fi
+    done
+    
+    # Pre-fetch NSG names
+    for nsg_id in $(echo "$all_nsg_ids" | tr ' ' '\n' | sort -u); do
+        [[ -z "$nsg_id" ]] && continue
+        local nsg_name
+        nsg_name=$(oci network nsg get --nsg-id "$nsg_id" --query 'data."display-name"' --raw-output 2>/dev/null) || nsg_name="N/A"
+        cached_nsg_names=$(echo "$cached_nsg_names" | jq --arg id "$nsg_id" --arg name "$nsg_name" '. + {($id): $name}' 2>/dev/null)
+    done
+    echo -ne "\r${GRAY}Loading instance data...${NC}"
+    
+    # Pre-fetch all individual boot volume details and build lookup JSON
+    local cached_boot_vol_details="{}"
+    local cached_backup_policies="{}"
+    
+    if [[ -n "$cached_boot_vol_attachments" ]]; then
+        local bv_ids
+        bv_ids=$(echo "$cached_boot_vol_attachments" | jq -r '.data[]["boot-volume-id"] // empty' 2>/dev/null)
+        for bv_id in $bv_ids; do
+            [[ -z "$bv_id" ]] && continue
+            local bv_data
+            bv_data=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
+            if [[ -n "$bv_data" ]]; then
+                cached_boot_vol_details=$(echo "$cached_boot_vol_details" | jq --arg id "$bv_id" --argjson data "$bv_data" '. + {($id): $data}' 2>/dev/null)
+            fi
+            # Get backup policy
+            local backup_assign backup_policy="None"
+            backup_assign=$(oci bv volume-backup-policy-assignment get-volume-backup-policy-asset-assignment \
+                --asset-id "$bv_id" --query 'data[0]."policy-id"' --raw-output 2>/dev/null)
+            if [[ -n "$backup_assign" && "$backup_assign" != "null" ]]; then
+                backup_policy=$(oci bv volume-backup-policy get --policy-id "$backup_assign" --query 'data."display-name"' --raw-output 2>/dev/null) || backup_policy="Custom"
+            fi
+            cached_backup_policies=$(echo "$cached_backup_policies" | jq --arg id "$bv_id" --arg policy "$backup_policy" '. + {($id): $policy}' 2>/dev/null)
+        done
+    fi
+    echo -ne "\r${GRAY}Loading instance data....${NC}"
+    
+    # Pre-fetch all individual block volume details and build lookup JSON
+    local cached_block_vol_details="{}"
+    if [[ -n "$cached_block_vol_attachments" ]]; then
+        local vol_ids
+        vol_ids=$(echo "$cached_block_vol_attachments" | jq -r '.data[]["volume-id"] // empty' 2>/dev/null)
+        for vol_id in $vol_ids; do
+            [[ -z "$vol_id" ]] && continue
+            local vol_data
+            vol_data=$(oci bv volume get --volume-id "$vol_id" --output json 2>/dev/null)
+            if [[ -n "$vol_data" ]]; then
+                cached_block_vol_details=$(echo "$cached_block_vol_details" | jq --arg id "$vol_id" --argjson data "$vol_data" '. + {($id): $data}' 2>/dev/null)
+            fi
+            # Get backup policy
+            local backup_assign backup_policy="None"
+            backup_assign=$(oci bv volume-backup-policy-assignment get-volume-backup-policy-asset-assignment \
+                --asset-id "$vol_id" --query 'data[0]."policy-id"' --raw-output 2>/dev/null)
+            if [[ -n "$backup_assign" && "$backup_assign" != "null" ]]; then
+                backup_policy=$(oci bv volume-backup-policy get --policy-id "$backup_assign" --query 'data."display-name"' --raw-output 2>/dev/null) || backup_policy="Custom"
+            fi
+            cached_backup_policies=$(echo "$cached_backup_policies" | jq --arg id "$vol_id" --arg policy "$backup_policy" '. + {($id): $policy}' 2>/dev/null)
+        done
+    fi
+    
+    # Clear loading message
+    echo -ne "\r\033[K"
     
     # Extract basic info
     local display_name state shape ad fd time_created launch_mode image_id
@@ -6262,55 +6699,28 @@ display_instance_details() {
         *) state_color="$WHITE" ;;
     esac
     
-    # ========== BASIC INFO ==========
+    # ========== BASIC INFO (Compact) ==========
     echo ""
-    echo -e "${BOLD}${WHITE}=== Basic Info ===${NC}"
-    echo -e "  ${WHITE}Name:${NC}           ${GREEN}$display_name${NC}"
-    echo -e "  ${WHITE}Instance${NC}        ${GRAY}(${YELLOW}$instance_ocid${GRAY})${NC}"
-    echo -e "  ${WHITE}State:${NC}          ${state_color}$state${NC}"
-    echo -e "  ${WHITE}Time Created:${NC}   ${time_created:0:19}"
-    echo -e "  ${WHITE}AD / FD:${NC}        $ad / $fd"
-    echo -e "  ${WHITE}Launch Mode:${NC}    $launch_mode"
+    echo -e "${BOLD}${WHITE}─── Basic Info ────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    printf "${WHITE}%-10s${NC}${GREEN}%s${NC}\n" "Name:" "$display_name"
+    printf "${WHITE}%-10s${NC}${YELLOW}%s${NC}\n" "OCID:" "$instance_ocid"
+    printf "${WHITE}%-10s${NC}${state_color}%-12s${NC}  ${WHITE}%-10s${NC}%-22s  ${WHITE}%-8s${NC}%s\n" "State:" "$state" "Created:" "${time_created:0:19}" "Launch:" "$launch_mode"
+    printf "${WHITE}%-10s${NC}%-30s  ${WHITE}%-10s${NC}%s\n" "AD:" "${ad##*:}" "FD:" "${fd##*-}"
     
-    # ========== ORACLE-TAGS & CREATED BY ==========
+    # ========== SHAPE & COMPUTE (Compact) ==========
     echo ""
-    echo -e "${BOLD}${WHITE}=== Oracle-Tags & Created By ===${NC}"
+    echo -e "${BOLD}${WHITE}─── Shape & Resources ─────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    printf "${WHITE}%-10s${NC}${CYAN}%-30s${NC}  ${WHITE}%-8s${NC}%-8s  ${WHITE}%-8s${NC}%-10s\n" "Shape:" "$shape" "OCPUs:" "$shape_ocpus" "Memory:" "${shape_memory_gb} GB"
     
-    # Oracle-Tags first
-    if [[ -n "$oracle_created_by" ]]; then
-        echo -e "  ${WHITE}Oracle-Tags CreatedBy:${NC}  ${CYAN}$oracle_created_by${NC}"
+    local gpu_info="N/A"
+    if [[ "$shape_gpus" != "0" && "$shape_gpus" != "N/A" ]]; then
+        gpu_info="${shape_gpus}x ${shape_gpu_desc:-GPU}"
     fi
-    if [[ -n "$oracle_created_on" ]]; then
-        echo -e "  ${WHITE}Oracle-Tags CreatedOn:${NC}  ${CYAN}${oracle_created_on:0:19}${NC}"
-    fi
-    if [[ -z "$oracle_created_by" && -z "$oracle_created_on" ]]; then
-        echo -e "  ${GRAY}Oracle-Tags not set${NC}"
-    fi
+    printf "${WHITE}%-10s${NC}${GREEN}%-30s${NC}  ${WHITE}%-8s${NC}%-8s  ${WHITE}%-8s${NC}%-10s\n" "GPUs:" "$gpu_info" "NetBW:" "${shape_network_bw}Gb" "VNICs:" "$shape_max_nics"
     
-    # OKE / Instance Pool / Instance Config
+    # ========== IMAGE (Single Line) ==========
     echo ""
-    if [[ -n "$oke_cluster_id" ]]; then
-        echo -e "  ${WHITE}OKE Cluster${NC}     ${GRAY}(${YELLOW}$oke_cluster_id${GRAY})${NC}"
-        if [[ -n "$oke_nodepool_id" ]]; then
-            echo -e "  ${WHITE}OKE Node Pool${NC}   ${GRAY}(${YELLOW}$oke_nodepool_id${GRAY})${NC}"
-        fi
-    fi
-    if [[ -n "$instance_pool_id" ]]; then
-        echo -e "  ${WHITE}Instance Pool${NC}   ${GRAY}(${YELLOW}$instance_pool_id${GRAY})${NC}"
-    fi
-    if [[ -n "$instance_config_id" ]]; then
-        local ic_name
-        ic_name=$(get_instance_config_name "$instance_config_id")
-        echo -e "  ${WHITE}Instance Config${NC} ${GREEN}$ic_name${NC}"
-        echo -e "  ${WHITE}               ${NC} ${GRAY}(${YELLOW}$instance_config_id${GRAY})${NC}"
-    fi
-    if [[ -z "$oke_cluster_id" && -z "$instance_pool_id" && -z "$instance_config_id" ]]; then
-        echo -e "  ${GRAY}No OKE/Instance Pool/Instance Config association${NC}"
-    fi
-    
-    # ========== IMAGE ===========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Image ===${NC}"
+    echo -e "${BOLD}${WHITE}─── Image ─────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
     if [[ -n "$image_id" ]]; then
         local image_name image_os image_os_version
         local image_json
@@ -6319,47 +6729,305 @@ display_instance_details() {
             image_name=$(echo "$image_json" | jq -r '.data["display-name"] // "N/A"')
             image_os=$(echo "$image_json" | jq -r '.data["operating-system"] // "N/A"')
             image_os_version=$(echo "$image_json" | jq -r '.data["operating-system-version"] // "N/A"')
-            echo -e "  ${WHITE}Name:${NC}           ${GREEN}$image_name${NC}"
-            echo -e "  ${WHITE}OS:${NC}             $image_os $image_os_version"
+            printf "${GRAY}%-80s %-15s %s${NC}\n" "Name" "OS" "OCID"
+            printf "${GREEN}%-80s${NC} %-15s ${YELLOW}%s${NC}\n" "${image_name:0:78}" "$image_os $image_os_version" "$image_id"
         fi
-        echo -e "  ${WHITE}Image${NC}           ${GRAY}(${YELLOW}$image_id${GRAY})${NC}"
     else
-        echo -e "  ${GRAY}Image information not available${NC}"
+        echo -e "${GRAY}Image information not available${NC}"
     fi
     
-    # ========== SHAPE CONFIGURATION ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Shape Configuration ===${NC}"
-    echo -e "  ${WHITE}Shape:${NC}          ${CYAN}$shape${NC}"
-    echo -e "  ${WHITE}OCPUs:${NC}          $shape_ocpus"
-    echo -e "  ${WHITE}Memory:${NC}         $shape_memory_gb GB"
-    if [[ "$shape_gpus" != "0" && "$shape_gpus" != "N/A" ]]; then
-        echo -e "  ${WHITE}GPUs:${NC}           ${GREEN}$shape_gpus${NC}"
-        [[ -n "$shape_gpu_desc" ]] && echo -e "  ${WHITE}GPU Type:${NC}       ${GREEN}$shape_gpu_desc${NC}"
-    fi
-    if [[ "$shape_nvmes" != "0" && "$shape_nvmes" != "N/A" ]]; then
-        echo -e "  ${WHITE}Local NVMes:${NC}    $shape_nvmes"
-    fi
-    echo -e "  ${WHITE}Network BW:${NC}     $shape_network_bw Gbps"
-    echo -e "  ${WHITE}Max VNICs:${NC}      $shape_max_nics"
-    
-    # ========== CLUSTER ASSOCIATIONS ==========
-    if [[ -n "$gpu_mem_cluster" || -n "$compute_cluster_id" ]]; then
+    # ========== CLUSTER/OKE ASSOCIATIONS (Compact) ==========
+    if [[ -n "$gpu_mem_cluster" || -n "$compute_cluster_id" || -n "$oke_cluster_id" || -n "$instance_config_id" ]]; then
         echo ""
-        echo -e "${BOLD}${WHITE}=== Cluster Associations ===${NC}"
+        echo -e "${BOLD}${WHITE}─── Associations ──────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        
         if [[ -n "$gpu_mem_cluster" ]]; then
             local cluster_name
             cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
-            echo -e "  ${WHITE}GPU Memory Cluster${NC} ${GREEN}$cluster_name${NC}"
-            echo -e "  ${WHITE}                  ${NC} ${GRAY}(${YELLOW}$gpu_mem_cluster${GRAY})${NC}"
+            printf "${WHITE}%-18s${NC}${GREEN}%s${NC}\n" "GPU Mem Cluster:" "$cluster_name"
+            printf "${WHITE}%-18s${NC}${YELLOW}%s${NC}\n" "" "$gpu_mem_cluster"
         fi
         if [[ -n "$compute_cluster_id" ]]; then
             local cc_name
             cc_name=$(get_compute_cluster_name "$compute_cluster_id")
-            echo -e "  ${WHITE}Compute Cluster${NC}    ${GREEN}$cc_name${NC}"
-            echo -e "  ${WHITE}               ${NC}    ${GRAY}(${YELLOW}$compute_cluster_id${GRAY})${NC}"
+            printf "${WHITE}%-18s${NC}${GREEN}%s${NC}\n" "Compute Cluster:" "$cc_name"
+            printf "${WHITE}%-18s${NC}${YELLOW}%s${NC}\n" "" "$compute_cluster_id"
+        fi
+        if [[ -n "$oke_cluster_id" ]]; then
+            printf "${WHITE}%-18s${NC}${YELLOW}%s${NC}\n" "OKE Cluster:" "$oke_cluster_id"
+        fi
+        if [[ -n "$oke_nodepool_id" ]]; then
+            printf "${WHITE}%-18s${NC}${YELLOW}%s${NC}\n" "OKE Node Pool:" "$oke_nodepool_id"
+        fi
+        if [[ -n "$instance_config_id" ]]; then
+            local ic_name
+            ic_name=$(get_instance_config_name "$instance_config_id")
+            printf "${WHITE}%-18s${NC}${GREEN}%s${NC}\n" "Instance Config:" "$ic_name"
+            printf "${WHITE}%-18s${NC}${YELLOW}%s${NC}\n" "" "$instance_config_id"
         fi
     fi
+    
+    # ========== KUBERNETES STATUS (Compact) ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}─── Kubernetes ────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    
+    local k8s_node_info
+    k8s_node_info=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '
+        .items[] | select(.spec.providerID | contains($ocid)) | 
+        "\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")|\(.spec.unschedulable // false)"
+    ' 2>/dev/null)
+    
+    if [[ -n "$k8s_node_info" ]]; then
+        local k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable
+        IFS='|' read -r k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable <<< "$k8s_node_info"
+        
+        local ready_color="$GREEN"
+        [[ "$k8s_ready" != "True" ]] && ready_color="$RED"
+        
+        # Get pod count on this node
+        local k8s_pod_count k8s_ds_pod_count
+        k8s_pod_count=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$k8s_node_name",status.phase=Running -o json 2>/dev/null | jq '.items | length' 2>/dev/null)
+        [[ -z "$k8s_pod_count" ]] && k8s_pod_count="0"
+        k8s_ds_pod_count=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$k8s_node_name",status.phase=Running -o json 2>/dev/null | \
+            jq '[.items[] | select(.metadata.ownerReferences[]?.kind == "DaemonSet")] | length' 2>/dev/null)
+        [[ -z "$k8s_ds_pod_count" ]] && k8s_ds_pod_count="0"
+        
+        # Determine scheduling status
+        local sched_status="Schedulable"
+        local sched_color="$GREEN"
+        if [[ "$k8s_unschedulable" == "true" ]]; then
+            local non_ds_pods=$((k8s_pod_count - k8s_ds_pod_count))
+            if [[ $non_ds_pods -le 0 ]]; then
+                sched_status="Drained"
+                sched_color="$RED"
+            else
+                sched_status="Cordoned"
+                sched_color="$YELLOW"
+            fi
+        fi
+        
+        printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${GREEN}%-22s${NC}  ${WHITE}%-8s${NC}${ready_color}%-8s${NC}  ${WHITE}%-10s${NC}${sched_color}%-12s${NC}  ${WHITE}%-6s${NC}${CYAN}%-5s${NC}\n" \
+            "Status:" "In Cluster" "Node:" "$k8s_node_name" "Ready:" "$k8s_ready" "Schedule:" "$sched_status" "Pods:" "$k8s_pod_count"
+        
+        if [[ "$k8s_gpu_present" == "true" ]]; then
+            local clique_info="N/A"
+            [[ "$k8s_clique" != "N/A" ]] && clique_info="$k8s_clique"
+            printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${CYAN}%-22s${NC}\n" "GPU:" "Present" "Clique:" "$clique_info"
+        fi
+    else
+        printf "${WHITE}%-10s${NC}${YELLOW}%-50s${NC}\n" "Status:" "Not in cluster (not joined or not found)"
+    fi
+    
+    # ========== NETWORK / VNIC INFORMATION (Single Line per VNIC) ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}─── Network (VNICs) ───────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    
+    if [[ -n "$cached_vnic_attachments" ]] && echo "$cached_vnic_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        # Print header
+        printf "${GRAY}%-3s %-20s %-15s %-15s %-10s %-18s %-12s %-6s %s${NC}\n" "NIC" "Name" "Private IP" "Public IP" "Subnet" "NSG" "Route Table" "VLAN" "OCID"
+        
+        echo "$cached_vnic_attachments" | jq -r '.data[] | "\(.["vnic-id"])|\(.["display-name"] // "N/A")|\(.["nic-index"] // 0)|\(.["vlan-tag"] // "")"' 2>/dev/null | \
+        while IFS='|' read -r vnic_id vnic_attach_name nic_index vlan_tag; do
+            [[ -z "$vnic_id" ]] && continue
+            
+            # Get VNIC details from cache
+            local vnic_json
+            vnic_json=$(echo "$cached_vnic_details" | jq --arg id "$vnic_id" '.[$id]' 2>/dev/null)
+            
+            if [[ -n "$vnic_json" && "$vnic_json" != "null" ]] && echo "$vnic_json" | jq -e '.data' > /dev/null 2>&1; then
+                local vnic_name private_ip public_ip subnet_id mac_addr is_primary
+                vnic_name=$(echo "$vnic_json" | jq -r '.data["display-name"] // "N/A"')
+                private_ip=$(echo "$vnic_json" | jq -r '.data["private-ip"] // "N/A"')
+                public_ip=$(echo "$vnic_json" | jq -r '.data["public-ip"] // empty')
+                subnet_id=$(echo "$vnic_json" | jq -r '.data["subnet-id"] // "N/A"')
+                mac_addr=$(echo "$vnic_json" | jq -r '.data["mac-address"] // "N/A"')
+                is_primary=$(echo "$vnic_json" | jq -r '.data["is-primary"] // false')
+                
+                # Get NSG names from cache
+                local nsg_ids nsg_names=""
+                nsg_ids=$(echo "$vnic_json" | jq -r '.data["nsg-ids"] // [] | .[]' 2>/dev/null)
+                if [[ -n "$nsg_ids" ]]; then
+                    while read -r nsg_id; do
+                        [[ -z "$nsg_id" ]] && continue
+                        local nsg_name
+                        nsg_name=$(echo "$cached_nsg_names" | jq -r --arg id "$nsg_id" '.[$id] // "N/A"' 2>/dev/null)
+                        [[ "$nsg_name" == "null" ]] && nsg_name="N/A"
+                        if [[ -n "$nsg_names" ]]; then
+                            nsg_names="${nsg_names},${nsg_name}"
+                        else
+                            nsg_names="$nsg_name"
+                        fi
+                    done <<< "$nsg_ids"
+                fi
+                [[ -z "$nsg_names" ]] && nsg_names="-"
+                
+                # Get subnet name from cache
+                local subnet_name="-"
+                local route_table_name="-"
+                if [[ "$subnet_id" != "N/A" && -n "$subnet_id" ]]; then
+                    subnet_name=$(echo "$cached_subnet_names" | jq -r --arg id "$subnet_id" '.[$id].name // "-"' 2>/dev/null)
+                    route_table_name=$(echo "$cached_subnet_names" | jq -r --arg id "$subnet_id" '.[$id].rt // "-"' 2>/dev/null)
+                    [[ "$subnet_name" == "null" ]] && subnet_name="-"
+                    [[ "$route_table_name" == "null" ]] && route_table_name="-"
+                fi
+                
+                local nic_display="$nic_index"
+                [[ "$is_primary" == "true" ]] && nic_display="${nic_index}*"
+                
+                # Format public IP and VLAN display
+                local pub_ip_display="-"
+                [[ -n "$public_ip" && "$public_ip" != "null" ]] && pub_ip_display="$public_ip"
+                local vlan_display="-"
+                [[ -n "$vlan_tag" ]] && vlan_display="$vlan_tag"
+                
+                # Single line with all info
+                printf "%-3s ${GREEN}%-20s${NC} ${CYAN}%-15s${NC} ${CYAN}%-15s${NC} %-10s %-18s %-12s %-6s ${YELLOW}%s${NC}\n" \
+                    "$nic_display" "${vnic_name:0:18}" "$private_ip" "$pub_ip_display" "${subnet_name:0:8}" "${nsg_names:0:16}" "${route_table_name:0:10}" "$vlan_display" "$vnic_id"
+            fi
+        done
+    else
+        echo -e "${YELLOW}No VNICs found${NC}"
+    fi
+    
+    # ========== BOOT VOLUME (with extended details) ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}─── Boot Volume ───────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    
+    if [[ -n "$cached_boot_vol_attachments" ]] && echo "$cached_boot_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        # Print header (aligned with block volumes)
+        printf "${GRAY}%-24s %-9s %-5s %-3s %-5s %-6s %-8s %-4s %-4s %-4s %-6s %s${NC}\n" "Name" "State" "Size" "VPU" "Type" "Backup" "BkupMgd" "Repl" "VGrp" "Hydr" "EncKey" "OCID"
+        
+        echo "$cached_boot_vol_attachments" | jq -r '.data[] | "\(.["boot-volume-id"])|\(.["lifecycle-state"])"' 2>/dev/null | \
+        while IFS='|' read -r bv_id bv_attach_state; do
+            [[ -z "$bv_id" ]] && continue
+            
+            # Get boot volume details from cache
+            local bv_json
+            bv_json=$(echo "$cached_boot_vol_details" | jq --arg id "$bv_id" '.[$id]' 2>/dev/null)
+            
+            if [[ -n "$bv_json" && "$bv_json" != "null" ]] && echo "$bv_json" | jq -e '.data' > /dev/null 2>&1; then
+                local bv_name bv_state bv_size_gb bv_vpus
+                bv_name=$(echo "$bv_json" | jq -r '.data["display-name"] // "N/A"')
+                bv_state=$(echo "$bv_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                bv_size_gb=$(echo "$bv_json" | jq -r '.data["size-in-gbs"] // "N/A"')
+                bv_vpus=$(echo "$bv_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
+                
+                # Get additional fields
+                local kms_key_id volume_group_id is_hydrated
+                kms_key_id=$(echo "$bv_json" | jq -r '.data["kms-key-id"] // empty')
+                volume_group_id=$(echo "$bv_json" | jq -r '.data["volume-group-id"] // empty')
+                is_hydrated=$(echo "$bv_json" | jq -r '.data["is-hydrated"] // "N/A"')
+                
+                # Get backup policy from cache
+                local backup_policy="None"
+                local cached_policy
+                cached_policy=$(echo "$cached_backup_policies" | jq -r --arg id "$bv_id" '.[$id] // "None"' 2>/dev/null)
+                [[ -n "$cached_policy" && "$cached_policy" != "null" ]] && backup_policy="$cached_policy"
+                
+                # Backup managed by: Volume (direct) or VolGroup (if in volume group)
+                local backup_managed="Volume"
+                [[ -n "$volume_group_id" ]] && backup_managed="VolGroup"
+                
+                # Check cross-region replication
+                local repl_status="-"
+                local replicas
+                replicas=$(echo "$bv_json" | jq -r '.data["boot-volume-replicas"] // [] | length' 2>/dev/null)
+                [[ "$replicas" -gt 0 ]] && repl_status="Yes"
+                
+                # Format displays
+                local bv_state_color="$GREEN"
+                [[ "$bv_state" != "AVAILABLE" ]] && bv_state_color="$YELLOW"
+                
+                # Encryption: Oracle managed (no kms-key-id) or Customer (has kms-key-id/Vault)
+                local enc_display="Oracle"
+                [[ -n "$kms_key_id" ]] && enc_display="Cust"
+                
+                local vg_display="-"
+                [[ -n "$volume_group_id" ]] && vg_display="Yes"
+                
+                local hydr_display="-"
+                [[ "$is_hydrated" == "true" ]] && hydr_display="Yes"
+                [[ "$is_hydrated" == "false" ]] && hydr_display="No"
+                
+                printf "${GREEN}%-24s${NC} ${bv_state_color}%-9s${NC} %-5s %-3s %-5s %-6s %-8s %-4s %-4s %-4s %-6s ${YELLOW}%s${NC}\n" \
+                    "${bv_name:0:22}" "$bv_state" "${bv_size_gb}GB" "$bv_vpus" "boot" "${backup_policy:0:6}" "$backup_managed" "$repl_status" "$vg_display" "$hydr_display" "$enc_display" "$bv_id"
+            fi
+        done
+    else
+        echo -e "${YELLOW}No boot volume found${NC}"
+    fi
+    
+    # ========== BLOCK VOLUMES (with extended details) ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}─── Block Volumes ─────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    
+    local vol_count=0
+    if [[ -n "$cached_block_vol_attachments" ]] && echo "$cached_block_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        # Print header (aligned with boot volume)
+        printf "${GRAY}%-24s %-9s %-5s %-3s %-5s %-6s %-8s %-4s %-4s %-4s %-6s %s${NC}\n" "Name" "State" "Size" "VPU" "Type" "Backup" "BkupMgd" "Repl" "VGrp" "Hydr" "EncKey" "OCID"
+        
+        while IFS='|' read -r vol_id attach_state attach_type device is_readonly; do
+            [[ -z "$vol_id" ]] && continue
+            ((vol_count++))
+            
+            # Get block volume details from cache
+            local vol_json
+            vol_json=$(echo "$cached_block_vol_details" | jq --arg id "$vol_id" '.[$id]' 2>/dev/null)
+            
+            if [[ -n "$vol_json" && "$vol_json" != "null" ]] && echo "$vol_json" | jq -e '.data' > /dev/null 2>&1; then
+                local vol_name vol_state vol_size_gb vol_vpus is_hydrated
+                vol_name=$(echo "$vol_json" | jq -r '.data["display-name"] // "N/A"')
+                vol_state=$(echo "$vol_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                vol_size_gb=$(echo "$vol_json" | jq -r '.data["size-in-gbs"] // "N/A"')
+                vol_vpus=$(echo "$vol_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
+                is_hydrated=$(echo "$vol_json" | jq -r '.data["is-hydrated"] // "N/A"')
+                
+                # Get additional fields
+                local kms_key_id volume_group_id
+                kms_key_id=$(echo "$vol_json" | jq -r '.data["kms-key-id"] // empty')
+                volume_group_id=$(echo "$vol_json" | jq -r '.data["volume-group-id"] // empty')
+                
+                # Get backup policy from cache
+                local backup_policy="None"
+                local cached_policy
+                cached_policy=$(echo "$cached_backup_policies" | jq -r --arg id "$vol_id" '.[$id] // "None"' 2>/dev/null)
+                [[ -n "$cached_policy" && "$cached_policy" != "null" ]] && backup_policy="$cached_policy"
+                
+                # Backup managed by: Volume (direct) or VolGroup (if in volume group)
+                local backup_managed="Volume"
+                [[ -n "$volume_group_id" ]] && backup_managed="VolGroup"
+                
+                # Check cross-region replication
+                local repl_status="-"
+                local replicas
+                replicas=$(echo "$vol_json" | jq -r '.data["block-volume-replicas"] // [] | length' 2>/dev/null)
+                [[ "$replicas" -gt 0 ]] && repl_status="Yes"
+                
+                # Format displays
+                local vol_state_color="$GREEN"
+                [[ "$vol_state" != "AVAILABLE" ]] && vol_state_color="$YELLOW"
+                
+                local name_display="${vol_name:0:22}"
+                [[ "$is_readonly" == "true" ]] && name_display="${vol_name:0:19}*RO"
+                
+                # Encryption: Oracle managed (no kms-key-id) or Customer (has kms-key-id/Vault)
+                local enc_display="Oracle"
+                [[ -n "$kms_key_id" ]] && enc_display="Cust"
+                
+                local vg_display="-"
+                [[ -n "$volume_group_id" ]] && vg_display="Yes"
+                
+                local hydr_display="-"
+                [[ "$is_hydrated" == "true" ]] && hydr_display="Yes"
+                [[ "$is_hydrated" == "false" ]] && hydr_display="No"
+                
+                printf "${GREEN}%-24s${NC} ${vol_state_color}%-9s${NC} %-5s %-3s %-5s %-6s %-8s %-4s %-4s %-4s %-6s ${YELLOW}%s${NC}\n" \
+                    "$name_display" "$vol_state" "${vol_size_gb}GB" "$vol_vpus" "$attach_type" "${backup_policy:0:6}" "$backup_managed" "$repl_status" "$vg_display" "$hydr_display" "$enc_display" "$vol_id"
+            fi
+        done < <(echo "$cached_block_vol_attachments" | jq -r '.data[] | "\(.["volume-id"])|\(.["lifecycle-state"])|\(.["attachment-type"])|\(.device // "N/A")|\(.["is-read-only"] // false)"' 2>/dev/null)
+    fi
+    
+    [[ $vol_count -eq 0 ]] && echo -e "${GRAY}No block volumes attached${NC}"
     
     # Check for user_data (cloud-init)
     local user_data_b64
@@ -6371,192 +7039,58 @@ display_instance_details() {
         local ud_decoded_size
         ud_decoded_size=$(echo "$user_data_b64" | base64 -d 2>/dev/null | wc -c)
         echo ""
-        echo -e "${BOLD}${WHITE}=== Cloud-Init ===${NC}"
-        echo -e "  ${WHITE}Status:${NC}         ${GREEN}Present${NC} (~${ud_decoded_size} bytes)"
+        echo -e "${BOLD}${WHITE}─── Cloud-Init ────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        local gzip_indicator=""
+        is_user_data_gzip "$user_data_b64" && gzip_indicator=" (gzip)"
+        printf "${WHITE}%-10s${NC}${GREEN}%-15s${NC}  ${WHITE}%-8s${NC}%-15s\n" "Status:" "Present${gzip_indicator}" "Size:" "~${ud_decoded_size} bytes"
     fi
     
-    # ========== KUBERNETES STATUS ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Kubernetes Status ===${NC}"
+    # Check if in K8s (do once, before loop)
+    local k8s_node_name=""
+    k8s_node_name=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '.items[] | select(.spec.providerID | contains($ocid)) | .metadata.name' 2>/dev/null)
     
-    local k8s_node_info
-    k8s_node_info=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '
-        .items[] | select(.spec.providerID | contains($ocid)) | 
-        "\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")"
-    ' 2>/dev/null)
-    
-    if [[ -n "$k8s_node_info" ]]; then
-        local k8s_node_name k8s_ready k8s_clique k8s_gpu_present
-        IFS='|' read -r k8s_node_name k8s_ready k8s_clique k8s_gpu_present <<< "$k8s_node_info"
+    # ========== ACTIONS LOOP ==========
+    while true; do
+        # Show actions menu
+        echo ""
+        echo -e "${BOLD}${WHITE}─── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
         
-        local ready_color="$GREEN"
-        [[ "$k8s_ready" != "True" ]] && ready_color="$RED"
+        # Line 0: Refresh/view details
+        echo -e "  ${GREEN}r${NC}) Refresh instance details"
         
-        echo -e "  ${WHITE}In Kubernetes:${NC}  ${GREEN}Yes${NC}"
-        echo -e "  ${WHITE}Node Name:${NC}      ${GREEN}$k8s_node_name${NC}"
-        echo -e "  ${WHITE}Ready:${NC}          ${ready_color}$k8s_ready${NC}"
-        if [[ "$k8s_gpu_present" == "true" ]]; then
-            echo -e "  ${WHITE}GPU Present:${NC}    ${GREEN}Yes${NC}"
-            [[ "$k8s_clique" != "N/A" ]] && echo -e "  ${WHITE}GPU Clique:${NC}     ${CYAN}$k8s_clique${NC}"
+        # Line 1: Cloud-init + Console history
+        if [[ "$has_cloud_init" == "true" ]]; then
+            echo -e "  ${MAGENTA}1${NC}) View cloud-init    ${MAGENTA}2${NC}) Save cloud-init    ${MAGENTA}3${NC}) Compare cloud-init    ${YELLOW}4${NC}) Console history"
+        else
+            echo -e "  ${GRAY}1) View cloud-init    2) Save cloud-init    3) Compare cloud-init${NC}    ${YELLOW}4${NC}) Console history"
         fi
-    else
-        echo -e "  ${WHITE}In Kubernetes:${NC}  ${YELLOW}No${NC} (not joined or not found)"
-    fi
-    
-    # ========== NETWORK / VNIC INFORMATION ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Network (VNICs) ===${NC}"
-    
-    local vnic_attachments
-    vnic_attachments=$(oci compute vnic-attachment list \
-        --compartment-id "$compartment_id" \
-        --instance-id "$instance_ocid" \
-        --output json 2>/dev/null)
-    
-    if [[ -n "$vnic_attachments" ]] && echo "$vnic_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
-        echo "$vnic_attachments" | jq -r '.data[] | "\(.["vnic-id"])|\(.["display-name"] // "N/A")|\(.["nic-index"] // 0)"' 2>/dev/null | \
-        while IFS='|' read -r vnic_id vnic_attach_name nic_index; do
-            [[ -z "$vnic_id" ]] && continue
-            
-            local vnic_json
-            vnic_json=$(oci network vnic get --vnic-id "$vnic_id" --output json 2>/dev/null)
-            
-            if [[ -n "$vnic_json" ]] && echo "$vnic_json" | jq -e '.data' > /dev/null 2>&1; then
-                local vnic_name private_ip public_ip subnet_id mac_addr is_primary
-                vnic_name=$(echo "$vnic_json" | jq -r '.data["display-name"] // "N/A"')
-                private_ip=$(echo "$vnic_json" | jq -r '.data["private-ip"] // "N/A"')
-                public_ip=$(echo "$vnic_json" | jq -r '.data["public-ip"] // "N/A"')
-                subnet_id=$(echo "$vnic_json" | jq -r '.data["subnet-id"] // "N/A"')
-                mac_addr=$(echo "$vnic_json" | jq -r '.data["mac-address"] // "N/A"')
-                is_primary=$(echo "$vnic_json" | jq -r '.data["is-primary"] // false')
-                
-                local subnet_name="N/A"
-                if [[ "$subnet_id" != "N/A" && -n "$subnet_id" ]]; then
-                    subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
-                fi
-                
-                local primary_marker=""
-                [[ "$is_primary" == "true" ]] && primary_marker=" ${GREEN}(Primary)${NC}"
-                
-                echo ""
-                echo -e "  ${BOLD}${WHITE}NIC ${nic_index}:${NC} ${GREEN}$vnic_name${NC}${primary_marker}"
-                echo -e "    ${WHITE}Private IP:${NC}   ${CYAN}$private_ip${NC}"
-                if [[ -n "$public_ip" && "$public_ip" != "null" && "$public_ip" != "N/A" ]]; then
-                    echo -e "    ${WHITE}Public IP:${NC}    ${CYAN}$public_ip${NC}"
-                fi
-                echo -e "    ${WHITE}MAC Address:${NC}  $mac_addr"
-                echo -e "    ${WHITE}Subnet${NC}        ${GREEN}$subnet_name${NC}"
-                echo -e "    ${WHITE}      ${NC}        ${GRAY}(${YELLOW}$subnet_id${GRAY})${NC}"
-            fi
-        done
-    else
-        echo -e "  ${YELLOW}No VNICs found${NC}"
-    fi
-    
-    # ========== BOOT VOLUME ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Boot Volume ===${NC}"
-    
-    local boot_vol_attachments
-    boot_vol_attachments=$(oci compute boot-volume-attachment list \
-        --compartment-id "$compartment_id" \
-        --availability-domain "$ad" \
-        --instance-id "$instance_ocid" \
-        --output json 2>/dev/null)
-    
-    if [[ -n "$boot_vol_attachments" ]] && echo "$boot_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
-        echo "$boot_vol_attachments" | jq -r '.data[] | "\(.["boot-volume-id"])|\(.["lifecycle-state"])"' 2>/dev/null | \
-        while IFS='|' read -r bv_id bv_attach_state; do
-            [[ -z "$bv_id" ]] && continue
-            
-            local bv_json
-            bv_json=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
-            
-            if [[ -n "$bv_json" ]] && echo "$bv_json" | jq -e '.data' > /dev/null 2>&1; then
-                local bv_name bv_state bv_size_gb bv_vpus
-                bv_name=$(echo "$bv_json" | jq -r '.data["display-name"] // "N/A"')
-                bv_state=$(echo "$bv_json" | jq -r '.data["lifecycle-state"] // "N/A"')
-                bv_size_gb=$(echo "$bv_json" | jq -r '.data["size-in-gbs"] // "N/A"')
-                bv_vpus=$(echo "$bv_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
-                
-                local bv_state_color="$GREEN"
-                [[ "$bv_state" != "AVAILABLE" ]] && bv_state_color="$YELLOW"
-                
-                echo -e "  ${WHITE}Name:${NC}           ${GREEN}$bv_name${NC}"
-                echo -e "  ${WHITE}Boot Volume${NC}     ${GRAY}(${YELLOW}$bv_id${GRAY})${NC}"
-                echo -e "  ${WHITE}State:${NC}          ${bv_state_color}$bv_state${NC}"
-                echo -e "  ${WHITE}Size:${NC}           ${bv_size_gb} GB"
-                echo -e "  ${WHITE}VPUs:${NC}           ${bv_vpus} per GB"
-            fi
-        done
-    else
-        echo -e "  ${YELLOW}No boot volume found${NC}"
-    fi
-    
-    # ========== BLOCK VOLUMES ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}=== Block Volumes ===${NC}"
-    
-    local block_vol_attachments
-    block_vol_attachments=$(oci compute volume-attachment list \
-        --compartment-id "$compartment_id" \
-        --instance-id "$instance_ocid" \
-        --output json 2>/dev/null)
-    
-    local vol_count=0
-    if [[ -n "$block_vol_attachments" ]] && echo "$block_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
-        while IFS='|' read -r vol_id attach_state attach_type device is_readonly; do
-            [[ -z "$vol_id" ]] && continue
-            ((vol_count++))
-            
-            local vol_json
-            vol_json=$(oci bv volume get --volume-id "$vol_id" --output json 2>/dev/null)
-            
-            if [[ -n "$vol_json" ]] && echo "$vol_json" | jq -e '.data' > /dev/null 2>&1; then
-                local vol_name vol_state vol_size_gb vol_vpus
-                vol_name=$(echo "$vol_json" | jq -r '.data["display-name"] // "N/A"')
-                vol_state=$(echo "$vol_json" | jq -r '.data["lifecycle-state"] // "N/A"')
-                vol_size_gb=$(echo "$vol_json" | jq -r '.data["size-in-gbs"] // "N/A"')
-                vol_vpus=$(echo "$vol_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
-                
-                local vol_state_color="$GREEN"
-                [[ "$vol_state" != "AVAILABLE" ]] && vol_state_color="$YELLOW"
-                
-                local readonly_marker=""
-                [[ "$is_readonly" == "true" ]] && readonly_marker=" ${YELLOW}(Read-Only)${NC}"
-                
-                echo ""
-                echo -e "  ${BOLD}${WHITE}Volume ${vol_count}:${NC} ${GREEN}$vol_name${NC}${readonly_marker}"
-                echo -e "    ${WHITE}Block Volume${NC}  ${GRAY}(${YELLOW}$vol_id${GRAY})${NC}"
-                echo -e "    ${WHITE}State:${NC}        ${vol_state_color}$vol_state${NC}"
-                echo -e "    ${WHITE}Size:${NC}         ${vol_size_gb} GB"
-                echo -e "    ${WHITE}VPUs:${NC}         ${vol_vpus} per GB"
-                echo -e "    ${WHITE}Attachment:${NC}   $attach_type"
-                [[ "$device" != "N/A" && -n "$device" ]] && echo -e "    ${WHITE}Device:${NC}       $device"
-            fi
-        done < <(echo "$block_vol_attachments" | jq -r '.data[] | "\(.["volume-id"])|\(.["lifecycle-state"])|\(.["attachment-type"])|\(.device // "N/A")|\(.["is-read-only"] // false)"' 2>/dev/null)
-    fi
-    
-    [[ $vol_count -eq 0 ]] && echo -e "  ${GRAY}No block volumes attached${NC}"
-    
-    # ========== ACTIONS ==========
-    echo ""
-    echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
-    if [[ "$has_cloud_init" == "true" ]]; then
-        echo -e "  ${MAGENTA}cloud-init${NC}  - View decoded cloud-init user-data"
-        echo -e "  ${MAGENTA}save${NC}        - Save cloud-init to file"
-        echo -e "  ${BLUE}compare${NC}     - Compare cloud-init with another instance or instance configuration"
-    fi
-    echo -e "  ${YELLOW}console${NC}     - Capture and view console history"
-    echo -e "  ${CYAN}Enter${NC}       - Return to menu"
-    echo ""
-    echo -n -e "${CYAN}Action [cloud-init/save/compare/console/Enter]: ${NC}"
-    
-    local action
-    read -r action
-    
-    case "$action" in
-        cloud-init|cloudinit|ci|view|VIEW)
+        
+        # Line 2: Instance lifecycle actions
+        echo -e "  ${CYAN}5${NC}) Reboot             ${CYAN}6${NC}) Force reboot       ${CYAN}7${NC}) Stop instance         ${CYAN}8${NC}) Start instance     ${RED}9${NC}) ${RED}TERMINATE${NC}"
+        
+        # Line 3: K8s node actions (only if in K8s)
+        if [[ -n "$k8s_node_name" ]]; then
+            echo -e "  ${BLUE}d${NC}) Drain K8s node     ${BLUE}c${NC}) Cordon node        ${BLUE}u${NC}) Uncordon node"
+        fi
+        
+        echo ""
+        echo -e "  ${WHITE}Enter${NC}) Return to list"
+        echo ""
+        echo -n -e "${CYAN}Select [r/1-9/d/c/u/Enter]: ${NC}"
+        
+        local action
+        read -r action
+        
+        case "$action" in
+        r|R|refresh|REFRESH|details|DETAILS)
+            # Re-display instance details by calling self recursively (but without re-fetching)
+            # Actually, just break and let the caller loop handle it by re-calling display_instance_details
+            echo ""
+            echo -e "${YELLOW}Refreshing instance details...${NC}"
+            # Return special code to indicate refresh
+            return 2
+            ;;
+        1|cloud-init|cloudinit|ci|view|VIEW)
             if [[ "$has_cloud_init" == "true" ]]; then
                 echo ""
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -6583,9 +7117,10 @@ display_instance_details() {
                 read -r
             else
                 echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+                sleep 1
             fi
             ;;
-        save|SAVE|s|S)
+        2|save|SAVE|s|S)
             if [[ "$has_cloud_init" == "true" ]]; then
                 local safe_name
                 safe_name=$(echo "$display_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
@@ -6612,32 +7147,255 @@ display_instance_details() {
                 read -r
             else
                 echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+                sleep 1
             fi
             ;;
-        compare|COMPARE|c|C)
+        3|compare|COMPARE)
             if [[ "$has_cloud_init" == "true" ]]; then
                 compare_instance_cloud_init "$instance_ocid" "$display_name" "$user_data_b64"
             else
                 echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+                sleep 1
             fi
             ;;
-        console|CONSOLE|con|CON|history|HISTORY)
+        4|console|CONSOLE|con|CON|history|HISTORY)
             capture_console_history "$instance_ocid" "$display_name"
             ;;
+        5|reboot|REBOOT)
+            echo ""
+            echo -e "${YELLOW}Rebooting instance ${GREEN}$display_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm reboot? (yes/no): ${NC}"
+            local confirm
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                log_action "REBOOT" "oci compute instance action --instance-id $instance_ocid --action SOFTRESET"
+                if oci compute instance action --instance-id "$instance_ocid" --action SOFTRESET 2>/dev/null; then
+                    echo -e "${GREEN}✓ Reboot initiated successfully${NC}"
+                    log_action_result "SUCCESS" "Instance $display_name reboot initiated"
+                else
+                    echo -e "${RED}✗ Failed to reboot instance${NC}"
+                    log_action_result "FAILED" "Instance $display_name reboot failed"
+                fi
+            else
+                echo -e "${YELLOW}Reboot cancelled${NC}"
+            fi
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        6|force|FORCE)
+            echo ""
+            echo -e "${YELLOW}Force rebooting instance ${GREEN}$display_name${NC}${YELLOW}...${NC}"
+            echo -e "${RED}WARNING: This is a hard reset and may cause data loss!${NC}"
+            echo -n -e "${CYAN}Confirm force reboot? (yes/no): ${NC}"
+            local confirm
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                log_action "FORCE_REBOOT" "oci compute instance action --instance-id $instance_ocid --action RESET"
+                if oci compute instance action --instance-id "$instance_ocid" --action RESET 2>/dev/null; then
+                    echo -e "${GREEN}✓ Force reboot initiated successfully${NC}"
+                    log_action_result "SUCCESS" "Instance $display_name force reboot initiated"
+                else
+                    echo -e "${RED}✗ Failed to force reboot instance${NC}"
+                    log_action_result "FAILED" "Instance $display_name force reboot failed"
+                fi
+            else
+                echo -e "${YELLOW}Force reboot cancelled${NC}"
+            fi
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        7|stop|STOP)
+            echo ""
+            echo -e "${YELLOW}Stopping instance ${GREEN}$display_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm stop? (yes/no): ${NC}"
+            local confirm
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                log_action "STOP" "oci compute instance action --instance-id $instance_ocid --action SOFTSTOP"
+                if oci compute instance action --instance-id "$instance_ocid" --action SOFTSTOP 2>/dev/null; then
+                    echo -e "${GREEN}✓ Stop initiated successfully${NC}"
+                    log_action_result "SUCCESS" "Instance $display_name stop initiated"
+                else
+                    echo -e "${RED}✗ Failed to stop instance${NC}"
+                    log_action_result "FAILED" "Instance $display_name stop failed"
+                fi
+            else
+                echo -e "${YELLOW}Stop cancelled${NC}"
+            fi
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        8|start|START)
+            echo ""
+            echo -e "${YELLOW}Starting instance ${GREEN}$display_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm start? (yes/no): ${NC}"
+            local confirm
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                log_action "START" "oci compute instance action --instance-id $instance_ocid --action START"
+                if oci compute instance action --instance-id "$instance_ocid" --action START 2>/dev/null; then
+                    echo -e "${GREEN}✓ Start initiated successfully${NC}"
+                    log_action_result "SUCCESS" "Instance $display_name start initiated"
+                else
+                    echo -e "${RED}✗ Failed to start instance${NC}"
+                    log_action_result "FAILED" "Instance $display_name start failed"
+                fi
+            else
+                echo -e "${YELLOW}Start cancelled${NC}"
+            fi
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        9|terminate|TERMINATE)
+            echo ""
+            echo -e "${RED}╔════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}║                    ⚠️  WARNING: TERMINATE  ⚠️                   ║${NC}"
+            echo -e "${RED}╚════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${RED}This will PERMANENTLY DELETE the instance:${NC}"
+            echo -e "  Name: ${GREEN}$display_name${NC}"
+            echo -e "  OCID: ${YELLOW}$instance_ocid${NC}"
+            echo ""
+            echo -e "${RED}This action cannot be undone!${NC}"
+            echo ""
+            
+            if [[ -n "$k8s_node_name" ]]; then
+                echo -e "${YELLOW}⚠️  This instance is a Kubernetes node: ${CYAN}$k8s_node_name${NC}"
+                echo -e "${YELLOW}   Consider draining the node first (option d)${NC}"
+                echo ""
+            fi
+            
+            echo -n -e "${RED}Type 'TERMINATE' to confirm deletion: ${NC}"
+            local confirm
+            read -r confirm
+            if [[ "$confirm" == "TERMINATE" ]]; then
+                echo ""
+                echo -e "${YELLOW}Terminating instance...${NC}"
+                log_action "TERMINATE" "oci compute instance terminate --instance-id $instance_ocid --preserve-boot-volume false --force"
+                if oci compute instance terminate --instance-id "$instance_ocid" --preserve-boot-volume false --force 2>/dev/null; then
+                    echo -e "${GREEN}✓ Terminate initiated successfully${NC}"
+                    echo -e "${YELLOW}Instance will be deleted. Boot volume will also be deleted.${NC}"
+                    log_action_result "SUCCESS" "Instance $display_name terminate initiated"
+                else
+                    echo -e "${RED}✗ Failed to terminate instance${NC}"
+                    log_action_result "FAILED" "Instance $display_name terminate failed"
+                fi
+            else
+                echo -e "${YELLOW}Termination cancelled${NC}"
+            fi
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        d|D|drain|DRAIN)
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Draining Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This will evict all pods (except DaemonSets) from the node.${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm drain? (yes/no): ${NC}"
+                local confirm
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    echo ""
+                    log_action "K8S_DRAIN" "kubectl drain $k8s_node_name --ignore-daemonsets --delete-emptydir-data"
+                    if kubectl drain "$k8s_node_name" --ignore-daemonsets --delete-emptydir-data 2>&1; then
+                        echo -e "${GREEN}✓ Node drained successfully${NC}"
+                        log_action_result "SUCCESS" "Node $k8s_node_name drained"
+                    else
+                        echo -e "${RED}✗ Failed to drain node (some pods may not be evictable)${NC}"
+                        log_action_result "FAILED" "Node $k8s_node_name drain failed"
+                    fi
+                else
+                    echo -e "${YELLOW}Drain cancelled${NC}"
+                fi
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            fi
+            ;;
+        c|C|cordon|CORDON)
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Cordoning Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This marks the node as unschedulable (existing pods continue running).${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm cordon? (yes/no): ${NC}"
+                local confirm
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    log_action "K8S_CORDON" "kubectl cordon $k8s_node_name"
+                    if kubectl cordon "$k8s_node_name" 2>&1; then
+                        echo -e "${GREEN}✓ Node cordoned successfully${NC}"
+                        log_action_result "SUCCESS" "Node $k8s_node_name cordoned"
+                    else
+                        echo -e "${RED}✗ Failed to cordon node${NC}"
+                        log_action_result "FAILED" "Node $k8s_node_name cordon failed"
+                    fi
+                else
+                    echo -e "${YELLOW}Cordon cancelled${NC}"
+                fi
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            fi
+            ;;
+        u|U|uncordon|UNCORDON)
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Uncordoning Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This marks the node as schedulable again.${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm uncordon? (yes/no): ${NC}"
+                local confirm
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    log_action "K8S_UNCORDON" "kubectl uncordon $k8s_node_name"
+                    if kubectl uncordon "$k8s_node_name" 2>&1; then
+                        echo -e "${GREEN}✓ Node uncordoned successfully${NC}"
+                        log_action_result "SUCCESS" "Node $k8s_node_name uncordoned"
+                    else
+                        echo -e "${RED}✗ Failed to uncordon node${NC}"
+                        log_action_result "FAILED" "Node $k8s_node_name uncordon failed"
+                    fi
+                else
+                    echo -e "${YELLOW}Uncordon cancelled${NC}"
+                fi
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            fi
+            ;;
         *)
-            # Return to menu
+            # Return to instance list (exit the actions loop)
+            break
             ;;
     esac
+    done  # End of actions loop
 }
 
 #--------------------------------------------------------------------------------
-# Capture and display instance console history
+# Interactive console history - entry point from instance details menu
 # Args: $1 = instance OCID, $2 = instance display name
 #--------------------------------------------------------------------------------
 capture_console_history() {
     local instance_ocid="$1"
     local instance_name="$2"
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
     
     echo ""
     echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -6652,7 +7410,7 @@ capture_console_history() {
     echo -e "${YELLOW}Checking for existing console history captures...${NC}"
     
     local existing_history
-    existing_history=$(oci compute instance-console-history list \
+    existing_history=$(oci --region "$region" compute console-history list \
         --compartment-id "$compartment_id" \
         --instance-id "$instance_ocid" \
         --lifecycle-state "SUCCEEDED" \
@@ -6692,12 +7450,20 @@ capture_console_history() {
         read -r choice
         
         if [[ "$choice" == "n" || "$choice" == "N" ]]; then
-            capture_new_console_history "$instance_ocid" "$instance_name"
+            # Capture new using unified function (auto_cleanup=true, interactive=true)
+            fetch_and_display_console_history "$instance_ocid" "$region" "$instance_name" "true" "true"
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
         elif [[ "$choice" == "b" || "$choice" == "B" || -z "$choice" ]]; then
             return
         elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le ${#HISTORY_LIST[@]} ]]; then
             local selected_id="${HISTORY_LIST[$((choice-1))]}"
-            display_console_history_content "$selected_id" "$instance_name"
+            # Display existing history content
+            _display_existing_console_history "$selected_id" "$instance_name" "$region"
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
         else
             echo -e "${RED}Invalid selection${NC}"
             sleep 1
@@ -6706,156 +7472,107 @@ capture_console_history() {
         echo ""
         echo -e "${GRAY}No existing console history captures found.${NC}"
         echo ""
-        echo -n -e "${CYAN}Capture new console history? [Y/n]: ${NC}"
-        local confirm
-        read -r confirm
-        
-        if [[ ! "$confirm" =~ ^[Nn] ]]; then
-            capture_new_console_history "$instance_ocid" "$instance_name"
-        fi
+        # Automatically capture new console history using unified function
+        fetch_and_display_console_history "$instance_ocid" "$region" "$instance_name" "true" "true"
+        echo ""
+        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+        read -r
     fi
 }
 
 #--------------------------------------------------------------------------------
-# Capture new console history
-# Args: $1 = instance OCID, $2 = instance display name
+# Display existing console history content (for viewing previously captured history)
+# Args: $1 = console history OCID, $2 = instance display name, $3 = region
 #--------------------------------------------------------------------------------
-capture_new_console_history() {
-    local instance_ocid="$1"
-    local instance_name="$2"
-    
-    echo ""
-    echo -e "${YELLOW}Capturing console history...${NC}"
-    echo ""
-    
-    # Build command
-    printf "%s\n" "oci compute instance-console-history capture \\"
-    printf "%s\n" "  --instance-id \"$instance_ocid\""
-    echo ""
-    
-    local result
-    result=$(oci compute instance-console-history capture \
-        --instance-id "$instance_ocid" \
-        --output json 2>&1)
-    local exit_code=$?
-    
-    if [[ $exit_code -eq 0 ]]; then
-        local history_id
-        history_id=$(echo "$result" | jq -r '.data.id // empty' 2>/dev/null)
-        
-        if [[ -n "$history_id" ]]; then
-            echo -e "${GREEN}✓ Console history capture initiated${NC}"
-            echo -e "  ${CYAN}History ID:${NC} ${YELLOW}$history_id${NC}"
-            echo ""
-            
-            # Wait for capture to complete
-            echo -e "${YELLOW}Waiting for capture to complete...${NC}"
-            local max_wait=60
-            local wait_count=0
-            local capture_state="REQUESTED"
-            
-            while [[ "$capture_state" != "SUCCEEDED" && "$capture_state" != "FAILED" && $wait_count -lt $max_wait ]]; do
-                sleep 2
-                ((wait_count+=2))
-                
-                local status_json
-                status_json=$(oci compute instance-console-history get \
-                    --instance-console-history-id "$history_id" \
-                    --output json 2>/dev/null)
-                
-                capture_state=$(echo "$status_json" | jq -r '.data["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
-                echo -ne "\r${YELLOW}  Status: ${WHITE}${capture_state}${NC} (${wait_count}s)    "
-            done
-            echo ""
-            
-            if [[ "$capture_state" == "SUCCEEDED" ]]; then
-                echo ""
-                echo -e "${GREEN}✓ Console history capture completed${NC}"
-                echo ""
-                echo -n -e "${CYAN}View console output now? [Y/n]: ${NC}"
-                local view_now
-                read -r view_now
-                
-                if [[ ! "$view_now" =~ ^[Nn] ]]; then
-                    display_console_history_content "$history_id" "$instance_name"
-                fi
-            else
-                echo ""
-                echo -e "${RED}Console history capture failed or timed out${NC}"
-                echo -e "${WHITE}State: ${YELLOW}$capture_state${NC}"
-            fi
-        else
-            echo -e "${RED}Failed to get console history ID from response${NC}"
-            echo "$result"
-        fi
-    else
-        echo -e "${RED}Failed to capture console history${NC}"
-        echo "$result"
-    fi
-    
-    echo ""
-    echo -n -e "${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-#--------------------------------------------------------------------------------
-# Display console history content
-# Args: $1 = console history OCID, $2 = instance display name
-#--------------------------------------------------------------------------------
-display_console_history_content() {
+_display_existing_console_history() {
     local history_id="$1"
     local instance_name="$2"
+    local region="${3:-${EFFECTIVE_REGION:-$REGION}}"
     
     echo ""
     echo -e "${YELLOW}Fetching console output...${NC}"
     
-    local content
-    content=$(oci compute instance-console-history get-content \
-        --instance-console-history-id "$history_id" \
-        --length 100000 2>/dev/null)
+    # Build the command (for display)
+    local cmd="oci --region \"$region\" compute console-history get-content --instance-console-history-id \"$history_id\" --length 10000000 --file -"
+    echo -e "${GRAY}Command: ${cmd}${NC}"
+    echo ""
     
-    if [[ -n "$content" ]]; then
-        echo ""
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}${CYAN}                                       CONSOLE OUTPUT                                                          ${NC}"
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${GRAY}Instance: ${WHITE}$instance_name${NC}"
-        echo -e "${GRAY}History ID: ${YELLOW}$history_id${NC}"
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "$content"
-        echo ""
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        # Option to save
-        echo -n -e "${CYAN}Save to file? [y/N]: ${NC}"
-        local save_choice
-        read -r save_choice
-        
-        if [[ "$save_choice" =~ ^[Yy] ]]; then
-            local safe_name
-            safe_name=$(echo "$instance_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
-            local filename="${safe_name}_console_$(date +%Y%m%d_%H%M%S).log"
+    # Use temp file for reliability
+    local temp_output temp_error
+    temp_output=$(mktemp)
+    temp_error=$(mktemp)
+    
+    # Capture raw output for display if empty
+    local raw_output
+    raw_output=$(oci --region "$region" compute console-history get-content \
+        --instance-console-history-id "$history_id" \
+        --length 10000000 \
+        --file "$temp_output" 2>&1)
+    local exit_code=$?
+    
+    echo -e "${BOLD}${CYAN}─── Console Output ───────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ -s "$temp_output" ]]; then
+            cat "$temp_output"
+            echo ""
+            echo -e "${BOLD}${CYAN}─── End of Console Output ────────────────────────────────────────────────────────${NC}"
+            echo ""
             
-            echo -n -e "${CYAN}Filename [${filename}]: ${NC}"
-            local custom_filename
-            read -r custom_filename
-            [[ -n "$custom_filename" ]] && filename="$custom_filename"
+            # Option to save
+            echo -n -e "${CYAN}Save to file? [y/N]: ${NC}"
+            local save_choice
+            read -r save_choice
             
-            if echo "$content" > "$filename" 2>/dev/null; then
-                echo -e "${GREEN}✓ Console output saved to: ${WHITE}$(pwd)/${filename}${NC}"
-            else
-                echo -e "${RED}Failed to save console output${NC}"
+            if [[ "$save_choice" =~ ^[Yy] ]]; then
+                local safe_name
+                safe_name=$(echo "$instance_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                local filename="${safe_name}_console_$(date +%Y%m%d_%H%M%S).log"
+                
+                echo -n -e "${CYAN}Filename [${filename}]: ${NC}"
+                local custom_filename
+                read -r custom_filename
+                [[ -n "$custom_filename" ]] && filename="$custom_filename"
+                
+                if cp "$temp_output" "$filename" 2>/dev/null; then
+                    echo -e "${GREEN}✓ Console output saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                else
+                    echo -e "${RED}Failed to save console output${NC}"
+                fi
             fi
+        else
+            echo -e "${YELLOW}(Console history is empty - no serial console output captured)${NC}"
+            echo ""
+            echo -e "${WHITE}OCI CLI raw output:${NC}"
+            if [[ -n "$raw_output" ]]; then
+                echo -e "${GRAY}${raw_output}${NC}"
+            else
+                echo -e "${GRAY}(no output returned)${NC}"
+            fi
+            echo ""
+            echo -e "${WHITE}Note: This can happen if:${NC}"
+            echo -e "${GRAY}  - The instance has not produced any serial console output${NC}"
+            echo -e "${GRAY}  - Serial console logging is not enabled on the instance${NC}"
+            echo -e "${GRAY}  - The instance was recently created/rebooted${NC}"
+            echo ""
+            echo -e "${BOLD}${CYAN}─── End of Console Output ────────────────────────────────────────────────────────${NC}"
         fi
     else
         echo -e "${RED}Failed to fetch console history content${NC}"
+        echo -e "${GRAY}Exit code: ${exit_code}${NC}"
+        echo -e "${WHITE}OCI CLI output:${NC}"
+        echo -e "${GRAY}${raw_output}${NC}"
+        if [[ -s "$temp_error" ]]; then
+            echo -e "${WHITE}Stderr:${NC}"
+            cat "$temp_error"
+        fi
+        echo ""
+        echo -e "${BOLD}${CYAN}─── End of Console Output ────────────────────────────────────────────────────────${NC}"
     fi
     
-    echo ""
-    echo -n -e "${CYAN}Press Enter to continue...${NC}"
-    read -r
+    # Cleanup temp files
+    rm -f "$temp_output" "$temp_error"
 }
 
 #--------------------------------------------------------------------------------
@@ -10181,6 +10898,622 @@ create_compute_cluster_interactive() {
     read -r
 }
 
+#===============================================================================
+# GPU INSTANCE TAGGING MANAGEMENT
+#===============================================================================
+
+# Default tag namespace and tag settings for GPU instance host actions
+GPU_TAG_NAMESPACE="${GPU_TAG_NAMESPACE:-ComputeInstanceHostActions}"
+GPU_TAG_NAMESPACE_DESCRIPTION="${GPU_TAG_NAMESPACE_DESCRIPTION:-Compute Instance Actions Tag Namespace}"
+GPU_TAG_NAME="${GPU_TAG_NAME:-CustomerReportedHostStatus}"
+GPU_TAG_NAME_DESCRIPTION="${GPU_TAG_NAME_DESCRIPTION:-host is unhealthy and needs manual intervention before returning to the previous pool post-recycle}"
+GPU_TAG_VALUES="${GPU_TAG_VALUES:-unhealthy}"
+
+#--------------------------------------------------------------------------------
+# Get tenancy home region (required for IAM operations)
+# OCI Command: oci iam region-subscription list --tenancy-id <TENANCY_ID>
+#--------------------------------------------------------------------------------
+get_home_region() {
+    local tenancy_ocid="${TENANCY_ID:-$TENANCY_OCID}"
+    
+    if [[ -z "$tenancy_ocid" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    local home_region
+    # Query home region from tenancy's region subscriptions
+    home_region=$(oci iam region-subscription list \
+        --tenancy-id "$tenancy_ocid" \
+        --query "data[?\"is-home-region\"==\`true\`].\"region-name\" | [0]" \
+        --raw-output 2>/dev/null)
+    
+    echo "$home_region"
+}
+
+#--------------------------------------------------------------------------------
+# Manage GPU Instance Tagging - Main menu
+#--------------------------------------------------------------------------------
+manage_gpu_instance_tagging() {
+    local tenancy_ocid="${TENANCY_ID:-$TENANCY_OCID}"
+    local home_region
+    
+    # Get home region for IAM operations
+    echo -e "${GRAY}Detecting home region...${NC}"
+    home_region=$(get_home_region)
+    
+    if [[ -z "$home_region" ]]; then
+        echo ""
+        echo -e "${RED}Error: Could not determine home region.${NC}"
+        echo -e "${YELLOW}Please ensure TENANCY_ID or TENANCY_OCID is set in variables.sh${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                        GPU INSTANCE TAGGING                                                     ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Configuration:${NC}"
+        echo -e "  ${CYAN}Tenancy:${NC}     ${YELLOW}${tenancy_ocid}${NC}"
+        echo -e "  ${CYAN}Home Region:${NC} ${WHITE}${home_region}${NC}"
+        echo -e "  ${CYAN}Namespace:${NC}   ${WHITE}${GPU_TAG_NAMESPACE}${NC}"
+        echo -e "  ${CYAN}Tag Name:${NC}    ${WHITE}${GPU_TAG_NAME}${NC}"
+        echo -e "  ${CYAN}Tag Values:${NC}  ${WHITE}${GPU_TAG_VALUES}${NC}"
+        echo ""
+        echo -e "${GRAY}Home region derived from: oci iam region-subscription list --tenancy-id \"\$TENANCY_ID\" --query \"data[?\\\"is-home-region\\\"==\\\`true\\\`].\\\"region-name\\\" | [0]\"${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo ""
+        echo -e "  ${GREEN}1${NC}) ${WHITE}Create namespace and tag${NC}      - Create ${GPU_TAG_NAMESPACE} namespace with ${GPU_TAG_NAME} tag"
+        echo -e "  ${CYAN}2${NC}) ${WHITE}Validate namespace and tag${NC}    - Check if namespace exists with proper tag configuration"
+        echo -e "  ${RED}3${NC}) ${WHITE}Delete namespace${NC}              - Retire and cascade-delete the namespace"
+        echo ""
+        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-3/b]: ${NC}"
+        
+        local choice
+        read -r choice
+        
+        case "$choice" in
+            1)
+                create_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
+                ;;
+            2)
+                validate_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
+                ;;
+            3)
+                delete_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Create GPU Tagging Namespace and Tag
+#--------------------------------------------------------------------------------
+create_gpu_tagging_namespace() {
+    local tenancy_ocid="$1"
+    local home_region="$2"
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                  CREATE TAG NAMESPACE AND TAG                                                    ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Use global DEBUG_MODE
+    local debug_flag=""
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        debug_flag="--debug"
+    fi
+    
+    # Step 1: Check if namespace already exists
+    echo -e "${YELLOW}Step 1: Checking if namespace already exists...${NC}"
+    echo ""
+    
+    local check_cmd="oci iam tag-namespace list --compartment-id \"$tenancy_ocid\" --all --query \"data[?name=='${GPU_TAG_NAMESPACE}']\" --output json"
+    echo -e "${GRAY}$check_cmd${NC}"
+    echo ""
+    
+    local existing_ns
+    existing_ns=$(oci iam tag-namespace list \
+        --compartment-id "$tenancy_ocid" \
+        --all \
+        --query "data[?name=='${GPU_TAG_NAMESPACE}']" \
+        --output json 2>/dev/null)
+    
+    local namespace_ocid
+    namespace_ocid=$(echo "$existing_ns" | jq -r '.[0].id // empty' 2>/dev/null)
+    
+    if [[ -n "$namespace_ocid" ]]; then
+        local ns_state
+        ns_state=$(echo "$existing_ns" | jq -r '.[0]["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+        
+        echo -e "${YELLOW}⚠ Namespace '${GPU_TAG_NAMESPACE}' already exists${NC}"
+        echo -e "  ${CYAN}OCID:${NC}  ${YELLOW}${namespace_ocid}${NC}"
+        echo -e "  ${CYAN}State:${NC} ${WHITE}${ns_state}${NC}"
+        echo ""
+        
+        if [[ "$ns_state" == "ACTIVE" ]]; then
+            echo -e "${WHITE}Checking if tag '${GPU_TAG_NAME}' exists...${NC}"
+            echo ""
+            
+            local existing_tag
+            existing_tag=$(oci iam tag list \
+                --tag-namespace-id "$namespace_ocid" \
+                --all \
+                --query "data[?name=='${GPU_TAG_NAME}']" \
+                --output json 2>/dev/null)
+            
+            local tag_ocid
+            tag_ocid=$(echo "$existing_tag" | jq -r '.[0].id // empty' 2>/dev/null)
+            
+            if [[ -n "$tag_ocid" ]]; then
+                echo -e "${GREEN}✓ Tag '${GPU_TAG_NAME}' already exists${NC}"
+                echo -e "  ${CYAN}OCID:${NC} ${YELLOW}${tag_ocid}${NC}"
+                echo ""
+                echo -e "${WHITE}No action needed - namespace and tag are already configured.${NC}"
+            else
+                echo -e "${YELLOW}Tag '${GPU_TAG_NAME}' does not exist. Creating...${NC}"
+                echo ""
+                _create_gpu_tag "$namespace_ocid" "$home_region" "$debug_flag"
+            fi
+        else
+            echo -e "${RED}Namespace is in state '${ns_state}' - cannot create tag${NC}"
+        fi
+        
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${GREEN}✓ Namespace does not exist. Proceeding with creation...${NC}"
+    echo ""
+    
+    # Step 2: Create namespace
+    echo -e "${YELLOW}Step 2: Creating tag namespace '${GPU_TAG_NAMESPACE}'...${NC}"
+    echo ""
+    
+    local create_ns_cmd="oci iam tag-namespace create \\
+    --compartment-id \"$tenancy_ocid\" \\
+    --name \"${GPU_TAG_NAMESPACE}\" \\
+    --description \"${GPU_TAG_NAMESPACE_DESCRIPTION}\" \\
+    --region \"$home_region\""
+    
+    echo -e "${BOLD}${YELLOW}Command to execute:${NC}"
+    echo -e "${GRAY}$create_ns_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Execute this command? [y/N]: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo -e "${YELLOW}Operation cancelled${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    log_action "CREATE_TAG_NAMESPACE" "$create_ns_cmd"
+    
+    local ns_result
+    ns_result=$(oci iam tag-namespace create \
+        --compartment-id "$tenancy_ocid" \
+        --name "${GPU_TAG_NAMESPACE}" \
+        --description "${GPU_TAG_NAMESPACE_DESCRIPTION}" \
+        --region "$home_region" \
+        --output json $debug_flag 2>&1)
+    local ns_exit=$?
+    
+    if [[ $ns_exit -eq 0 ]]; then
+        namespace_ocid=$(echo "$ns_result" | jq -r '.data.id // empty' 2>/dev/null)
+        echo -e "${GREEN}✓ Namespace created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}${namespace_ocid}${NC}"
+        log_action_result "SUCCESS" "Namespace ${GPU_TAG_NAMESPACE} created: ${namespace_ocid}"
+        echo ""
+        
+        # Wait for namespace to be active
+        echo -e "${YELLOW}Waiting for namespace to become active...${NC}"
+        sleep 5
+        
+        # Step 3: Create tag
+        echo ""
+        echo -e "${YELLOW}Step 3: Creating tag '${GPU_TAG_NAME}' in namespace...${NC}"
+        echo ""
+        
+        _create_gpu_tag "$namespace_ocid" "$home_region" "$debug_flag"
+    else
+        echo -e "${RED}✗ Failed to create namespace${NC}"
+        echo -e "${GRAY}Error: $ns_result${NC}"
+        log_action_result "FAILED" "Namespace creation failed"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Helper: Create GPU tag in namespace
+#--------------------------------------------------------------------------------
+_create_gpu_tag() {
+    local namespace_ocid="$1"
+    local home_region="$2"
+    local debug_flag="$3"
+    
+    # Build validator JSON for enum values
+    local values_json
+    values_json=$(echo "${GPU_TAG_VALUES}" | tr ',' '\n' | jq -R . | jq -s '.')
+    local validator_json="{\"validator-type\": \"ENUM\", \"values\": ${values_json}}"
+    
+    local create_tag_cmd="oci iam tag create \\
+    --tag-namespace-id \"$namespace_ocid\" \\
+    --name \"${GPU_TAG_NAME}\" \\
+    --description \"${GPU_TAG_NAME_DESCRIPTION}\" \\
+    --validator '${validator_json}' \\
+    --region \"$home_region\""
+    
+    echo -e "${BOLD}${YELLOW}Command to execute:${NC}"
+    echo -e "${GRAY}$create_tag_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Execute this command? [y/N]: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo -e "${YELLOW}Tag creation cancelled${NC}"
+        return
+    fi
+    
+    echo ""
+    log_action "CREATE_TAG" "$create_tag_cmd"
+    
+    local tag_result
+    tag_result=$(oci iam tag create \
+        --tag-namespace-id "$namespace_ocid" \
+        --name "${GPU_TAG_NAME}" \
+        --description "${GPU_TAG_NAME_DESCRIPTION}" \
+        --validator "$validator_json" \
+        --region "$home_region" \
+        --output json $debug_flag 2>&1)
+    local tag_exit=$?
+    
+    if [[ $tag_exit -eq 0 ]]; then
+        local tag_ocid
+        tag_ocid=$(echo "$tag_result" | jq -r '.data.id // empty' 2>/dev/null)
+        echo -e "${GREEN}✓ Tag created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}${tag_ocid}${NC}"
+        log_action_result "SUCCESS" "Tag ${GPU_TAG_NAME} created: ${tag_ocid}"
+    else
+        echo -e "${RED}✗ Failed to create tag${NC}"
+        echo -e "${GRAY}Error: $tag_result${NC}"
+        log_action_result "FAILED" "Tag creation failed"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# Validate GPU Tagging Namespace and Tag
+#--------------------------------------------------------------------------------
+validate_gpu_tagging_namespace() {
+    local tenancy_ocid="$1"
+    local home_region="$2"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                  VALIDATE TAG NAMESPACE AND TAG                                                  ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    local all_valid=true
+    
+    # Step 1: Check namespace exists
+    echo -e "${YELLOW}Step 1: Checking for namespace '${GPU_TAG_NAMESPACE}'...${NC}"
+    echo ""
+    
+    local check_cmd="oci iam tag-namespace list --compartment-id \"$tenancy_ocid\" --all --query \"data[?name=='${GPU_TAG_NAMESPACE}']\" --output json"
+    echo -e "${GRAY}$check_cmd${NC}"
+    echo ""
+    
+    local existing_ns
+    existing_ns=$(oci iam tag-namespace list \
+        --compartment-id "$tenancy_ocid" \
+        --all \
+        --query "data[?name=='${GPU_TAG_NAMESPACE}']" \
+        --output json 2>/dev/null)
+    
+    local namespace_ocid ns_state ns_description
+    namespace_ocid=$(echo "$existing_ns" | jq -r '.[0].id // empty' 2>/dev/null)
+    
+    if [[ -z "$namespace_ocid" ]]; then
+        echo -e "${RED}✗ Namespace '${GPU_TAG_NAMESPACE}' does NOT exist${NC}"
+        all_valid=false
+    else
+        ns_state=$(echo "$existing_ns" | jq -r '.[0]["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+        ns_description=$(echo "$existing_ns" | jq -r '.[0].description // "N/A"' 2>/dev/null)
+        
+        echo -e "${GREEN}✓ Namespace '${GPU_TAG_NAMESPACE}' exists${NC}"
+        echo -e "  ${CYAN}OCID:${NC}        ${YELLOW}${namespace_ocid}${NC}"
+        echo -e "  ${CYAN}State:${NC}       ${WHITE}${ns_state}${NC}"
+        echo -e "  ${CYAN}Description:${NC} ${WHITE}${ns_description}${NC}"
+        
+        if [[ "$ns_state" != "ACTIVE" ]]; then
+            echo -e "${RED}  ⚠ Namespace is not ACTIVE (state: ${ns_state})${NC}"
+            all_valid=false
+        fi
+    fi
+    
+    echo ""
+    
+    # Step 2: Check tag exists
+    if [[ -n "$namespace_ocid" && "$ns_state" == "ACTIVE" ]]; then
+        echo -e "${YELLOW}Step 2: Checking for tag '${GPU_TAG_NAME}' in namespace...${NC}"
+        echo ""
+        
+        local tag_list_cmd="oci iam tag list --tag-namespace-id \"$namespace_ocid\" --all --output json"
+        echo -e "${GRAY}$tag_list_cmd${NC}"
+        echo ""
+        
+        local existing_tags
+        existing_tags=$(oci iam tag list \
+            --tag-namespace-id "$namespace_ocid" \
+            --all \
+            --output json 2>/dev/null)
+        
+        local tag_info
+        tag_info=$(echo "$existing_tags" | jq -r ".data[] | select(.name==\"${GPU_TAG_NAME}\")" 2>/dev/null)
+        
+        if [[ -z "$tag_info" ]]; then
+            echo -e "${RED}✗ Tag '${GPU_TAG_NAME}' does NOT exist in namespace${NC}"
+            all_valid=false
+        else
+            local tag_ocid tag_state tag_description validator_type validator_values
+            tag_ocid=$(echo "$tag_info" | jq -r '.id // empty')
+            tag_state=$(echo "$tag_info" | jq -r '.["lifecycle-state"] // "UNKNOWN"')
+            tag_description=$(echo "$tag_info" | jq -r '.description // "N/A"')
+            validator_type=$(echo "$tag_info" | jq -r '.validator["validator-type"] // "NONE"')
+            validator_values=$(echo "$tag_info" | jq -r '.validator.values // [] | join(", ")')
+            
+            echo -e "${GREEN}✓ Tag '${GPU_TAG_NAME}' exists${NC}"
+            echo -e "  ${CYAN}OCID:${NC}        ${YELLOW}${tag_ocid}${NC}"
+            echo -e "  ${CYAN}State:${NC}       ${WHITE}${tag_state}${NC}"
+            echo -e "  ${CYAN}Description:${NC} ${WHITE}${tag_description}${NC}"
+            echo -e "  ${CYAN}Validator:${NC}   ${WHITE}${validator_type}${NC}"
+            if [[ -n "$validator_values" ]]; then
+                echo -e "  ${CYAN}Values:${NC}      ${WHITE}${validator_values}${NC}"
+            fi
+            
+            if [[ "$tag_state" != "ACTIVE" ]]; then
+                echo -e "${RED}  ⚠ Tag is not ACTIVE (state: ${tag_state})${NC}"
+                all_valid=false
+            fi
+            
+            # Check if expected values are present
+            local expected_values
+            IFS=',' read -ra expected_values <<< "${GPU_TAG_VALUES}"
+            for val in "${expected_values[@]}"; do
+                if ! echo "$validator_values" | grep -q "$val"; then
+                    echo -e "${YELLOW}  ⚠ Expected value '${val}' not found in validator${NC}"
+                fi
+            done
+        fi
+        
+        echo ""
+        
+        # List all tags in namespace
+        echo -e "${YELLOW}All tags in namespace:${NC}"
+        echo ""
+        printf "  ${GRAY}%-30s %-12s %-15s %s${NC}\n" "Name" "State" "Validator" "OCID"
+        echo "$existing_tags" | jq -r '.data[] | "\(.name)|\(.["lifecycle-state"])|\(.validator["validator-type"] // "NONE")|\(.id)"' 2>/dev/null | \
+        while IFS='|' read -r t_name t_state t_validator t_ocid; do
+            local state_color="$GREEN"
+            [[ "$t_state" != "ACTIVE" ]] && state_color="$YELLOW"
+            printf "  ${WHITE}%-30s${NC} ${state_color}%-12s${NC} %-15s ${YELLOW}%s${NC}\n" "$t_name" "$t_state" "$t_validator" "$t_ocid"
+        done
+    else
+        echo -e "${YELLOW}Step 2: Skipping tag check (namespace not available)${NC}"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Validation Summary ═══${NC}"
+    echo ""
+    if [[ "$all_valid" == "true" ]]; then
+        echo -e "${GREEN}✓ All validation checks PASSED${NC}"
+        echo -e "${WHITE}  The GPU instance tagging namespace and tag are properly configured.${NC}"
+    else
+        echo -e "${RED}✗ Some validation checks FAILED${NC}"
+        echo -e "${WHITE}  Use option 1 to create the missing namespace/tag.${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Delete GPU Tagging Namespace
+#--------------------------------------------------------------------------------
+delete_gpu_tagging_namespace() {
+    local tenancy_ocid="$1"
+    local home_region="$2"
+    
+    echo ""
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}                                      DELETE TAG NAMESPACE                                                        ${NC}"
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Use global DEBUG_MODE
+    local debug_flag=""
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        debug_flag="--debug"
+    fi
+    
+    # Step 1: Find namespace
+    echo -e "${YELLOW}Step 1: Finding namespace '${GPU_TAG_NAMESPACE}'...${NC}"
+    echo ""
+    
+    local check_cmd="oci iam tag-namespace list --compartment-id \"$tenancy_ocid\" --all --query \"data[?name=='${GPU_TAG_NAMESPACE}']\" --output json"
+    echo -e "${GRAY}$check_cmd${NC}"
+    echo ""
+    
+    local existing_ns
+    existing_ns=$(oci iam tag-namespace list \
+        --compartment-id "$tenancy_ocid" \
+        --all \
+        --query "data[?name=='${GPU_TAG_NAMESPACE}']" \
+        --output json 2>/dev/null)
+    
+    local namespace_ocid ns_state
+    namespace_ocid=$(echo "$existing_ns" | jq -r '.[0].id // empty' 2>/dev/null)
+    
+    if [[ -z "$namespace_ocid" ]]; then
+        echo -e "${YELLOW}Namespace '${GPU_TAG_NAMESPACE}' does not exist. Nothing to delete.${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    ns_state=$(echo "$existing_ns" | jq -r '.[0]["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+    
+    echo -e "${WHITE}Found namespace:${NC}"
+    echo -e "  ${CYAN}Name:${NC}  ${WHITE}${GPU_TAG_NAMESPACE}${NC}"
+    echo -e "  ${CYAN}OCID:${NC}  ${YELLOW}${namespace_ocid}${NC}"
+    echo -e "  ${CYAN}State:${NC} ${WHITE}${ns_state}${NC}"
+    echo ""
+    
+    if [[ "$ns_state" == "DELETED" ]]; then
+        echo -e "${YELLOW}Namespace is already in DELETED state${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Warning
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                      ⚠️  WARNING  ⚠️                             ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${RED}This will:${NC}"
+    echo -e "${WHITE}  1. Retire the namespace (mark as inactive)${NC}"
+    echo -e "${WHITE}  2. Cascade-delete the namespace and ALL tags within it${NC}"
+    echo ""
+    echo -e "${RED}This action cannot be undone!${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Operation cancelled${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    
+    # Step 2: Retire namespace (required before delete)
+    if [[ "$ns_state" == "ACTIVE" ]]; then
+        echo -e "${YELLOW}Step 2: Retiring namespace...${NC}"
+        echo ""
+        
+        local retire_cmd="oci iam tag-namespace retire \\
+    --tag-namespace-id \"$namespace_ocid\" \\
+    --region \"$home_region\""
+        
+        echo -e "${GRAY}$retire_cmd${NC}"
+        echo ""
+        
+        log_action "RETIRE_TAG_NAMESPACE" "$retire_cmd"
+        
+        local retire_result
+        retire_result=$(oci iam tag-namespace retire \
+            --tag-namespace-id "$namespace_ocid" \
+            --region "$home_region" \
+            $debug_flag 2>&1)
+        local retire_exit=$?
+        
+        if [[ $retire_exit -eq 0 ]]; then
+            echo -e "${GREEN}✓ Namespace retired successfully${NC}"
+            log_action_result "SUCCESS" "Namespace retired"
+        else
+            echo -e "${RED}✗ Failed to retire namespace${NC}"
+            echo -e "${GRAY}Error: $retire_result${NC}"
+            log_action_result "FAILED" "Namespace retire failed"
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+        
+        echo ""
+        echo -e "${YELLOW}Waiting for retire to complete...${NC}"
+        sleep 3
+    else
+        echo -e "${YELLOW}Step 2: Namespace already retired (state: ${ns_state}), skipping retire...${NC}"
+    fi
+    
+    echo ""
+    
+    # Step 3: Cascade delete
+    echo -e "${YELLOW}Step 3: Cascade-deleting namespace and all tags...${NC}"
+    echo ""
+    
+    local delete_cmd="oci iam tag-namespace cascade-delete \\
+    --tag-namespace-id \"$namespace_ocid\" \\
+    --region \"$home_region\""
+    
+    echo -e "${GRAY}$delete_cmd${NC}"
+    echo ""
+    
+    log_action "CASCADE_DELETE_TAG_NAMESPACE" "$delete_cmd"
+    
+    local delete_result
+    delete_result=$(oci iam tag-namespace cascade-delete \
+        --tag-namespace-id "$namespace_ocid" \
+        --region "$home_region" \
+        $debug_flag 2>&1)
+    local delete_exit=$?
+    
+    if [[ $delete_exit -eq 0 ]]; then
+        echo -e "${GREEN}✓ Namespace cascade-delete initiated successfully${NC}"
+        echo -e "${YELLOW}Note: The delete operation runs asynchronously. It may take a few minutes to complete.${NC}"
+        log_action_result "SUCCESS" "Namespace cascade-delete initiated"
+    else
+        echo -e "${RED}✗ Failed to delete namespace${NC}"
+        echo -e "${GRAY}Error: $delete_result${NC}"
+        log_action_result "FAILED" "Namespace cascade-delete failed"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
 #--------------------------------------------------------------------------------
 # Create Instance Configuration interactively
 #--------------------------------------------------------------------------------
@@ -11717,7 +13050,12 @@ main() {
             if [[ "$show_console_history" == "true" ]]; then
                 get_console_history "$instance_id"
             elif [[ "$show_instance_details" == "true" ]]; then
-                display_instance_details "$instance_id"
+                # Loop to handle refresh requests
+                while true; do
+                    display_instance_details "$instance_id"
+                    local ret=$?
+                    [[ $ret -ne 2 ]] && break  # Exit loop unless refresh requested
+                done
             else
                 get_node_info "$instance_id" "$show_labels" "$show_clique" "$count_clique"
             fi
