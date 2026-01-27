@@ -43,6 +43,9 @@ readonly ORANGE='\033[38;5;208m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m' # No Color
 
+# Debug mode (set via --debug command line flag)
+DEBUG_MODE=false
+
 # Cache settings
 readonly CACHE_MAX_AGE=3600  # 1 hour in seconds
 
@@ -436,7 +439,7 @@ fetch_compute_clusters() {
     # Write cache header
     {
         echo "# Compute Clusters"
-        echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain"
+        echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain|LifecycleState"
     } > "$COMPUTE_CLUSTER_CACHE"
     
     # Get availability domains
@@ -458,7 +461,8 @@ fetch_compute_clusters() {
                 --all \
                 --output json > "$raw_json" 2>/dev/null; then
             
-            jq -r '.data.items[]? | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
+            # Try .data[] first (standard format), fallback to .data.items[] (paginated format)
+            jq -r '(.data // .data.items // [])[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
         fi
         
         rm -f "$raw_json"
@@ -3465,21 +3469,36 @@ display_gpu_management_menu() {
     # ========== COMPUTE CLUSTERS ==========
     echo -e "${BOLD}${BLUE}═══ Compute Clusters ═══${NC}"
     echo ""
-    printf "${BOLD}%-5s %-60s %s${NC}\n" "ID" "Compute Cluster Name" "OCID"
+    printf "${BOLD}%-5s %-50s %-12s %s${NC}\n" "ID" "Compute Cluster Name" "Status" "OCID"
     print_separator 140
     
     local cc_idx=0
     if [[ -f "$COMPUTE_CLUSTER_CACHE" ]]; then
-        while IFS='|' read -r cc_ocid cc_name cc_ad; do
+        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
             [[ "$cc_ocid" =~ ^#.*$ ]] && continue
             [[ -z "$cc_ocid" ]] && continue
+            
+            # Default state if not present (old cache format)
+            [[ -z "$cc_state" ]] && cc_state="UNKNOWN"
+            
+            # Skip deleted clusters
+            [[ "$cc_state" == "DELETED" ]] && continue
             
             ((cc_idx++))
             local cid="c${cc_idx}"
             CC_INDEX_MAP[$cid]="$cc_ocid"
             
-            printf "${YELLOW}%-5s${NC} ${WHITE}%-60s${NC} ${CYAN}%s${NC}\n" \
-                "$cid" "$cc_name" "$cc_ocid"
+            # Color-code the status
+            local state_color="$GREEN"
+            case "$cc_state" in
+                ACTIVE) state_color="$GREEN" ;;
+                CREATING|UPDATING) state_color="$YELLOW" ;;
+                DELETING) state_color="$RED" ;;
+                *) state_color="$GRAY" ;;
+            esac
+            
+            printf "${YELLOW}%-5s${NC} ${WHITE}%-50s${NC} ${state_color}%-12s${NC} ${CYAN}%s${NC}\n" \
+                "$cid" "$cc_name" "$cc_state" "$cc_ocid"
         done < <(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null)
     fi
     
@@ -3515,11 +3534,12 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}3${NC}) ${WHITE}GPU Memory Fabrics & Clusters${NC} - Manage GPU memory fabrics and clusters"
         echo -e "  ${GREEN}4${NC}) ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
         echo -e "  ${GREEN}5${NC}) ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
+        echo -e "  ${GREEN}6${NC}) ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
         echo ""
         echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-5, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-6, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3546,6 +3566,9 @@ interactive_management_main_menu() {
             5)
                 manage_instance_configurations
                 ;;
+            6)
+                manage_compute_clusters
+                ;;
             c|C|cache|CACHE)
                 display_cache_stats
                 ;;
@@ -3555,7 +3578,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-5, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-6, c, or q.${NC}"
                 ;;
         esac
     done
@@ -5515,7 +5538,8 @@ display_instances_properties_view() {
         
         local bv_count=0
         local bv_total
-        bv_total=$(echo "$unique_instances" | grep -c . || echo 0)
+        bv_total=$(echo "$unique_instances" | grep -c . 2>/dev/null) || bv_total=0
+        [[ ! "$bv_total" =~ ^[0-9]+$ ]] && bv_total=0
         
         # Fetch boot volume attachments and details in parallel
         while IFS='|' read -r inst_ocid inst_ad; do
@@ -7549,7 +7573,8 @@ rename_instance_configuration_interactive() {
     local base_pattern="${shape}-ic-oke-${oke_version}-${network_type}"
     local existing_count=0
     if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null) || existing_count=0
+        [[ ! "$existing_count" =~ ^[0-9]+$ ]] && existing_count=0
     fi
     local next_num=$((existing_count + 1))
     
@@ -7592,9 +7617,9 @@ rename_instance_configuration_interactive() {
     # Show command to be executed
     echo -e "${BOLD}${YELLOW}─── Command to Execute ───${NC}"
     echo ""
-    echo -e "${WHITE}oci compute-management instance-configuration update \\${NC}"
-    echo -e "${WHITE}  --instance-configuration-id \"$ic_ocid\" \\${NC}"
-    echo -e "${WHITE}  --display-name \"$new_name\"${NC}"
+    printf "%s\n" "oci compute-management instance-configuration update \\"
+    printf "%s\n" "  --instance-configuration-id \"$ic_ocid\" \\"
+    printf "%s\n" "  --display-name \"$new_name\""
     echo ""
     
     # Log file for the action
@@ -7743,7 +7768,8 @@ rename_single_instance_configuration() {
     local base_pattern="${shape}-ic-oke-${oke_version}-${network_type}"
     local existing_count=0
     if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null) || existing_count=0
+        [[ ! "$existing_count" =~ ^[0-9]+$ ]] && existing_count=0
     fi
     local next_num=$((existing_count + 1))
     
@@ -8280,8 +8306,8 @@ create_gpu_memory_cluster_interactive() {
     # Display Compute Clusters
     echo -e "${WHITE}Available Compute Clusters:${NC}"
     echo ""
-    printf "${BOLD}%-6s %-45s %-40s${NC}\n" \
-        "ID" "Compute Cluster Name" "Availability Domain"
+    printf "${BOLD}%-6s %-40s %-35s %-12s${NC}\n" \
+        "ID" "Compute Cluster Name" "Availability Domain" "Status"
     print_separator 95
     
     local cc_output_temp
@@ -8293,22 +8319,36 @@ create_gpu_memory_cluster_interactive() {
         [[ -z "$cc_ocid" ]] && continue
         
         # Get compute cluster info from cache
-        local cc_line cc_name cc_ad
+        local cc_line cc_name cc_ad cc_state
         cc_line=$(grep "^${cc_ocid}|" "$COMPUTE_CLUSTER_CACHE" 2>/dev/null | head -1)
         if [[ -n "$cc_line" ]]; then
-            IFS='|' read -r _ cc_name cc_ad <<< "$cc_line"
+            IFS='|' read -r _ cc_name cc_ad cc_state <<< "$cc_line"
+            # Default state if not present (old cache format)
+            [[ -z "$cc_state" ]] && cc_state="UNKNOWN"
         else
             cc_name="N/A"
             cc_ad="N/A"
+            cc_state="UNKNOWN"
         fi
         
+        # Skip deleted clusters
+        [[ "$cc_state" == "DELETED" ]] && continue
+        
         local cid_num="${cid#c}"
-        echo "${cid_num}|${cid}|${cc_name}|${cc_ad}" >> "$cc_output_temp"
+        echo "${cid_num}|${cid}|${cc_name}|${cc_ad}|${cc_state}" >> "$cc_output_temp"
     done
     
-    sort -t'|' -k1 -n "$cc_output_temp" | while IFS='|' read -r _ cid cc_name cc_ad; do
-        printf "${YELLOW}%-6s${NC} ${CYAN}%-45s${NC} ${MAGENTA}%-40s${NC}\n" \
-            "$cid" "$cc_name" "$cc_ad"
+    sort -t'|' -k1 -n "$cc_output_temp" | while IFS='|' read -r _ cid cc_name cc_ad cc_state; do
+        # Color-code the status
+        local state_color="$GREEN"
+        case "$cc_state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        printf "${YELLOW}%-6s${NC} ${CYAN}%-40s${NC} ${MAGENTA}%-35s${NC} ${state_color}%-12s${NC}\n" \
+            "$cid" "$cc_name" "$cc_ad" "$cc_state"
     done
     
     rm -f "$cc_output_temp"
@@ -9179,6 +9219,605 @@ delete_single_instance_configuration() {
 }
 
 #--------------------------------------------------------------------------------
+# Manage Compute Clusters - Main menu for compute cluster operations
+#--------------------------------------------------------------------------------
+manage_compute_clusters() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}                                         COMPUTE CLUSTER MANAGEMENT                                              ${NC}"
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        # ========== Show Existing Compute Clusters ==========
+        echo -e "${BOLD}${MAGENTA}─── Existing Compute Clusters ───${NC}"
+        echo ""
+        
+        # Refresh compute cluster cache
+        fetch_compute_clusters "$compartment_id" "$region"
+        
+        # Build array for selection
+        declare -a CC_LIST=()
+        local cc_count=0
+        
+        if [[ -f "$COMPUTE_CLUSTER_CACHE" ]] && [[ -s "$COMPUTE_CLUSTER_CACHE" ]]; then
+            printf "  ${GRAY}%-4s %-45s %-35s %-12s${NC}\n" "#" "Display Name" "Availability Domain" "Status"
+            echo -e "  ${GRAY}──────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+            while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
+                [[ -z "$cc_ocid" || "$cc_ocid" == "#"* ]] && continue
+                
+                # Default state if not present (old cache format)
+                [[ -z "$cc_state" ]] && cc_state="UNKNOWN"
+                
+                # Skip deleted clusters
+                [[ "$cc_state" == "DELETED" ]] && continue
+                ((cc_count++))
+                CC_LIST+=("$cc_ocid|$cc_name|$cc_ad|$cc_state")
+                
+                # Color-code the status
+                local state_color="$GREEN"
+                case "$cc_state" in
+                    ACTIVE) state_color="$GREEN" ;;
+                    CREATING|UPDATING) state_color="$YELLOW" ;;
+                    DELETING) state_color="$RED" ;;
+                    *) state_color="$GRAY" ;;
+                esac
+                
+                printf "  ${YELLOW}%-4s${NC} ${WHITE}%-45s${NC} ${CYAN}%-35s${NC} ${state_color}%-12s${NC}\n" "$cc_count)" "$cc_name" "$cc_ad" "$cc_state"
+            done < <(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null)
+            
+            if [[ $cc_count -eq 0 ]]; then
+                echo -e "  ${GRAY}(No existing compute clusters found)${NC}"
+            else
+                echo ""
+                echo -e "  ${WHITE}Total: ${GREEN}${cc_count}${WHITE} compute cluster(s)${NC}"
+            fi
+        else
+            echo -e "  ${GRAY}(No existing compute clusters found)${NC}"
+        fi
+        echo ""
+        
+        # ========== Menu Options ==========
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo ""
+        echo -e "  ${GREEN}c${NC}) ${WHITE}Create${NC}  - Create a new compute cluster"
+        if [[ $cc_count -gt 0 ]]; then
+            echo -e "  ${RED}d${NC}) ${WHITE}Delete${NC}  - Delete an existing compute cluster"
+            echo -e "  ${CYAN}v${NC}) ${WHITE}View${NC}    - View compute cluster details (enter number)"
+        fi
+        echo -e "  ${CYAN}r${NC}) ${WHITE}Refresh${NC} - Refresh compute cluster list"
+        echo -e "  ${WHITE}b${NC}) ${WHITE}Back${NC}    - Return to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection [c/d/v/r/b] or cluster number: ${NC}"
+        
+        local choice
+        read -r choice
+        
+        case "$choice" in
+            c|C|create|CREATE)
+                create_compute_cluster_interactive
+                ;;
+            d|D|delete|DELETE)
+                if [[ $cc_count -eq 0 ]]; then
+                    echo -e "${YELLOW}No compute clusters available to delete${NC}"
+                    sleep 1
+                else
+                    delete_compute_cluster_interactive
+                fi
+                ;;
+            v|V|view|VIEW)
+                if [[ $cc_count -gt 0 ]]; then
+                    echo -n -e "${CYAN}Enter cluster number to view [1-${cc_count}]: ${NC}"
+                    local view_num
+                    read -r view_num
+                    if [[ "$view_num" =~ ^[0-9]+$ ]] && [[ $view_num -ge 1 ]] && [[ $view_num -le $cc_count ]]; then
+                        local selected="${CC_LIST[$((view_num-1))]}"
+                        local sel_ocid sel_name sel_ad sel_state
+                        IFS='|' read -r sel_ocid sel_name sel_ad sel_state <<< "$selected"
+                        view_compute_cluster_details "$sel_ocid" "$sel_name"
+                    else
+                        echo -e "${RED}Invalid selection${NC}"
+                        sleep 1
+                    fi
+                else
+                    echo -e "${YELLOW}No compute clusters available to view${NC}"
+                    sleep 1
+                fi
+                ;;
+            r|R|refresh|REFRESH)
+                rm -f "$COMPUTE_CLUSTER_CACHE"
+                echo -e "${GREEN}Cache cleared, refreshing...${NC}"
+                sleep 1
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            [0-9]*)
+                # Direct number selection for viewing
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le $cc_count ]]; then
+                    local selected="${CC_LIST[$((choice-1))]}"
+                    local sel_ocid sel_name sel_ad sel_state
+                    IFS='|' read -r sel_ocid sel_name sel_ad sel_state <<< "$selected"
+                    view_compute_cluster_details "$sel_ocid" "$sel_name"
+                else
+                    echo -e "${RED}Invalid selection${NC}"
+                    sleep 1
+                fi
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# View Compute Cluster details
+#--------------------------------------------------------------------------------
+view_compute_cluster_details() {
+    local cc_ocid="$1"
+    local cc_name="$2"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Compute Cluster Details ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}Fetching details for: ${WHITE}${cc_name}${NC}"
+    echo ""
+    
+    local cc_json
+    cc_json=$(oci compute compute-cluster get --compute-cluster-id "$cc_ocid" 2>/dev/null)
+    
+    if [[ -z "$cc_json" ]]; then
+        echo -e "${RED}Failed to fetch compute cluster details${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo "$cc_json" | jq -r '
+        .data | 
+        "  Display Name:        \(.["display-name"] // "N/A")",
+        "  OCID:                \(.id)",
+        "  Availability Domain: \(.["availability-domain"] // "N/A")",
+        "  Lifecycle State:     \(.["lifecycle-state"] // "N/A")",
+        "  Time Created:        \(.["time-created"] // "N/A")"
+    '
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Delete Compute Cluster interactively
+#--------------------------------------------------------------------------------
+delete_compute_cluster_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    echo ""
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}                                       DELETE COMPUTE CLUSTER                                                     ${NC}"
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Fetch and display compute clusters
+    fetch_compute_clusters "$compartment_id" "$region"
+    
+    declare -a CC_LIST=()
+    local cc_count=0
+    
+    if [[ -f "$COMPUTE_CLUSTER_CACHE" ]] && [[ -s "$COMPUTE_CLUSTER_CACHE" ]]; then
+        printf "  ${GRAY}%-4s %-45s %-35s %-12s${NC}\n" "#" "Display Name" "Availability Domain" "Status"
+        echo -e "  ${GRAY}──────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
+            [[ -z "$cc_ocid" || "$cc_ocid" == "#"* ]] && continue
+            
+            # Default state if not present (old cache format)
+            [[ -z "$cc_state" ]] && cc_state="UNKNOWN"
+            
+            # Skip deleted clusters
+            [[ "$cc_state" == "DELETED" ]] && continue
+            ((cc_count++))
+            CC_LIST+=("$cc_ocid|$cc_name|$cc_ad|$cc_state")
+            
+            # Color-code the status
+            local state_color="$GREEN"
+            case "$cc_state" in
+                ACTIVE) state_color="$GREEN" ;;
+                CREATING|UPDATING) state_color="$YELLOW" ;;
+                DELETING) state_color="$RED" ;;
+                *) state_color="$GRAY" ;;
+            esac
+            
+            printf "  ${YELLOW}%-4s${NC} ${WHITE}%-45s${NC} ${CYAN}%-35s${NC} ${state_color}%-12s${NC}\n" "$cc_count)" "$cc_name" "$cc_ad" "$cc_state"
+        done < <(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null)
+    fi
+    
+    if [[ $cc_count -eq 0 ]]; then
+        echo -e "  ${GRAY}(No compute clusters found to delete)${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter cluster number to delete [1-${cc_count}] or 'b' to go back: ${NC}"
+    local del_choice
+    read -r del_choice
+    
+    if [[ "$del_choice" == "b" || "$del_choice" == "B" || -z "$del_choice" ]]; then
+        return
+    fi
+    
+    if ! [[ "$del_choice" =~ ^[0-9]+$ ]] || [[ $del_choice -lt 1 ]] || [[ $del_choice -gt $cc_count ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    local selected="${CC_LIST[$((del_choice-1))]}"
+    local sel_ocid sel_name sel_ad sel_state
+    IFS='|' read -r sel_ocid sel_name sel_ad sel_state <<< "$selected"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Selected Compute Cluster:${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}${sel_name}${NC}"
+    echo -e "  ${CYAN}OCID:${NC}                ${YELLOW}${sel_ocid}${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${sel_ad}${NC}"
+    echo -e "  ${CYAN}Status:${NC}              ${WHITE}${sel_state}${NC}"
+    echo ""
+    
+    # Use global DEBUG_MODE
+    local debug_flag=""
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        debug_flag="--debug"
+    fi
+    
+    # ========== Show Command ==========
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}                                          COMMAND TO EXECUTE                                                     ${NC}"
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    local cmd="oci compute compute-cluster delete \\
+    --compute-cluster-id \"${sel_ocid}\" \\
+    --force"
+    
+    [[ -n "$debug_flag" ]] && cmd="${cmd} \\
+    ${debug_flag}"
+    
+    echo -e "${WHITE}${cmd}${NC}"
+    echo ""
+    
+    # Log file for the action
+    local log_file="compute_cluster_delete_$(date +%Y%m%d_%H%M%S).log"
+    
+    echo -e "${BOLD}${RED}═══ CONFIRM DELETION ═══${NC}"
+    echo ""
+    echo -e "${RED}WARNING: This action cannot be undone!${NC}"
+    echo -e "${WHITE}Log file: ${CYAN}${log_file}${NC}"
+    echo ""
+    echo -n -e "${CYAN}Type 'DELETE' to confirm, or anything else to cancel: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # ========== Execute the Command ==========
+    echo ""
+    echo -e "${YELLOW}Deleting Compute Cluster...${NC}"
+    
+    # Log the command
+    {
+        echo "=========================================="
+        echo "Compute Cluster Deletion"
+        echo "Timestamp: $(date)"
+        echo "=========================================="
+        echo ""
+        echo "Display Name:        ${sel_name}"
+        echo "OCID:                ${sel_ocid}"
+        echo "Availability Domain: ${sel_ad}"
+        echo "Debug Mode:          ${debug_flag:-disabled}"
+        echo ""
+        echo "Command:"
+        echo "oci compute compute-cluster delete \\"
+        echo "    --compute-cluster-id \"${sel_ocid}\" \\"
+        echo "    --force ${debug_flag}"
+        echo ""
+        echo "=========================================="
+        echo "Execution Output:"
+        echo "=========================================="
+    } > "$log_file"
+    
+    local result
+    if [[ -n "$debug_flag" ]]; then
+        result=$(oci compute compute-cluster delete \
+            --compute-cluster-id "${sel_ocid}" \
+            --force \
+            --debug 2>&1)
+    else
+        result=$(oci compute compute-cluster delete \
+            --compute-cluster-id "${sel_ocid}" \
+            --force 2>&1)
+    fi
+    local exit_code=$?
+    
+    # Log the result
+    echo "$result" >> "$log_file"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        echo ""
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                                        COMPUTE CLUSTER DELETED                                                   ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${CYAN}Display Name:${NC} ${WHITE}${sel_name}${NC}"
+        echo -e "  ${CYAN}OCID:${NC}         ${YELLOW}${sel_ocid}${NC}"
+        echo ""
+        echo -e "  ${WHITE}Log file: ${CYAN}${log_file}${NC}"
+        echo ""
+        
+        # Invalidate compute cluster cache
+        rm -f "$COMPUTE_CLUSTER_CACHE"
+        echo -e "${GRAY}(Compute cluster cache cleared)${NC}"
+        
+        # Log success
+        {
+            echo ""
+            echo "=========================================="
+            echo "Result: SUCCESS"
+            echo "=========================================="
+        } >> "$log_file"
+    else
+        echo ""
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                                      COMPUTE CLUSTER DELETION FAILED                                            ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}Error:${NC}"
+        echo "$result"
+        echo ""
+        echo -e "  ${WHITE}Log file: ${CYAN}${log_file}${NC}"
+        
+        # Log failure
+        {
+            echo ""
+            echo "=========================================="
+            echo "Result: FAILED"
+            echo "Exit Code: ${exit_code}"
+            echo "=========================================="
+        } >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Create Compute Cluster interactively
+#--------------------------------------------------------------------------------
+create_compute_cluster_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    local selected_ad="${AD:-}"
+    local shape_name="${SHAPE_NAME:-GPU}"
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                       CREATE COMPUTE CLUSTER                                                    ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Validate required variables
+    local missing_vars=""
+    [[ -z "$compartment_id" ]] && missing_vars+="COMPARTMENT_ID "
+    [[ -z "$selected_ad" ]] && missing_vars+="AD "
+    
+    if [[ -n "$missing_vars" ]]; then
+        echo -e "${RED}Missing required variables in variables.sh:${NC}"
+        echo -e "${YELLOW}  $missing_vars${NC}"
+        echo ""
+        echo -e "${WHITE}Please run ${CYAN}--setup${WHITE} or manually configure variables.sh${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    echo -e "${BOLD}${WHITE}Current Environment:${NC}"
+    echo -e "  ${CYAN}Region:${NC}              ${WHITE}${region}${NC}"
+    echo -e "  ${CYAN}Compartment:${NC}         ${YELLOW}${compartment_id}${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${selected_ad}${NC}"
+    echo -e "  ${CYAN}Shape:${NC}               ${WHITE}${shape_name}${NC}"
+    [[ "$DEBUG_MODE" == "true" ]] && echo -e "  ${CYAN}Debug Mode:${NC}          ${YELLOW}ENABLED${NC}"
+    echo ""
+    
+    # ========== Enter Display Name ==========
+    echo -e "${BOLD}${MAGENTA}─── Compute Cluster Display Name ───${NC}"
+    echo ""
+    
+    # Default name based on shape from variables.sh
+    local default_name="${shape_name}-Compute-Cluster"
+    echo -e "${WHITE}Common naming patterns:${NC}"
+    echo -e "  ${GRAY}- <shape>-Compute-Cluster (e.g., BM.GPU.H100.8-Compute-Cluster)${NC}"
+    echo -e "  ${GRAY}- <project>-cc-<ad> (e.g., ml-training-cc-ad1)${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Enter display name [${default_name}]: ${NC}"
+    local display_name
+    read -r display_name
+    
+    [[ -z "$display_name" ]] && display_name="$default_name"
+    
+    echo -e "${GREEN}✓ Display Name: ${WHITE}${display_name}${NC}"
+    echo ""
+    
+    # Use global DEBUG_MODE (set via --debug command line flag)
+    local debug_flag=""
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        debug_flag="--debug"
+    fi
+    
+    # ========== Show Command and Confirm ==========
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}                                          COMMAND TO EXECUTE                                                     ${NC}"
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    local cmd="oci compute compute-cluster create \\
+    --availability-domain \"${selected_ad}\" \\
+    --compartment-id \"${compartment_id}\" \\
+    --display-name \"${display_name}\""
+    
+    [[ -n "$debug_flag" ]] && cmd="${cmd} \\
+    ${debug_flag}"
+    
+    echo -e "${WHITE}${cmd}${NC}"
+    echo ""
+    
+    # Log file for the action
+    local log_file="compute_cluster_create_$(date +%Y%m%d_%H%M%S).log"
+    
+    echo -e "${BOLD}${RED}═══ CONFIRM CREATION ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}This will create a new Compute Cluster.${NC}"
+    echo -e "${WHITE}Log file: ${CYAN}${log_file}${NC}"
+    echo ""
+    echo -n -e "${CYAN}Type 'CREATE' to confirm, or anything else to cancel: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "CREATE" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return 0
+    fi
+    
+    # ========== Execute the Command ==========
+    echo ""
+    echo -e "${YELLOW}Creating Compute Cluster...${NC}"
+    
+    # Log the command
+    {
+        echo "=========================================="
+        echo "Compute Cluster Creation"
+        echo "Timestamp: $(date)"
+        echo "=========================================="
+        echo ""
+        echo "Display Name:        ${display_name}"
+        echo "Availability Domain: ${selected_ad}"
+        echo "Compartment ID:      ${compartment_id}"
+        echo "Region:              ${region}"
+        echo "Debug Mode:          ${debug_flag:-disabled}"
+        echo ""
+        echo "Command:"
+        echo "oci compute compute-cluster create \\"
+        echo "    --availability-domain \"${selected_ad}\" \\"
+        echo "    --compartment-id \"${compartment_id}\" \\"
+        echo "    --display-name \"${display_name}\" ${debug_flag}"
+        echo ""
+        echo "=========================================="
+        echo "Execution Output:"
+        echo "=========================================="
+    } > "$log_file"
+    
+    local result
+    if [[ -n "$debug_flag" ]]; then
+        result=$(oci compute compute-cluster create \
+            --availability-domain "${selected_ad}" \
+            --compartment-id "${compartment_id}" \
+            --display-name "${display_name}" \
+            --debug 2>&1)
+    else
+        result=$(oci compute compute-cluster create \
+            --availability-domain "${selected_ad}" \
+            --compartment-id "${compartment_id}" \
+            --display-name "${display_name}" 2>&1)
+    fi
+    local exit_code=$?
+    
+    # Log the result
+    echo "$result" >> "$log_file"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        local new_ocid
+        new_ocid=$(echo "$result" | jq -r '.data.id // empty' 2>/dev/null)
+        local new_state
+        new_state=$(echo "$result" | jq -r '.data["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+        
+        echo ""
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                                        COMPUTE CLUSTER CREATED                                                  ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}${display_name}${NC}"
+        echo -e "  ${CYAN}OCID:${NC}                ${YELLOW}${new_ocid}${NC}"
+        echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${selected_ad}${NC}"
+        echo -e "  ${CYAN}State:${NC}               ${GREEN}${new_state}${NC}"
+        echo ""
+        echo -e "  ${WHITE}Log file: ${CYAN}${log_file}${NC}"
+        echo ""
+        
+        # Invalidate compute cluster cache
+        rm -f "$COMPUTE_CLUSTER_CACHE"
+        echo -e "${GRAY}(Compute cluster cache cleared - will refresh on next access)${NC}"
+        
+        # Log success
+        {
+            echo ""
+            echo "=========================================="
+            echo "Result: SUCCESS"
+            echo "New OCID: ${new_ocid}"
+            echo "State: ${new_state}"
+            echo "=========================================="
+        } >> "$log_file"
+    else
+        echo ""
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                                      COMPUTE CLUSTER CREATION FAILED                                            ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}Error:${NC}"
+        echo "$result"
+        echo ""
+        echo -e "  ${WHITE}Log file: ${CYAN}${log_file}${NC}"
+        
+        # Log failure
+        {
+            echo ""
+            echo "=========================================="
+            echo "Result: FAILED"
+            echo "Exit Code: ${exit_code}"
+            echo "=========================================="
+        } >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
 # Create Instance Configuration interactively
 #--------------------------------------------------------------------------------
 create_instance_configuration_interactive() {
@@ -9202,7 +9841,6 @@ create_instance_configuration_interactive() {
     [[ -z "$ad" ]] && missing_vars+="AD "
     [[ -z "$worker_subnet" ]] && missing_vars+="WORKER_SUBNET_ID "
     [[ -z "$worker_nsg" ]] && missing_vars+="WORKER_SUBNET_NSG_ID "
-    [[ -z "$image_id" ]] && missing_vars+="IMAGE_ID "
     
     if [[ -n "$missing_vars" ]]; then
         echo -e "${RED}Missing required variables in variables.sh:${NC}"
@@ -9221,7 +9859,11 @@ create_instance_configuration_interactive() {
     echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${ad}${NC}"
     echo -e "  ${CYAN}Worker Subnet:${NC}    ${YELLOW}...${worker_subnet: -20}${NC}"
     echo -e "  ${CYAN}Worker NSG:${NC}       ${YELLOW}...${worker_nsg: -20}${NC}"
-    echo -e "  ${CYAN}Image ID:${NC}         ${YELLOW}...${image_id: -20}${NC}"
+    if [[ -n "$image_id" ]]; then
+        echo -e "  ${CYAN}Image ID:${NC}         ${YELLOW}...${image_id: -20}${NC}"
+    else
+        echo -e "  ${CYAN}Image ID:${NC}         ${GRAY}(will select after shape)${NC}"
+    fi
     echo ""
     
     # ========== STEP 1: Cloud-init file selection ==========
@@ -9232,10 +9874,20 @@ create_instance_configuration_interactive() {
     local cwd
     cwd=$(pwd)
     
-    # Check for cloud-init files in current directory
+    # Check for cloud-init files in current directory (using associative array to avoid duplicates)
+    declare -A found_files_map
     local found_files=()
+    
+    # First pass: collect all matching files, using basename as key to prevent duplicates
     for f in "$cwd"/*.yml "$cwd"/*.yaml "$cwd"/cloud-init*; do
-        [[ -f "$f" ]] && found_files+=("$f")
+        [[ -f "$f" ]] || continue
+        local bname
+        bname=$(basename "$f")
+        # Only add if not already in map
+        if [[ -z "${found_files_map[$bname]:-}" ]]; then
+            found_files_map[$bname]="$f"
+            found_files+=("$f")
+        fi
     done
     
     if [[ ${#found_files[@]} -gt 0 ]]; then
@@ -9311,7 +9963,7 @@ create_instance_configuration_interactive() {
     case "$net_choice" in
         2|native|NATIVE)
             network_type="native"
-            max_pods="31"  # Native networking typically has lower pod limit
+            max_pods="60"
             ;;
         *)
             network_type="flannel"
@@ -9358,12 +10010,118 @@ create_instance_configuration_interactive() {
     esac
     echo -e "${GREEN}✓ Shape: ${WHITE}${shape_name}${NC}"
     
+    # ========== STEP 3b: Image Selection ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 3b: Image Selection ───${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}Fetching compatible images for ${WHITE}${shape_name}${YELLOW}...${NC}"
+    
+    # Fetch compatible images for the shape
+    local images_json
+    images_json=$(oci compute image list \
+        --compartment-id "$compartment_id" \
+        --shape "$shape_name" \
+        --lifecycle-state "AVAILABLE" \
+        --sort-by "TIMECREATED" \
+        --sort-order "DESC" \
+        --limit 15 \
+        --output json 2>/dev/null)
+    
+    local images_count=0
+    [[ -n "$images_json" ]] && images_count=$(echo "$images_json" | jq -r '.data | length' 2>/dev/null) || images_count=0
+    [[ ! "$images_count" =~ ^[0-9]+$ ]] && images_count=0
+    
+    if [[ $images_count -eq 0 ]]; then
+        if [[ -z "$image_id" ]]; then
+            echo -e "${RED}No compatible images found and no IMAGE_ID in variables.sh${NC}"
+            echo -e "${WHITE}Please set IMAGE_ID in variables.sh or choose a different shape.${NC}"
+            echo ""
+            echo -e "Press Enter to return..."
+            read -r
+            return 1
+        fi
+        echo -e "${YELLOW}No compatible images found for ${WHITE}${shape_name}${NC}"
+        echo -e "${WHITE}Using IMAGE_ID from variables.sh: ${YELLOW}...${image_id: -30}${NC}"
+        echo ""
+        echo -n -e "${CYAN}Continue with this image? [Y/n]: ${NC}"
+        local img_confirm
+        read -r img_confirm
+        if [[ "$img_confirm" =~ ^[Nn] ]]; then
+            echo -e "${YELLOW}Cancelled.${NC}"
+            echo -e "Press Enter to return..."
+            read -r
+            return 1
+        fi
+    else
+        echo ""
+        echo -e "${WHITE}Compatible images for ${CYAN}${shape_name}${WHITE}:${NC}"
+        echo ""
+        
+        # Build array of images
+        declare -a IMAGE_LIST=()
+        local img_idx=0
+        
+        printf "  ${GRAY}%-4s %-70s %-20s${NC}\n" "#" "Image Name" "OS Version"
+        echo -e "  ${GRAY}────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        
+        while IFS='|' read -r img_ocid img_name img_os img_os_ver; do
+            [[ -z "$img_ocid" ]] && continue
+            ((img_idx++))
+            IMAGE_LIST+=("$img_ocid")
+            
+            # Truncate name if too long
+            local display_name="${img_name:0:68}"
+            [[ ${#img_name} -gt 68 ]] && display_name="${display_name}..."
+            
+            printf "  ${YELLOW}%-4s${NC} ${WHITE}%-70s${NC} ${CYAN}%-20s${NC}\n" "${img_idx})" "$display_name" "$img_os_ver"
+        done < <(echo "$images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["operating-system"] // "N/A")|\(.["operating-system-version"] // "N/A")"' 2>/dev/null)
+        
+        echo ""
+        if [[ -n "$image_id" ]]; then
+            echo -e "  ${GREEN}0${NC}) Use IMAGE_ID from variables.sh: ${YELLOW}...${image_id: -25}${NC} ${WHITE}(default)${NC}"
+            echo ""
+            echo -n -e "${CYAN}Select image [0]: ${NC}"
+        else
+            echo -n -e "${CYAN}Select image [1]: ${NC}"
+        fi
+        local img_choice
+        read -r img_choice
+        
+        # Default based on whether IMAGE_ID exists
+        if [[ -z "$img_choice" ]]; then
+            if [[ -n "$image_id" ]]; then
+                img_choice="0"
+            else
+                img_choice="1"
+            fi
+        fi
+        
+        if [[ "$img_choice" == "0" ]] && [[ -n "$image_id" ]]; then
+            echo -e "${GREEN}✓ Using IMAGE_ID from variables.sh${NC}"
+        elif [[ "$img_choice" =~ ^[0-9]+$ ]] && [[ $img_choice -ge 1 ]] && [[ $img_choice -le ${#IMAGE_LIST[@]} ]]; then
+            image_id="${IMAGE_LIST[$((img_choice-1))]}"
+            echo -e "${GREEN}✓ Selected image: ${WHITE}...${image_id: -30}${NC}"
+        else
+            echo -e "${RED}Invalid selection${NC}"
+            if [[ -n "$image_id" ]]; then
+                echo -e "${YELLOW}Using IMAGE_ID from variables.sh${NC}"
+            else
+                echo -e "${RED}No valid image selected. Aborting.${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return 1
+            fi
+        fi
+    fi
+    echo ""
+    
     # ========== STEP 4: Boot Volume Configuration ==========
     echo ""
     echo -e "${BOLD}${MAGENTA}─── Step 4: Boot Volume Configuration ───${NC}"
     echo ""
     
-    local boot_volume_size="4096"
+    local boot_volume_size="512"
     echo -n -e "${CYAN}Boot volume size in GB [${boot_volume_size}]: ${NC}"
     local bv_size_input
     read -r bv_size_input
@@ -9406,7 +10164,9 @@ create_instance_configuration_interactive() {
     local base_pattern="${shape_name}-ic-oke-${network_type}"
     local existing_count=0
     if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null) || existing_count=0
+        # Ensure we have a valid number
+        [[ ! "$existing_count" =~ ^[0-9]+$ ]] && existing_count=0
     fi
     local next_num=$((existing_count + 1))
     
@@ -9571,13 +10331,22 @@ create_instance_configuration_interactive() {
 EOF
 )
     
+    echo -e "${BOLD}${YELLOW}─── Configuration Summary ───${NC}"
+    echo ""
+    echo -e "  ${CYAN}Shape:${NC}       ${WHITE}${shape_name}${NC}"
+    echo -e "  ${CYAN}Image:${NC}       ${WHITE}...${image_id: -40}${NC}"
+    echo -e "  ${CYAN}Boot Vol:${NC}    ${WHITE}${boot_volume_size} GB @ ${boot_volume_vpus} VPUs/GB${NC}"
+    echo -e "  ${CYAN}Max Pods:${NC}    ${WHITE}${max_pods}${NC}"
+    echo -e "  ${CYAN}Network:${NC}     ${WHITE}${network_type}${NC}"
+    echo ""
+    
     echo -e "${BOLD}${YELLOW}─── Command to Execute ───${NC}"
     echo ""
-    echo -e "${WHITE}oci --region \"${region}\" \\${NC}"
-    echo -e "${WHITE}  compute-management instance-configuration create \\${NC}"
-    echo -e "${WHITE}  --compartment-id \"${compartment_id}\" \\${NC}"
-    echo -e "${WHITE}  --display-name \"${display_name}\" \\${NC}"
-    echo -e "${WHITE}  --instance-details '<JSON payload with ${#base64_cloud_init} char user_data>'${NC}"
+    printf "%s\n" "oci --region \"${region}\" \\"
+    printf "%s\n" "  compute-management instance-configuration create \\"
+    printf "%s\n" "  --compartment-id \"${compartment_id}\" \\"
+    printf "%s\n" "  --display-name \"${display_name}\" \\"
+    printf "%s\n" "  --instance-details '<JSON payload with ${#base64_cloud_init} char user_data>'"
     echo ""
     
     # Log file for the action
@@ -9612,6 +10381,7 @@ EOF
         echo ""
         echo "Display Name: ${display_name}"
         echo "Shape: ${shape_name}"
+        echo "Image ID: ${image_id}"
         echo "Network Type: ${network_type}"
         echo "Boot Volume: ${boot_volume_size} GB @ ${boot_volume_vpus} VPUs/GB"
         echo "Max Pods: ${max_pods}"
@@ -9862,6 +10632,7 @@ show_help() {
     echo -e "${BOLD}Global Options:${NC}"
     echo "  --compartment-id <ocid>   Override compartment ID from variables.sh"
     echo "  --region <region>         Override region from variables.sh"
+    echo "  --debug                   Enable debug mode for OCI CLI commands (verbose output)"
     echo ""
     echo -e "${BOLD}Instance Options:${NC}"
     echo "  --labels           Show all labels for the node"
@@ -9914,6 +10685,7 @@ show_help() {
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
     echo "  $0 --cliques-summary                                  # Summary table of cliques with fabric"
     echo "  $0 --manage                                           # Interactive resource management"
+    echo "  $0 --manage --debug                                   # Resource management with debug output"
     echo "  $0 --setup                                            # Run initial setup wizard"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx                 # Basic node info"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --labels        # Show labels"
@@ -10474,6 +11246,10 @@ main() {
                     log_error "--region requires a value"
                     exit 1
                 fi
+                ;;
+            --debug)
+                DEBUG_MODE=true
+                i=$((i + 1))
                 ;;
             *)
                 new_args+=("${args[$i]}")
