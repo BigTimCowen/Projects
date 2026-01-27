@@ -461,8 +461,8 @@ fetch_compute_clusters() {
                 --all \
                 --output json > "$raw_json" 2>/dev/null; then
             
-            # Try .data[] first (standard format), fallback to .data.items[] (paginated format)
-            jq -r '(.data // .data.items // [])[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
+            # OCI returns .data.items[] for paginated results
+            jq -r '(.data.items // .data // [])[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
         fi
         
         rm -f "$raw_json"
