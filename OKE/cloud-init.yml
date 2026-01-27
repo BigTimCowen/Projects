@@ -1,0 +1,19 @@
+#cloud-config
+apt:
+  sources:
+    oke-node: {source: 'deb [trusted=yes] https://objectstorage.us-sanjose-1.oraclecloud.com/p/_Zaa2khW3lPESEbqZ2JB3FijAd0HeKmiP-KA2eOMuWwro85dcG2WAqua2o_a-PlZ/n/odx-oke/b/okn-repositories-private/o/prod/ubuntu-jammy/kubernetes-1.`<oke version>` stable main'}
+packages:
+  - oci-oke-node-all-<oke_version>
+write_files:
+  - path: /etc/oke/oke-apiserver
+    permissions: '0644'
+    content: <api_server_host>
+  - encoding: b64
+    path: /etc/kubernetes/ca.crt
+    permissions: '0644'
+    content: <api_server_key>
+runcmd:
+  - systemctl disable --now nvidia-imex.service && systemctl mask nvidia-imex.service
+  - oke bootstrap --apiserver-host <api_server_host> --ca "<api_server_key" --kubelet-extra-args "--feature-gates=DynamicResourceAllocation=true --register-with-taints=newNode=true:NoSchedule"
+ssh_authorized_keys:
+  - ssh-rsa

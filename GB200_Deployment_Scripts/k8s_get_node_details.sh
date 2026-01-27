@@ -2561,25 +2561,13 @@ get_node_info() {
     fetch_capacity_topology
     build_announcement_lookup "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     
-    # Get Kubernetes node info
-    local node_json
-    node_json=$(kubectl get nodes -o json 2>/dev/null)
-    
-    local node_name
-    node_name=$(echo "$node_json" | jq -r --arg id "$instance_id" '.items[] | select(.spec.providerID==$id) | .metadata.name')
-    
-    if [[ -z "$node_name" ]]; then
-        log_error "Could not find Kubernetes node for instance OCID: $instance_id"
-        return 1
-    fi
-    
-    # Get OCI instance details
+    # Get OCI instance details FIRST
     log_info "Fetching OCI instance details..."
     local oci_instance_json
     oci_instance_json=$(oci compute instance get --instance-id "$instance_id" --output json 2>/dev/null)
     
-    if [[ -z "$oci_instance_json" ]]; then
-        log_error "Failed to fetch OCI instance details"
+    if [[ -z "$oci_instance_json" ]] || ! echo "$oci_instance_json" | jq -e '.data' > /dev/null 2>&1; then
+        log_error "Could not find instance in OCI: $instance_id"
         return 1
     fi
     
@@ -2593,21 +2581,45 @@ get_node_info() {
     gpu_memory_cluster=$(echo "$oci_instance_json" | jq -r '.data["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A"')
     time_created=$(echo "$oci_instance_json" | jq -r '.data["time-created"] // "N/A"')
     
-    # Extract Kubernetes node fields
-    local node_data
-    node_data=$(echo "$node_json" | jq --arg name "$node_name" '.items[] | select(.metadata.name==$name)')
+    # Try to get Kubernetes node info (optional - may not exist)
+    local node_json node_name node_data
+    local in_kubernetes="false"
+    node_json=$(kubectl get nodes -o json 2>/dev/null)
     
+    if [[ -n "$node_json" ]]; then
+        node_name=$(echo "$node_json" | jq -r --arg id "$instance_id" '.items[] | select(.spec.providerID==$id) | .metadata.name')
+        if [[ -n "$node_name" ]]; then
+            in_kubernetes="true"
+            node_data=$(echo "$node_json" | jq --arg name "$node_name" '.items[] | select(.metadata.name==$name)')
+        fi
+    fi
+    
+    # Extract Kubernetes node fields (defaults if not in K8s)
     local node_state clique_id gpu_count gpu_product gpu_memory
     local kubelet_version os_image kernel_version container_runtime
-    node_state=$(get_node_state_cached "$instance_id")
-    clique_id=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.clique"] // "N/A"')
-    gpu_count=$(echo "$node_data" | jq -r '.status.capacity["nvidia.com/gpu"] // "N/A"')
-    gpu_product=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.product"] // "N/A"')
-    gpu_memory=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.memory"] // "N/A"')
-    kubelet_version=$(echo "$node_data" | jq -r '.status.nodeInfo.kubeletVersion // "N/A"')
-    os_image=$(echo "$node_data" | jq -r '.status.nodeInfo.osImage // "N/A"')
-    kernel_version=$(echo "$node_data" | jq -r '.status.nodeInfo.kernelVersion // "N/A"')
-    container_runtime=$(echo "$node_data" | jq -r '.status.nodeInfo.containerRuntimeVersion // "N/A"')
+    
+    if [[ "$in_kubernetes" == "true" ]]; then
+        node_state=$(get_node_state_cached "$instance_id")
+        clique_id=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.clique"] // "N/A"')
+        gpu_count=$(echo "$node_data" | jq -r '.status.capacity["nvidia.com/gpu"] // "N/A"')
+        gpu_product=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.product"] // "N/A"')
+        gpu_memory=$(echo "$node_data" | jq -r '.metadata.labels["nvidia.com/gpu.memory"] // "N/A"')
+        kubelet_version=$(echo "$node_data" | jq -r '.status.nodeInfo.kubeletVersion // "N/A"')
+        os_image=$(echo "$node_data" | jq -r '.status.nodeInfo.osImage // "N/A"')
+        kernel_version=$(echo "$node_data" | jq -r '.status.nodeInfo.kernelVersion // "N/A"')
+        container_runtime=$(echo "$node_data" | jq -r '.status.nodeInfo.containerRuntimeVersion // "N/A"')
+    else
+        node_name="NOT IN KUBERNETES"
+        node_state="N/A"
+        clique_id="N/A"
+        gpu_count="N/A"
+        gpu_product="N/A"
+        gpu_memory="N/A"
+        kubelet_version="N/A"
+        os_image="N/A"
+        kernel_version="N/A"
+        container_runtime="N/A"
+    fi
     
     # Get additional states
     local cap_topo_state announcements
@@ -2659,25 +2671,35 @@ get_node_info() {
     
     # Kubernetes Node section
     echo -e "${BOLD}${CYAN}=== Kubernetes Node ===${NC}"
-    echo -e "  ${WHITE}Node Name:${NC}         ${GREEN}$node_name${NC}"
-    
-    local node_state_color
-    node_state_color=$(color_node_state "$node_state")
-    echo -e "  ${WHITE}Node State:${NC}        ${node_state_color}${node_state}${NC}"
-    
-    echo -e "  ${WHITE}Kubelet Version:${NC}   $kubelet_version"
-    echo -e "  ${WHITE}OS Image:${NC}          $os_image"
-    echo -e "  ${WHITE}Kernel:${NC}            $kernel_version"
-    echo -e "  ${WHITE}Container Runtime:${NC} $container_runtime"
+    if [[ "$in_kubernetes" == "true" ]]; then
+        echo -e "  ${WHITE}Node Name:${NC}         ${GREEN}$node_name${NC}"
+        
+        local node_state_color
+        node_state_color=$(color_node_state "$node_state")
+        echo -e "  ${WHITE}Node State:${NC}        ${node_state_color}${node_state}${NC}"
+        
+        echo -e "  ${WHITE}Kubelet Version:${NC}   $kubelet_version"
+        echo -e "  ${WHITE}OS Image:${NC}          $os_image"
+        echo -e "  ${WHITE}Kernel:${NC}            $kernel_version"
+        echo -e "  ${WHITE}Container Runtime:${NC} $container_runtime"
+    else
+        echo -e "  ${YELLOW}Instance has not joined the Kubernetes cluster${NC}"
+        echo -e "  ${GRAY}Use --console-history to check boot logs for issues${NC}"
+    fi
     echo ""
     
     # GPU Information section
     echo -e "${BOLD}${CYAN}=== GPU Information ===${NC}"
-    echo -e "  ${WHITE}GPU Count:${NC}         $gpu_count"
-    echo -e "  ${WHITE}GPU Product:${NC}       $gpu_product"
-    echo -e "  ${WHITE}GPU Memory:${NC}        $gpu_memory MB"
-    echo -e "  ${WHITE}GPU Clique ID:${NC}     ${YELLOW}$clique_id${NC}"
-    echo -e "  ${WHITE}Clique Size:${NC}       $clique_size nodes"
+    if [[ "$in_kubernetes" == "true" ]]; then
+        echo -e "  ${WHITE}GPU Count:${NC}         $gpu_count"
+        echo -e "  ${WHITE}GPU Product:${NC}       $gpu_product"
+        echo -e "  ${WHITE}GPU Memory:${NC}        $gpu_memory MB"
+        echo -e "  ${WHITE}GPU Clique ID:${NC}     ${YELLOW}$clique_id${NC}"
+        echo -e "  ${WHITE}Clique Size:${NC}       $clique_size nodes"
+    else
+        echo -e "  ${YELLOW}GPU information not available (instance not in K8s)${NC}"
+        echo -e "  ${WHITE}Shape:${NC}             $shape"
+    fi
     echo ""
     
     # GPU Memory Cluster section
@@ -2762,17 +2784,23 @@ get_node_info() {
     
     # Optional: Show Labels
     if [[ "$show_labels" == "true" ]]; then
-        echo -e "${BOLD}${CYAN}=== All Kubernetes Labels ===${NC}"
-        echo "$node_data" | jq -r '.metadata.labels | to_entries | sort_by(.key) | .[] | "  \(.key): \(.value)"'
-        echo ""
-        
-        echo -e "${BOLD}${CYAN}=== GPU Labels Only ===${NC}"
-        echo "$node_data" | jq -r '.metadata.labels | to_entries | map(select(.key | contains("nvidia.com/gpu"))) | sort_by(.key) | .[] | "  \(.key): \(.value)"'
-        echo ""
+        if [[ "$in_kubernetes" == "true" ]]; then
+            echo -e "${BOLD}${CYAN}=== All Kubernetes Labels ===${NC}"
+            echo "$node_data" | jq -r '.metadata.labels | to_entries | sort_by(.key) | .[] | "  \(.key): \(.value)"'
+            echo ""
+            
+            echo -e "${BOLD}${CYAN}=== GPU Labels Only ===${NC}"
+            echo "$node_data" | jq -r '.metadata.labels | to_entries | map(select(.key | contains("nvidia.com/gpu"))) | sort_by(.key) | .[] | "  \(.key): \(.value)"'
+            echo ""
+        else
+            echo -e "${BOLD}${CYAN}=== Kubernetes Labels ===${NC}"
+            echo -e "  ${YELLOW}Instance not in Kubernetes - no labels available${NC}"
+            echo ""
+        fi
     fi
     
     # Optional: Count Clique Members
-    if [[ "$count_clique" == "true" && "$clique_id" != "N/A" && "$clique_id" != "null" ]]; then
+    if [[ "$count_clique" == "true" && "$clique_id" != "N/A" && "$clique_id" != "null" && "$in_kubernetes" == "true" ]]; then
         echo -e "${BOLD}${CYAN}=== Nodes in Same Clique (${clique_id}) ===${NC}"
         echo ""
         
@@ -2841,6 +2869,10 @@ get_node_info() {
         
         unset cluster_nodes
         rm -f "$oci_data"
+    elif [[ "$count_clique" == "true" && "$in_kubernetes" != "true" ]]; then
+        echo -e "${BOLD}${CYAN}=== Clique Information ===${NC}"
+        echo -e "  ${YELLOW}Instance not in Kubernetes - clique information not available${NC}"
+        echo ""
     fi
     
     return 0
@@ -3211,10 +3243,11 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}1${NC}) ${WHITE}OKE Cluster Environment${NC}       - View OKE cluster details, VCN, and compute cluster"
         echo -e "  ${GREEN}2${NC}) ${WHITE}Network Resources${NC}             - View subnets and NSGs grouped by function"
         echo -e "  ${GREEN}3${NC}) ${WHITE}GPU Memory Fabrics & Clusters${NC} - Manage GPU memory fabrics and clusters"
+        echo -e "  ${GREEN}4${NC}) ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
         echo ""
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-3, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-4, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3235,13 +3268,16 @@ interactive_management_main_menu() {
             3)
                 interactive_gpu_management
                 ;;
+            4)
+                manage_compute_instances
+                ;;
             q|Q|quit|QUIT|exit|EXIT)
                 echo ""
                 echo -e "${GREEN}Exiting management mode${NC}"
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1, 2, 3, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-4, or q.${NC}"
                 ;;
         esac
     done
@@ -4724,6 +4760,677 @@ view_network_resource_detail() {
 }
 
 #===============================================================================
+# COMPUTE INSTANCE MANAGEMENT
+#===============================================================================
+
+manage_compute_instances() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}                                                         COMPUTE INSTANCE MANAGEMENT                                                                    ${NC}"
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        # Fetch instances
+        log_info "Fetching instances from OCI..."
+        local instances_json
+        instances_json=$(oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null)
+        
+        if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+            echo -e "${RED}Failed to fetch instances${NC}"
+            echo ""
+            echo -e "Press Enter to return..."
+            read -r
+            return
+        fi
+        
+        # Build instance index map
+        declare -A INSTANCE_INDEX_MAP=()
+        local instance_idx=0
+        
+        # Clear any old temp file
+        rm -f /tmp/instance_map_$$
+        
+        # Fetch K8s nodes once for lookup
+        local k8s_nodes_json
+        k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[] | "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)"' 2>/dev/null)
+        
+        # Display instances table
+        echo -e "${BOLD}${WHITE}═══ Instances ═══${NC}"
+        echo ""
+        printf "${BOLD}%-5s %-32s %-12s %-8s %-26s %-15s %-50s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "Shape" "Avail Domain" "Instance OCID"
+        print_separator 155
+        
+        echo "$instances_json" | jq -r '
+            .data[] | 
+            select(.["lifecycle-state"] != "TERMINATED") |
+            "\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["availability-domain"])|\(.id)"
+        ' 2>/dev/null | sort | while IFS='|' read -r name state shape ad ocid; do
+            ((instance_idx++))
+            local iid="i${instance_idx}"
+            
+            # Store in map (need to use a temp file since we're in a subshell)
+            echo "${iid}|${ocid}" >> /tmp/instance_map_$$
+            
+            # Color state
+            local state_color="$GREEN"
+            case "$state" in
+                RUNNING) state_color="$GREEN" ;;
+                STOPPED) state_color="$RED" ;;
+                STARTING|STOPPING) state_color="$YELLOW" ;;
+                PROVISIONING) state_color="$CYAN" ;;
+                *) state_color="$WHITE" ;;
+            esac
+            
+            # Check if in K8s
+            local k8s_status="No"
+            local k8s_color="$YELLOW"
+            if echo "$k8s_nodes_json" | grep -q "$ocid"; then
+                local k8s_ready
+                k8s_ready=$(echo "$k8s_nodes_json" | grep "$ocid" | cut -d'|' -f3)
+                if [[ "$k8s_ready" == "True" ]]; then
+                    k8s_status="Ready"
+                    k8s_color="$GREEN"
+                else
+                    k8s_status="NotRdy"
+                    k8s_color="$RED"
+                fi
+            fi
+            
+            # Truncate long fields
+            local name_trunc="${name:0:32}"
+            local shape_trunc="${shape:0:26}"
+            local ad_short="${ad##*:}"
+            # Show last 47 chars of OCID (enough to be useful)
+            local ocid_short="...${ocid: -47}"
+            
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} %-26s %-15s ${GRAY}%-50s${NC}\n" \
+                "$iid" "$name_trunc" "$state" "$k8s_status" "$shape_trunc" "$ad_short" "$ocid_short"
+        done
+        
+        # Read map from temp file
+        if [[ -f /tmp/instance_map_$$ ]]; then
+            while IFS='|' read -r iid ocid; do
+                INSTANCE_INDEX_MAP[$iid]="$ocid"
+            done < /tmp/instance_map_$$
+            rm -f /tmp/instance_map_$$
+        fi
+        
+        local total_instances=${#INSTANCE_INDEX_MAP[@]}
+        echo ""
+        echo -e "${GRAY}Total: ${total_instances} instances (excluding TERMINATED)${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo -e "  ${YELLOW}i#${NC}      - View instance details (e.g., 'i1', 'i5')"
+        echo -e "  ${YELLOW}ocid1...${NC} - View instance by OCID directly"
+        echo -e "  ${MAGENTA}refresh${NC} - Refresh instance list"
+        echo -e "  ${CYAN}back${NC}    - Return to main menu"
+        echo ""
+        echo -e "${GRAY}Tip: From command line, use:${NC}"
+        echo -e "${GRAY}  $0 <instance-ocid>                  # Basic info (OCI + K8s)${NC}"
+        echo -e "${GRAY}  $0 <instance-ocid> --details        # Full details (network, volumes)${NC}"
+        echo -e "${GRAY}  $0 <instance-ocid> --console-history # Boot logs (debug cloud-init)${NC}"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection [i#/ocid/refresh/back]: ${NC}"
+        
+        local input
+        read -r input
+        
+        # Empty input goes back
+        if [[ -z "$input" ]]; then
+            return
+        fi
+        
+        case "$input" in
+            refresh|REFRESH)
+                echo -e "${YELLOW}Refreshing...${NC}"
+                ;;
+            quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
+                return
+                ;;
+            i[0-9]*)
+                local instance_ocid="${INSTANCE_INDEX_MAP[$input]:-}"
+                if [[ -z "$instance_ocid" ]]; then
+                    echo -e "${RED}Invalid instance ID: $input${NC}"
+                    sleep 1
+                else
+                    display_instance_details "$instance_ocid"
+                    instance_actions_menu "$instance_ocid"
+                fi
+                ;;
+            ocid1.instance.*)
+                # Direct OCID input
+                display_instance_details "$input"
+                instance_actions_menu "$input"
+                ;;
+            *)
+                echo -e "${RED}Unknown command: $input${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Instance Actions Menu - Reboot, Terminate, etc.
+#--------------------------------------------------------------------------------
+instance_actions_menu() {
+    local instance_ocid="$1"
+    
+    # Get instance name for display
+    local instance_name
+    instance_name=$(oci compute instance get --instance-id "$instance_ocid" --query 'data."display-name"' --raw-output 2>/dev/null) || instance_name="Unknown"
+    
+    # Get current state
+    local instance_state
+    instance_state=$(oci compute instance get --instance-id "$instance_ocid" --query 'data."lifecycle-state"' --raw-output 2>/dev/null) || instance_state="Unknown"
+    
+    # Check if in K8s
+    local k8s_node_name=""
+    k8s_node_name=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '.items[] | select(.spec.providerID | contains($ocid)) | .metadata.name' 2>/dev/null)
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Instance Actions ═══${NC}"
+    echo -e "  Instance: ${GREEN}$instance_name${NC}"
+    echo -e "  State:    ${CYAN}$instance_state${NC}"
+    if [[ -n "$k8s_node_name" ]]; then
+        echo -e "  K8s Node: ${GREEN}$k8s_node_name${NC}"
+    else
+        echo -e "  K8s Node: ${YELLOW}Not in cluster${NC}"
+    fi
+    echo ""
+    echo -e "  ${YELLOW}1${NC}) ${WHITE}Reboot Instance${NC}        - Graceful reboot (ACPI shutdown + start)"
+    echo -e "  ${YELLOW}2${NC}) ${WHITE}Force Reboot Instance${NC}  - Hard reset (immediate power cycle)"
+    echo -e "  ${YELLOW}3${NC}) ${WHITE}Stop Instance${NC}          - Graceful shutdown"
+    echo -e "  ${YELLOW}4${NC}) ${WHITE}Start Instance${NC}         - Power on (if stopped)"
+    if [[ -n "$k8s_node_name" ]]; then
+        echo -e "  ${YELLOW}6${NC}) ${WHITE}Drain K8s Node${NC}         - Safely evict pods before maintenance"
+        echo -e "  ${YELLOW}7${NC}) ${WHITE}Cordon K8s Node${NC}        - Mark node as unschedulable"
+        echo -e "  ${YELLOW}8${NC}) ${WHITE}Uncordon K8s Node${NC}      - Mark node as schedulable"
+    fi
+    echo -e "  ${RED}5${NC}) ${WHITE}Terminate Instance${NC}     - ${RED}PERMANENTLY DELETE${NC} instance"
+    echo ""
+    echo -e "  ${MAGENTA}9${NC}) ${WHITE}View Console History${NC}   - Boot logs (debug cloud-init issues)"
+    echo ""
+    echo -e "  ${CYAN}Enter${NC}) Return to instance list"
+    echo ""
+    
+    local prompt_range="1-5,9"
+    [[ -n "$k8s_node_name" ]] && prompt_range="1-9"
+    echo -n -e "${BOLD}${CYAN}Select action [${prompt_range}/Enter]: ${NC}"
+    
+    local action
+    read -r action
+    
+    case "$action" in
+        1)
+            # Reboot (soft)
+            echo ""
+            echo -e "${YELLOW}Rebooting instance ${GREEN}$instance_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm reboot? (yes/no): ${NC}"
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                if oci compute instance action --instance-id "$instance_ocid" --action SOFTRESET 2>/dev/null; then
+                    echo -e "${GREEN}✓ Reboot initiated successfully${NC}"
+                else
+                    echo -e "${RED}✗ Failed to reboot instance${NC}"
+                fi
+            else
+                echo -e "${YELLOW}Reboot cancelled${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        2)
+            # Force Reboot (hard reset)
+            echo ""
+            echo -e "${YELLOW}Force rebooting instance ${GREEN}$instance_name${NC}${YELLOW}...${NC}"
+            echo -e "${RED}WARNING: This is a hard reset and may cause data loss!${NC}"
+            echo -n -e "${CYAN}Confirm force reboot? (yes/no): ${NC}"
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                if oci compute instance action --instance-id "$instance_ocid" --action RESET 2>/dev/null; then
+                    echo -e "${GREEN}✓ Force reboot initiated successfully${NC}"
+                else
+                    echo -e "${RED}✗ Failed to force reboot instance${NC}"
+                fi
+            else
+                echo -e "${YELLOW}Force reboot cancelled${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        3)
+            # Stop instance
+            echo ""
+            echo -e "${YELLOW}Stopping instance ${GREEN}$instance_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm stop? (yes/no): ${NC}"
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                if oci compute instance action --instance-id "$instance_ocid" --action SOFTSTOP 2>/dev/null; then
+                    echo -e "${GREEN}✓ Stop initiated successfully${NC}"
+                else
+                    echo -e "${RED}✗ Failed to stop instance${NC}"
+                fi
+            else
+                echo -e "${YELLOW}Stop cancelled${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        4)
+            # Start instance
+            echo ""
+            echo -e "${YELLOW}Starting instance ${GREEN}$instance_name${NC}${YELLOW}...${NC}"
+            echo -n -e "${CYAN}Confirm start? (yes/no): ${NC}"
+            read -r confirm
+            if [[ "$confirm" == "yes" ]]; then
+                if oci compute instance action --instance-id "$instance_ocid" --action START 2>/dev/null; then
+                    echo -e "${GREEN}✓ Start initiated successfully${NC}"
+                else
+                    echo -e "${RED}✗ Failed to start instance${NC}"
+                fi
+            else
+                echo -e "${YELLOW}Start cancelled${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        5)
+            # Terminate instance
+            echo ""
+            echo -e "${RED}╔════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}║                    ⚠️  WARNING: TERMINATE  ⚠️                   ║${NC}"
+            echo -e "${RED}╚════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${RED}This will PERMANENTLY DELETE the instance:${NC}"
+            echo -e "  Name: ${GREEN}$instance_name${NC}"
+            echo -e "  OCID: ${YELLOW}$instance_ocid${NC}"
+            echo ""
+            echo -e "${RED}This action cannot be undone!${NC}"
+            echo ""
+            
+            # Check if in K8s
+            if [[ -n "$k8s_node_name" ]]; then
+                echo -e "${YELLOW}⚠️  This instance is a Kubernetes node: ${CYAN}$k8s_node_name${NC}"
+                echo -e "${YELLOW}   Consider draining the node first (option 6)${NC}"
+                echo ""
+            fi
+            
+            echo -n -e "${RED}Type 'TERMINATE' to confirm deletion: ${NC}"
+            read -r confirm
+            if [[ "$confirm" == "TERMINATE" ]]; then
+                echo ""
+                echo -e "${YELLOW}Terminating instance...${NC}"
+                if oci compute instance terminate --instance-id "$instance_ocid" --preserve-boot-volume false --force 2>/dev/null; then
+                    echo -e "${GREEN}✓ Terminate initiated successfully${NC}"
+                    echo -e "${YELLOW}Instance will be deleted. Boot volume will also be deleted.${NC}"
+                else
+                    echo -e "${RED}✗ Failed to terminate instance${NC}"
+                fi
+            else
+                echo -e "${YELLOW}Termination cancelled${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        6)
+            # Drain K8s node
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Draining Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This will evict all pods (except DaemonSets) from the node.${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm drain? (yes/no): ${NC}"
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    echo ""
+                    echo -e "${YELLOW}Running: kubectl drain $k8s_node_name --ignore-daemonsets --delete-emptydir-data${NC}"
+                    if kubectl drain "$k8s_node_name" --ignore-daemonsets --delete-emptydir-data 2>&1; then
+                        echo -e "${GREEN}✓ Node drained successfully${NC}"
+                    else
+                        echo -e "${RED}✗ Failed to drain node (some pods may not be evictable)${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}Drain cancelled${NC}"
+                fi
+                echo ""
+                echo -e "Press Enter to continue..."
+                read -r
+            fi
+            ;;
+        7)
+            # Cordon K8s node
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Cordoning Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This marks the node as unschedulable (existing pods continue running).${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm cordon? (yes/no): ${NC}"
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    if kubectl cordon "$k8s_node_name" 2>&1; then
+                        echo -e "${GREEN}✓ Node cordoned successfully${NC}"
+                    else
+                        echo -e "${RED}✗ Failed to cordon node${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}Cordon cancelled${NC}"
+                fi
+                echo ""
+                echo -e "Press Enter to continue..."
+                read -r
+            fi
+            ;;
+        8)
+            # Uncordon K8s node
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                echo ""
+                echo -e "${YELLOW}Uncordoning Kubernetes node ${GREEN}$k8s_node_name${NC}${YELLOW}...${NC}"
+                echo -e "${WHITE}This marks the node as schedulable again.${NC}"
+                echo ""
+                echo -n -e "${CYAN}Confirm uncordon? (yes/no): ${NC}"
+                read -r confirm
+                if [[ "$confirm" == "yes" ]]; then
+                    if kubectl uncordon "$k8s_node_name" 2>&1; then
+                        echo -e "${GREEN}✓ Node uncordoned successfully${NC}"
+                    else
+                        echo -e "${RED}✗ Failed to uncordon node${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}Uncordon cancelled${NC}"
+                fi
+                echo ""
+                echo -e "Press Enter to continue..."
+                read -r
+            fi
+            ;;
+        9)
+            # View Console History
+            echo ""
+            echo -e "${CYAN}Fetching console history for ${GREEN}$instance_name${NC}${CYAN}...${NC}"
+            get_console_history "$instance_ocid"
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        *)
+            # Return to list
+            ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# Display detailed instance information
+#--------------------------------------------------------------------------------
+display_instance_details() {
+    local instance_ocid="$1"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Instance Details ===${NC}"
+    
+    # Fetch instance details
+    local instance_json
+    instance_json=$(oci compute instance get --instance-id "$instance_ocid" --output json 2>/dev/null)
+    
+    if [[ -z "$instance_json" ]] || ! echo "$instance_json" | jq -e '.data' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch instance details${NC}"
+        return 1
+    fi
+    
+    # Extract basic info
+    local display_name state shape ad fd time_created
+    display_name=$(echo "$instance_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$instance_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    shape=$(echo "$instance_json" | jq -r '.data.shape // "N/A"')
+    ad=$(echo "$instance_json" | jq -r '.data["availability-domain"] // "N/A"')
+    fd=$(echo "$instance_json" | jq -r '.data["fault-domain"] // "N/A"')
+    time_created=$(echo "$instance_json" | jq -r '.data["time-created"] // "N/A"')
+    
+    # Extract GPU memory cluster tag
+    local gpu_mem_cluster
+    gpu_mem_cluster=$(echo "$instance_json" | jq -r '.data["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A"')
+    
+    # Extract compute cluster ID
+    local compute_cluster_id
+    compute_cluster_id=$(echo "$instance_json" | jq -r '.data["compute-cluster-id"] // "N/A"')
+    
+    # Color state
+    local state_color="$GREEN"
+    case "$state" in
+        RUNNING) state_color="$GREEN" ;;
+        STOPPED) state_color="$RED" ;;
+        STARTING|STOPPING) state_color="$YELLOW" ;;
+        PROVISIONING) state_color="$CYAN" ;;
+        *) state_color="$WHITE" ;;
+    esac
+    
+    echo -e "${WHITE}Name:${NC}              ${GREEN}$display_name${NC}"
+    echo -e "${WHITE}OCID:${NC}              ${YELLOW}$instance_ocid${NC}"
+    echo ""
+    echo -e "${WHITE}State:${NC}             ${state_color}$state${NC}"
+    echo -e "${WHITE}Shape:${NC}             $shape"
+    echo -e "${WHITE}Availability Domain:${NC} $ad"
+    echo -e "${WHITE}Fault Domain:${NC}      $fd"
+    echo -e "${WHITE}Time Created:${NC}      $time_created"
+    
+    if [[ "$gpu_mem_cluster" != "N/A" && "$gpu_mem_cluster" != "null" ]]; then
+        local cluster_name
+        cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
+        echo ""
+        echo -e "${WHITE}GPU Memory Cluster:${NC} ${GREEN}$cluster_name${NC}"
+        echo -e "                    ${YELLOW}$gpu_mem_cluster${NC}"
+    fi
+    
+    if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" ]]; then
+        local cc_name
+        cc_name=$(get_compute_cluster_name "$compute_cluster_id")
+        echo -e "${WHITE}Compute Cluster:${NC}   ${GREEN}$cc_name${NC}"
+        echo -e "                    ${YELLOW}$compute_cluster_id${NC}"
+    fi
+    
+    # ========== KUBERNETES STATUS ==========
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Kubernetes Status ===${NC}"
+    
+    # Check if instance is in K8s
+    local k8s_node_info
+    k8s_node_info=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '
+        .items[] | select(.spec.providerID | contains($ocid)) | 
+        "\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")"
+    ' 2>/dev/null)
+    
+    if [[ -n "$k8s_node_info" ]]; then
+        local k8s_node_name k8s_ready k8s_clique k8s_gpu_present
+        IFS='|' read -r k8s_node_name k8s_ready k8s_clique k8s_gpu_present <<< "$k8s_node_info"
+        
+        local ready_color="$GREEN"
+        [[ "$k8s_ready" != "True" ]] && ready_color="$RED"
+        
+        echo -e "  ${WHITE}In Kubernetes:${NC}   ${GREEN}Yes${NC}"
+        echo -e "  ${WHITE}Node Name:${NC}       ${GREEN}$k8s_node_name${NC}"
+        echo -e "  ${WHITE}Ready:${NC}           ${ready_color}$k8s_ready${NC}"
+        if [[ "$k8s_gpu_present" == "true" ]]; then
+            echo -e "  ${WHITE}GPU Present:${NC}     ${GREEN}Yes${NC}"
+            [[ "$k8s_clique" != "N/A" ]] && echo -e "  ${WHITE}GPU Clique:${NC}      ${CYAN}$k8s_clique${NC}"
+        fi
+    else
+        echo -e "  ${WHITE}In Kubernetes:${NC}   ${YELLOW}No${NC} (not joined or not found)"
+    fi
+    
+    # ========== NETWORK / VNIC INFORMATION ==========
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Network (VNICs) ===${NC}"
+    
+    # Get VNIC attachments
+    local vnic_attachments
+    vnic_attachments=$(oci compute vnic-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -n "$vnic_attachments" ]] && echo "$vnic_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        echo "$vnic_attachments" | jq -r '.data[] | "\(.["vnic-id"])|\(.["display-name"] // "N/A")|\(.["nic-index"] // 0)"' 2>/dev/null | \
+        while IFS='|' read -r vnic_id vnic_attach_name nic_index; do
+            [[ -z "$vnic_id" ]] && continue
+            
+            # Get VNIC details
+            local vnic_json
+            vnic_json=$(oci network vnic get --vnic-id "$vnic_id" --output json 2>/dev/null)
+            
+            if [[ -n "$vnic_json" ]] && echo "$vnic_json" | jq -e '.data' > /dev/null 2>&1; then
+                local vnic_name private_ip public_ip subnet_id mac_addr is_primary
+                vnic_name=$(echo "$vnic_json" | jq -r '.data["display-name"] // "N/A"')
+                private_ip=$(echo "$vnic_json" | jq -r '.data["private-ip"] // "N/A"')
+                public_ip=$(echo "$vnic_json" | jq -r '.data["public-ip"] // "N/A"')
+                subnet_id=$(echo "$vnic_json" | jq -r '.data["subnet-id"] // "N/A"')
+                mac_addr=$(echo "$vnic_json" | jq -r '.data["mac-address"] // "N/A"')
+                is_primary=$(echo "$vnic_json" | jq -r '.data["is-primary"] // false')
+                
+                # Resolve subnet name
+                local subnet_name="N/A"
+                if [[ "$subnet_id" != "N/A" && -n "$subnet_id" ]]; then
+                    subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
+                fi
+                
+                local primary_marker=""
+                [[ "$is_primary" == "true" ]] && primary_marker=" ${GREEN}(Primary)${NC}"
+                
+                echo ""
+                echo -e "  ${BOLD}${WHITE}NIC ${nic_index}:${NC} ${GREEN}$vnic_name${NC}${primary_marker}"
+                echo -e "    ${WHITE}Private IP:${NC}  ${CYAN}$private_ip${NC}"
+                if [[ "$public_ip" != "N/A" && "$public_ip" != "null" && -n "$public_ip" ]]; then
+                    echo -e "    ${WHITE}Public IP:${NC}   ${CYAN}$public_ip${NC}"
+                fi
+                echo -e "    ${WHITE}MAC Address:${NC} $mac_addr"
+                echo -e "    ${WHITE}Subnet:${NC}      ${GREEN}$subnet_name${NC}"
+                echo -e "                  ${YELLOW}$subnet_id${NC}"
+            fi
+        done
+    else
+        echo -e "  ${YELLOW}No VNICs found${NC}"
+    fi
+    
+    # ========== BOOT VOLUME ==========
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Boot Volume ===${NC}"
+    
+    local boot_vol_attachments
+    boot_vol_attachments=$(oci compute boot-volume-attachment list \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$ad" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -n "$boot_vol_attachments" ]] && echo "$boot_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        echo "$boot_vol_attachments" | jq -r '.data[] | "\(.["boot-volume-id"])|\(.["lifecycle-state"])"' 2>/dev/null | \
+        while IFS='|' read -r bv_id bv_attach_state; do
+            [[ -z "$bv_id" ]] && continue
+            
+            # Get boot volume details
+            local bv_json
+            bv_json=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
+            
+            if [[ -n "$bv_json" ]] && echo "$bv_json" | jq -e '.data' > /dev/null 2>&1; then
+                local bv_name bv_state bv_size_gb bv_vpus
+                bv_name=$(echo "$bv_json" | jq -r '.data["display-name"] // "N/A"')
+                bv_state=$(echo "$bv_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                bv_size_gb=$(echo "$bv_json" | jq -r '.data["size-in-gbs"] // "N/A"')
+                bv_vpus=$(echo "$bv_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
+                
+                local bv_state_color="$GREEN"
+                [[ "$bv_state" != "AVAILABLE" ]] && bv_state_color="$YELLOW"
+                
+                echo -e "  ${WHITE}Name:${NC}   ${GREEN}$bv_name${NC}"
+                echo -e "  ${WHITE}OCID:${NC}   ${YELLOW}$bv_id${NC}"
+                echo -e "  ${WHITE}State:${NC}  ${bv_state_color}$bv_state${NC}"
+                echo -e "  ${WHITE}Size:${NC}   ${bv_size_gb} GB"
+                echo -e "  ${WHITE}VPUs:${NC}   ${bv_vpus} per GB"
+            fi
+        done
+    else
+        echo -e "  ${YELLOW}No boot volume found${NC}"
+    fi
+    
+    # ========== BLOCK VOLUMES ==========
+    echo ""
+    echo -e "${BOLD}${CYAN}=== Block Volumes ===${NC}"
+    
+    local block_vol_attachments
+    block_vol_attachments=$(oci compute volume-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    local vol_count=0
+    if [[ -n "$block_vol_attachments" ]] && echo "$block_vol_attachments" | jq -e '.data[]' > /dev/null 2>&1; then
+        while IFS='|' read -r vol_id attach_state attach_type device is_readonly; do
+            [[ -z "$vol_id" ]] && continue
+            ((vol_count++))
+            
+            # Get block volume details
+            local vol_json
+            vol_json=$(oci bv volume get --volume-id "$vol_id" --output json 2>/dev/null)
+            
+            if [[ -n "$vol_json" ]] && echo "$vol_json" | jq -e '.data' > /dev/null 2>&1; then
+                local vol_name vol_state vol_size_gb vol_vpus
+                vol_name=$(echo "$vol_json" | jq -r '.data["display-name"] // "N/A"')
+                vol_state=$(echo "$vol_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                vol_size_gb=$(echo "$vol_json" | jq -r '.data["size-in-gbs"] // "N/A"')
+                vol_vpus=$(echo "$vol_json" | jq -r '.data["vpus-per-gb"] // "N/A"')
+                
+                local vol_state_color="$GREEN"
+                [[ "$vol_state" != "AVAILABLE" ]] && vol_state_color="$YELLOW"
+                
+                local readonly_marker=""
+                [[ "$is_readonly" == "true" ]] && readonly_marker=" ${YELLOW}(Read-Only)${NC}"
+                
+                echo ""
+                echo -e "  ${BOLD}${WHITE}Volume ${vol_count}:${NC} ${GREEN}$vol_name${NC}${readonly_marker}"
+                echo -e "    ${WHITE}OCID:${NC}       ${YELLOW}$vol_id${NC}"
+                echo -e "    ${WHITE}State:${NC}      ${vol_state_color}$vol_state${NC}"
+                echo -e "    ${WHITE}Size:${NC}       ${vol_size_gb} GB"
+                echo -e "    ${WHITE}VPUs:${NC}       ${vol_vpus} per GB"
+                echo -e "    ${WHITE}Attachment:${NC} $attach_type"
+                [[ "$device" != "N/A" && -n "$device" ]] && echo -e "    ${WHITE}Device:${NC}     $device"
+            fi
+        done < <(echo "$block_vol_attachments" | jq -r '.data[] | "\(.["volume-id"])|\(.["lifecycle-state"])|\(.["attachment-type"])|\(.device // "N/A")|\(.["is-read-only"] // false)"' 2>/dev/null)
+    fi
+    
+    [[ $vol_count -eq 0 ]] && echo -e "  ${GRAY}No block volumes attached${NC}"
+}
+
+#===============================================================================
 # GPU MEMORY FABRIC & CLUSTER MANAGEMENT
 #===============================================================================
 
@@ -4735,13 +5442,15 @@ interactive_gpu_management() {
         display_gpu_management_menu
         
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
-        echo -e "  ${YELLOW}f#/g#${NC}   - View fabric or cluster details (e.g., 'f1', 'g2')"
-        echo -e "  ${GREEN}create${NC}  - Create a new GPU Memory Cluster on a Fabric"
-        echo -e "  ${YELLOW}update${NC}  - Update an existing GPU Memory Cluster (size/instance config)"
-        echo -e "  ${MAGENTA}refresh${NC} - Refresh data from OCI"
-        echo -e "  ${CYAN}back${NC}    - Return to main menu"
+        echo -e "  ${YELLOW}f#/g#/i#/c#${NC} - View resource details (e.g., 'f1', 'g2', 'i3', 'c1')"
+        echo -e "  ${GREEN}create${NC}      - Create a new GPU Memory Cluster on a Fabric"
+        echo -e "  ${YELLOW}update${NC}      - Update an existing GPU Memory Cluster (size/instance config)"
+        echo -e "  ${RED}delete-ic${NC}   - Delete an Instance Configuration"
+        echo -e "  ${BLUE}update-ic${NC}   - Update ALL GPU Memory Clusters with a selected Instance Configuration"
+        echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
+        echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter # or command [f#/g#/create/update/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter # or command [f#/g#/i#/c#/create/update/update-ic/delete-ic/refresh/back]: ${NC}"
         
         local input
         read -r input
@@ -4758,6 +5467,12 @@ interactive_gpu_management() {
             update|UPDATE)
                 update_gpu_memory_cluster_interactive
                 ;;
+            update-ic|UPDATE-IC)
+                update_all_clusters_instance_config
+                ;;
+            delete-ic|DELETE-IC)
+                delete_instance_configuration_interactive
+                ;;
             refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
                 rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
@@ -4769,7 +5484,7 @@ interactive_gpu_management() {
                 view_gpu_resource "$input"
                 ;;
             *)
-                echo -e "${RED}Unknown command: $input. Use f#/g#, create, update, refresh, or back.${NC}"
+                echo -e "${RED}Unknown command: $input${NC}"
                 ;;
         esac
     done
@@ -4891,16 +5606,53 @@ view_gpu_resource() {
                 --output json 2>/dev/null)
             
             if [[ -n "$ic_json" ]]; then
-                local ic_name
+                local ic_name ic_time_created ic_compartment
                 ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
-                echo -e "${WHITE}Name:${NC} ${GREEN}$ic_name${NC}"
-                echo -e "${WHITE}OCID:${NC} ${YELLOW}$ic_ocid${NC}"
+                ic_time_created=$(echo "$ic_json" | jq -r '.data["time-created"] // "N/A"')
+                ic_compartment=$(echo "$ic_json" | jq -r '.data["compartment-id"] // "N/A"')
+                
+                echo -e "${WHITE}Name:${NC}         ${GREEN}$ic_name${NC}"
+                echo -e "${WHITE}OCID:${NC}         ${YELLOW}$ic_ocid${NC}"
+                echo -e "${WHITE}Time Created:${NC} $ic_time_created"
+                echo -e "${WHITE}Compartment:${NC}  $ic_compartment"
+                
+                # Show instance details from the configuration
                 echo ""
+                echo -e "${BOLD}${CYAN}Instance Details:${NC}"
                 echo "$ic_json" | jq -r '
-                    .data | 
-                    "Time Created:    \(.["time-created"] // "N/A")",
-                    "Compartment:     \(.["compartment-id"] // "N/A")"
-                '
+                    .data["instance-details"]["launch-details"] // {} |
+                    "  Shape:              \(.shape // "N/A")",
+                    "  Availability Domain: \(.["availability-domain"] // "N/A")",
+                    "  Compartment:        \(.["compartment-id"][-20:] // "N/A")"
+                ' 2>/dev/null
+                
+                # Show source details
+                local source_type
+                source_type=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["source-type"] // "N/A"' 2>/dev/null)
+                echo -e "  Source Type:        $source_type"
+                
+                if [[ "$source_type" == "image" ]]; then
+                    local image_id
+                    image_id=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["image-id"] // "N/A"' 2>/dev/null)
+                    echo -e "  Image ID:           ${YELLOW}...${image_id: -20}${NC}"
+                fi
+                
+                # Show action option
+                echo ""
+                echo -e "${BOLD}${WHITE}Actions:${NC}"
+                echo -e "  ${RED}delete${NC} - Delete this instance configuration"
+                echo -e "  ${CYAN}Enter${NC}  - Return to menu"
+                echo ""
+                echo -n -e "${CYAN}Action [delete/Enter]: ${NC}"
+                
+                local action
+                read -r action
+                
+                if [[ "$action" == "delete" || "$action" == "DELETE" ]]; then
+                    # Store the ic_ocid for deletion
+                    IC_INDEX_MAP["delete_target"]="$ic_ocid"
+                    delete_single_instance_configuration "$ic_ocid" "$ic_name"
+                fi
             else
                 echo -e "${WHITE}OCID:${NC} ${YELLOW}$ic_ocid${NC}"
                 echo ""
@@ -4956,6 +5708,20 @@ create_gpu_memory_cluster_interactive() {
     
     echo ""
     echo -e "${BOLD}${GREEN}═══ Create GPU Memory Cluster ═══${NC}"
+    echo ""
+    
+    # Refresh caches to get latest data
+    echo -e "${YELLOW}Refreshing data from OCI...${NC}"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    fetch_gpu_fabrics
+    fetch_gpu_clusters
+    fetch_instance_configurations
+    fetch_compute_clusters
+    
+    # Rebuild index maps
+    display_gpu_management_menu > /dev/null 2>&1
+    
+    echo -e "${GREEN}✓ Data refreshed${NC}"
     echo ""
     
     # Display available GPU Memory Fabrics (only those with capacity)
@@ -5248,6 +6014,20 @@ update_gpu_memory_cluster_interactive() {
     
     echo ""
     echo -e "${BOLD}${YELLOW}═══ Update GPU Memory Cluster ═══${NC}"
+    echo ""
+    
+    # Refresh caches to get latest data
+    echo -e "${YELLOW}Refreshing data from OCI...${NC}"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    fetch_gpu_fabrics
+    fetch_gpu_clusters
+    fetch_instance_configurations
+    fetch_compute_clusters
+    
+    # Rebuild index maps
+    display_gpu_management_menu > /dev/null 2>&1
+    
+    echo -e "${GREEN}✓ Data refreshed${NC}"
     echo ""
     
     # List available GPU Memory Clusters
@@ -5617,6 +6397,491 @@ update_gpu_memory_cluster_interactive() {
     fi
 }
 
+#--------------------------------------------------------------------------------
+# Update ALL GPU Memory Clusters with a selected Instance Configuration
+#--------------------------------------------------------------------------------
+update_all_clusters_instance_config() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}═══ Update All GPU Memory Clusters - Instance Configuration ═══${NC}"
+    echo ""
+    
+    # Refresh caches to get latest data
+    echo -e "${YELLOW}Refreshing data from OCI...${NC}"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    fetch_gpu_fabrics
+    fetch_gpu_clusters
+    fetch_instance_configurations
+    fetch_compute_clusters
+    
+    # Rebuild index maps
+    display_gpu_management_menu > /dev/null 2>&1
+    
+    echo -e "${GREEN}✓ Data refreshed${NC}"
+    echo ""
+    
+    # Check if any instance configurations exist
+    if [[ ${#IC_INDEX_MAP[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No Instance Configurations available${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 0
+    fi
+    
+    # Check if any clusters exist
+    if [[ ${#CLUSTER_INDEX_MAP[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No GPU Memory Clusters available to update${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 0
+    fi
+    
+    # Display Instance Configurations
+    echo -e "${WHITE}Available Instance Configurations:${NC}"
+    echo ""
+    printf "${BOLD}%-6s %-60s %-90s${NC}\n" \
+        "ID" "Instance Configuration Name" "OCID"
+    print_separator 160
+    
+    # Sort and display instance configs
+    local ic_output_temp
+    ic_output_temp=$(mktemp)
+    
+    local iid
+    for iid in "${!IC_INDEX_MAP[@]}"; do
+        local ic_ocid="${IC_INDEX_MAP[$iid]}"
+        [[ -z "$ic_ocid" ]] && continue
+        
+        local ic_line ic_name
+        ic_line=$(grep "^${ic_ocid}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -1)
+        if [[ -n "$ic_line" ]]; then
+            IFS='|' read -r _ ic_name <<< "$ic_line"
+        else
+            ic_name="N/A"
+        fi
+        
+        local iid_num="${iid#i}"
+        echo "${iid_num}|${iid}|${ic_name}|${ic_ocid}" >> "$ic_output_temp"
+    done
+    
+    sort -t'|' -k1 -n "$ic_output_temp" | while IFS='|' read -r _ iid ic_name ic_ocid; do
+        printf "${YELLOW}%-6s${NC} ${GREEN}%-60s${NC} ${GRAY}%-90s${NC}\n" \
+            "$iid" "$ic_name" "$ic_ocid"
+    done
+    
+    rm -f "$ic_output_temp"
+    echo ""
+    
+    # Select Instance Configuration
+    echo -n -e "${CYAN}Select Instance Configuration to apply to ALL clusters (i#) or 'cancel': ${NC}"
+    local ic_input
+    read -r ic_input
+    
+    # Check for cancel
+    if [[ "$ic_input" == "cancel" || "$ic_input" == "c" || -z "$ic_input" ]]; then
+        echo -e "${YELLOW}Update cancelled${NC}"
+        return 0
+    fi
+    
+    local selected_ic_ocid="${IC_INDEX_MAP[$ic_input]:-}"
+    if [[ -z "$selected_ic_ocid" ]]; then
+        echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+        return 1
+    fi
+    
+    # Get selected IC name
+    local selected_ic_name
+    selected_ic_name=$(get_instance_config_name "$selected_ic_ocid")
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ GPU Memory Clusters to Update ═══${NC}"
+    echo ""
+    
+    # Collect clusters to update (only ACTIVE, UPDATING, SCALING states that don't already have the selected IC)
+    local clusters_to_update=()
+    local cluster_names=()
+    local cluster_current_ics=()
+    local skipped_count=0
+    
+    for gid in "${!CLUSTER_INDEX_MAP[@]}"; do
+        local cluster_ocid="${CLUSTER_INDEX_MAP[$gid]}"
+        [[ -z "$cluster_ocid" ]] && continue
+        
+        # Get cluster info from cache
+        local cluster_line
+        cluster_line=$(grep "^${cluster_ocid}|" "$CLUSTER_CACHE" 2>/dev/null | head -1)
+        
+        if [[ -n "$cluster_line" ]]; then
+            local c_name c_state c_fabric_suffix c_ic_id c_size
+            IFS='|' read -r _ c_name c_state c_fabric_suffix c_ic_id _ c_size <<< "$cluster_line"
+            
+            # Only include active-ish clusters
+            if [[ "$c_state" == "ACTIVE" || "$c_state" == "UPDATING" || "$c_state" == "SCALING" ]]; then
+                # Skip if already has the selected instance configuration
+                if [[ "$c_ic_id" == "$selected_ic_ocid" ]]; then
+                    ((skipped_count++))
+                    continue
+                fi
+                
+                clusters_to_update+=("$cluster_ocid")
+                cluster_names+=("$c_name")
+                
+                # Get current IC name
+                local current_ic_name="N/A"
+                if [[ -n "$c_ic_id" && "$c_ic_id" != "N/A" ]]; then
+                    current_ic_name=$(get_instance_config_name "$c_ic_id")
+                fi
+                cluster_current_ics+=("$current_ic_name")
+            fi
+        fi
+    done
+    
+    # Show skipped count if any
+    if [[ $skipped_count -gt 0 ]]; then
+        echo -e "${GREEN}Skipped ${skipped_count} cluster(s) already using ${selected_ic_name}${NC}"
+        echo ""
+    fi
+    
+    if [[ ${#clusters_to_update[@]} -eq 0 ]]; then
+        echo -e "${GREEN}All active GPU Memory Clusters already have the selected Instance Configuration${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 0
+    fi
+    
+    # Display clusters that will be updated
+    printf "${BOLD}%-40s %-50s${NC}\n" "Cluster Name" "Current Instance Config"
+    print_separator 95
+    
+    for i in "${!clusters_to_update[@]}"; do
+        printf "%-40s ${GRAY}%-50s${NC}\n" "${cluster_names[$i]}" "${cluster_current_ics[$i]}"
+    done
+    
+    echo ""
+    echo -e "${WHITE}Total clusters to update:${NC} ${CYAN}${#clusters_to_update[@]}${NC}"
+    echo -e "${WHITE}New Instance Configuration:${NC} ${GREEN}$selected_ic_name${NC}"
+    echo ""
+    
+    # Show commands that will be executed
+    echo -e "${BOLD}${WHITE}Commands to execute:${NC}"
+    echo ""
+    for i in "${!clusters_to_update[@]}"; do
+        local cluster_ocid="${clusters_to_update[$i]}"
+        echo -e "${GRAY}oci compute compute-gpu-memory-cluster update \\
+    --compute-gpu-memory-cluster-id \"$cluster_ocid\" \\
+    --instance-configuration-id \"$selected_ic_ocid\"${NC}"
+        echo ""
+    done
+    
+    # Confirm
+    echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║                    ⚠️  BULK UPDATE CONFIRMATION  ⚠️                              ║${NC}"
+    echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${WHITE}This will update ${CYAN}${#clusters_to_update[@]}${NC}${WHITE} GPU Memory Cluster(s) to use:${NC}"
+    echo -e "  ${GREEN}$selected_ic_name${NC}"
+    echo -e "  ${GRAY}$selected_ic_ocid${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Type 'UPDATE ALL' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "UPDATE ALL" ]]; then
+        echo -e "${YELLOW}Update cancelled${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Starting bulk update...${NC}"
+    echo ""
+    
+    # Update each cluster
+    local success_count=0
+    local fail_count=0
+    
+    for i in "${!clusters_to_update[@]}"; do
+        local cluster_ocid="${clusters_to_update[$i]}"
+        local cluster_name="${cluster_names[$i]}"
+        
+        echo -n -e "  Updating ${CYAN}$cluster_name${NC}... "
+        
+        local result
+        result=$(oci compute compute-gpu-memory-cluster update \
+            --compute-gpu-memory-cluster-id "$cluster_ocid" \
+            --instance-configuration-id "$selected_ic_ocid" \
+            --output json 2>&1)
+        local exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            echo -e "${GREEN}✓${NC}"
+            ((success_count++))
+        else
+            echo -e "${RED}✗${NC}"
+            echo -e "    ${RED}Error: $(echo "$result" | head -1)${NC}"
+            ((fail_count++))
+        fi
+    done
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update Summary ═══${NC}"
+    echo -e "  ${GREEN}Successful:${NC} $success_count"
+    echo -e "  ${RED}Failed:${NC}     $fail_count"
+    echo ""
+    
+    # Invalidate caches
+    rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE"
+    
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Delete a single Instance Configuration by OCID (called from view details)
+#--------------------------------------------------------------------------------
+delete_single_instance_configuration() {
+    local ic_ocid="$1"
+    local ic_name="$2"
+    
+    echo ""
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                    ⚠️  WARNING: DELETE INSTANCE CONFIGURATION  ⚠️               ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${WHITE}Instance Configuration:${NC} ${GREEN}$ic_name${NC}"
+    echo -e "${WHITE}OCID:${NC}                   ${YELLOW}$ic_ocid${NC}"
+    echo ""
+    
+    # Check if in use
+    local clusters_using_ic=""
+    if [[ -f "$CLUSTER_CACHE" ]]; then
+        while IFS='|' read -r cluster_ocid cluster_name cluster_state _ cluster_ic_id _; do
+            [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$cluster_ocid" ]] && continue
+            [[ "$cluster_state" == "DELETED" ]] && continue
+            
+            if [[ "$cluster_ic_id" == "$ic_ocid" ]]; then
+                clusters_using_ic="${clusters_using_ic}${cluster_name} (${cluster_state})\n"
+            fi
+        done < "$CLUSTER_CACHE"
+    fi
+    
+    if [[ -n "$clusters_using_ic" ]]; then
+        echo -e "${RED}⚠️  WARNING: This instance configuration is used by:${NC}"
+        echo -e "${YELLOW}$(echo -e "$clusters_using_ic")${NC}"
+        echo ""
+    fi
+    
+    echo -e "${RED}This action cannot be undone!${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Delete cancelled${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Deleting Instance Configuration...${NC}"
+    
+    local result
+    result=$(oci compute-management instance-configuration delete \
+        --instance-configuration-id "$ic_ocid" \
+        --force 2>&1)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "${GREEN}✓ Instance Configuration deleted successfully${NC}"
+        rm -f "$INSTANCE_CONFIG_CACHE"
+    else
+        echo -e "${RED}✗ Failed to delete:${NC}"
+        echo "$result"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Delete Instance Configuration interactively
+#--------------------------------------------------------------------------------
+delete_instance_configuration_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    
+    echo ""
+    echo -e "${BOLD}${RED}═══ Delete Instance Configuration ═══${NC}"
+    echo ""
+    
+    # Refresh caches to get latest data
+    echo -e "${YELLOW}Refreshing data from OCI...${NC}"
+    rm -f "$INSTANCE_CONFIG_CACHE" "$CLUSTER_CACHE"
+    fetch_instance_configurations
+    fetch_gpu_clusters
+    
+    # Rebuild index maps
+    display_gpu_management_menu > /dev/null 2>&1
+    
+    echo -e "${GREEN}✓ Data refreshed${NC}"
+    echo ""
+    
+    # Check if any instance configurations exist
+    if [[ ${#IC_INDEX_MAP[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No Instance Configurations available to delete${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 0
+    fi
+    
+    # Display Instance Configurations
+    echo -e "${WHITE}Available Instance Configurations:${NC}"
+    echo ""
+    printf "${BOLD}%-6s %-60s %-90s${NC}\n" \
+        "ID" "Instance Configuration Name" "OCID"
+    print_separator 160
+    
+    # Sort and display instance configs
+    local ic_output_temp
+    ic_output_temp=$(mktemp)
+    
+    local iid
+    for iid in "${!IC_INDEX_MAP[@]}"; do
+        local ic_ocid="${IC_INDEX_MAP[$iid]}"
+        [[ -z "$ic_ocid" ]] && continue
+        
+        local ic_line ic_name
+        ic_line=$(grep "^${ic_ocid}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -1)
+        if [[ -n "$ic_line" ]]; then
+            IFS='|' read -r _ ic_name <<< "$ic_line"
+        else
+            ic_name="N/A"
+        fi
+        
+        local iid_num="${iid#i}"
+        echo "${iid_num}|${iid}|${ic_name}|${ic_ocid}" >> "$ic_output_temp"
+    done
+    
+    sort -t'|' -k1 -n "$ic_output_temp" | while IFS='|' read -r _ iid ic_name ic_ocid; do
+        printf "${YELLOW}%-6s${NC} ${GREEN}%-60s${NC} ${GRAY}%-90s${NC}\n" \
+            "$iid" "$ic_name" "$ic_ocid"
+    done
+    
+    rm -f "$ic_output_temp"
+    echo ""
+    
+    # Select Instance Configuration to delete
+    echo -n -e "${CYAN}Select Instance Configuration to delete (i#) or 'cancel': ${NC}"
+    local ic_input
+    read -r ic_input
+    
+    # Check for cancel
+    if [[ "$ic_input" == "cancel" || "$ic_input" == "c" || -z "$ic_input" ]]; then
+        echo -e "${YELLOW}Delete cancelled${NC}"
+        return 0
+    fi
+    
+    local ic_ocid="${IC_INDEX_MAP[$ic_input]:-}"
+    if [[ -z "$ic_ocid" ]]; then
+        echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+        return 1
+    fi
+    
+    # Get instance configuration details
+    local ic_json ic_name ic_time_created
+    ic_json=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ic_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -n "$ic_json" ]]; then
+        ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
+        ic_time_created=$(echo "$ic_json" | jq -r '.data["time-created"] // "N/A"')
+    else
+        ic_name="Unknown"
+        ic_time_created="Unknown"
+    fi
+    
+    # Check if instance configuration is in use by any GPU memory clusters
+    echo ""
+    echo -e "${YELLOW}Checking if instance configuration is in use...${NC}"
+    
+    local clusters_using_ic=""
+    if [[ -f "$CLUSTER_CACHE" ]]; then
+        while IFS='|' read -r cluster_ocid cluster_name cluster_state _ cluster_ic_id _; do
+            [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$cluster_ocid" ]] && continue
+            [[ "$cluster_state" == "DELETED" ]] && continue
+            
+            if [[ "$cluster_ic_id" == "$ic_ocid" ]]; then
+                clusters_using_ic="${clusters_using_ic}${cluster_name} (${cluster_state})\n"
+            fi
+        done < "$CLUSTER_CACHE"
+    fi
+    
+    echo ""
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                    ⚠️  WARNING: DELETE INSTANCE CONFIGURATION  ⚠️               ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${WHITE}Instance Configuration:${NC} ${GREEN}$ic_name${NC}"
+    echo -e "${WHITE}OCID:${NC}                   ${YELLOW}$ic_ocid${NC}"
+    echo -e "${WHITE}Created:${NC}                $ic_time_created"
+    echo ""
+    
+    if [[ -n "$clusters_using_ic" ]]; then
+        echo -e "${RED}⚠️  WARNING: This instance configuration is used by the following GPU Memory Clusters:${NC}"
+        echo -e "${YELLOW}$(echo -e "$clusters_using_ic")${NC}"
+        echo -e "${RED}Deleting this configuration may affect future cluster operations!${NC}"
+        echo ""
+    fi
+    
+    echo -e "${RED}This action cannot be undone!${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm deletion: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Delete cancelled${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Deleting Instance Configuration...${NC}"
+    
+    local result
+    result=$(oci compute-management instance-configuration delete \
+        --instance-configuration-id "$ic_ocid" \
+        --force 2>&1)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "${GREEN}✓ Instance Configuration deleted successfully${NC}"
+        
+        # Invalidate cache
+        rm -f "$INSTANCE_CONFIG_CACHE"
+        
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+    else
+        echo -e "${RED}✗ Failed to delete Instance Configuration:${NC}"
+        echo "$result"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 1
+    fi
+}
+
 #===============================================================================
 # HELP AND USAGE
 #===============================================================================
@@ -5635,6 +6900,7 @@ show_help() {
     echo "  --clique           Show GPU clique information, OCI tags, cluster state, and fabric details"
     echo "  --count-clique     Count and list all nodes in the same clique with OCI tags and fabric info"
     echo "  --all              Show everything (labels + clique + count + OCI tags + fabric)"
+    echo "  --details          Show full instance details including network, boot volume, block volumes"
     echo "  --console-history  Capture and display console history for the instance"
     echo "                     Useful for debugging instances that fail to join Kubernetes"
     echo ""
@@ -5653,6 +6919,7 @@ show_help() {
     echo "                      - OKE Cluster environment view"
     echo "                      - Network resources (subnets, NSGs)"
     echo "                      - GPU Memory Fabrics & Clusters (create, update, view)"
+    echo "                      - Compute Instances (view details, IPs, volumes)"
     echo ""
     echo -e "${BOLD}Setup & Maintenance:${NC}"
     echo "  --setup             Run initial setup to create/update variables.sh"
@@ -5679,6 +6946,7 @@ show_help() {
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --clique        # Show clique info + fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --count-clique  # Show clique members + fabric"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --all           # Show everything"
+    echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --details       # Full details (network, volumes)"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --console-history  # View console history"
     echo "  $0 --list-cluster ocid1.xxx                           # List cluster instances + fabric"
 }
@@ -6283,6 +7551,7 @@ main() {
             local show_clique="false"
             local count_clique="false"
             local show_console_history="false"
+            local show_instance_details="false"
             
             shift
             while [[ $# -gt 0 ]]; do
@@ -6310,6 +7579,10 @@ main() {
                         show_console_history="true"
                         shift
                         ;;
+                    --details)
+                        show_instance_details="true"
+                        shift
+                        ;;
                     *)
                         log_error "Unknown option: $1"
                         exit 1
@@ -6319,6 +7592,8 @@ main() {
             
             if [[ "$show_console_history" == "true" ]]; then
                 get_console_history "$instance_id"
+            elif [[ "$show_instance_details" == "true" ]]; then
+                display_instance_details "$instance_id"
             else
                 get_node_info "$instance_id" "$show_labels" "$show_clique" "$count_clique"
             fi
