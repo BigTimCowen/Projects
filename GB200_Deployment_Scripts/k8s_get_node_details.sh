@@ -4803,16 +4803,24 @@ manage_compute_instances() {
         # Clear any old temp file
         rm -f /tmp/instance_map_$$
         
-        # Fetch K8s nodes once for lookup
+        # Fetch K8s nodes once for lookup (include taints)
         local k8s_nodes_json
-        k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[] | "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)"' 2>/dev/null)
+        k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null)
+        
+        # Build lookup: providerID|nodeName|readyStatus|newNodeTaint
+        local k8s_lookup
+        k8s_lookup=$(echo "$k8s_nodes_json" | jq -r '
+            .items[] | 
+            (.spec.taints // [] | map(select(.key == "newNode")) | if length > 0 then .[0].effect else "N/A" end) as $newNodeTaint |
+            "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\($newNodeTaint)"
+        ' 2>/dev/null)
         
         # Display instances table
         echo -e "${BOLD}${WHITE}═══ Instances ═══${NC}"
         echo ""
-        printf "${BOLD}%-5s %-32s %-12s %-8s %-26s %-15s %-50s${NC}\n" \
-            "ID" "Display Name" "State" "K8s" "Shape" "Avail Domain" "Instance OCID"
-        print_separator 155
+        printf "${BOLD}%-5s %-32s %-12s %-8s %-12s %-26s %-15s %s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "newNode" "Shape" "Avail Domain" "Instance OCID"
+        print_separator 220
         
         echo "$instances_json" | jq -r '
             .data[] | 
@@ -4835,12 +4843,20 @@ manage_compute_instances() {
                 *) state_color="$WHITE" ;;
             esac
             
-            # Check if in K8s
+            # Check if in K8s and get taint info
             local k8s_status="No"
             local k8s_color="$YELLOW"
-            if echo "$k8s_nodes_json" | grep -q "$ocid"; then
+            local new_node_taint="N/A"
+            local new_node_color="$GRAY"
+            
+            local k8s_match
+            k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
+            
+            if [[ -n "$k8s_match" ]]; then
                 local k8s_ready
-                k8s_ready=$(echo "$k8s_nodes_json" | grep "$ocid" | cut -d'|' -f3)
+                k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
+                new_node_taint=$(echo "$k8s_match" | cut -d'|' -f4)
+                
                 if [[ "$k8s_ready" == "True" ]]; then
                     k8s_status="Ready"
                     k8s_color="$GREEN"
@@ -4848,17 +4864,22 @@ manage_compute_instances() {
                     k8s_status="NotRdy"
                     k8s_color="$RED"
                 fi
+                
+                # Color the taint
+                if [[ "$new_node_taint" != "N/A" ]]; then
+                    new_node_color="$YELLOW"
+                else
+                    new_node_color="$GRAY"
+                fi
             fi
             
-            # Truncate long fields
+            # Truncate long fields (but show full OCID)
             local name_trunc="${name:0:32}"
             local shape_trunc="${shape:0:26}"
             local ad_short="${ad##*:}"
-            # Show last 47 chars of OCID (enough to be useful)
-            local ocid_short="...${ocid: -47}"
             
-            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} %-26s %-15s ${GRAY}%-50s${NC}\n" \
-                "$iid" "$name_trunc" "$state" "$k8s_status" "$shape_trunc" "$ad_short" "$ocid_short"
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${new_node_color}%-12s${NC} %-26s %-15s ${GRAY}%s${NC}\n" \
+                "$iid" "$name_trunc" "$state" "$k8s_status" "$new_node_taint" "$shape_trunc" "$ad_short" "$ocid"
         done
         
         # Read map from temp file
