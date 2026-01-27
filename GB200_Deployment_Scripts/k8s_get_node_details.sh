@@ -108,6 +108,14 @@ log_info() {
     echo "$1" >&2
 }
 
+# Check if a value is a valid OCID (not empty, not N/A, not null)
+# Args: $1 = value to check
+# Returns: 0 if valid, 1 if invalid
+is_valid_ocid() {
+    local val="$1"
+    [[ -n "$val" && "$val" != "N/A" && "$val" != "null" ]]
+}
+
 # Check if cache file is fresh (less than CACHE_MAX_AGE seconds old)
 # Args: $1 = cache file path
 # Returns: 0 if fresh, 1 if stale or missing
@@ -587,7 +595,7 @@ fetch_oke_environment() {
     
     # Get cluster addons/plugins if we have a cluster OCID
     local cluster_addons=""
-    if [[ "$cluster_ocid" != "N/A" && "$cluster_ocid" != "null" && -n "$cluster_ocid" ]]; then
+    if is_valid_ocid "$cluster_ocid"; then
         # Use OCI CE cluster list-addons to get installed addons
         local addons_json
         addons_json=$(oci ce cluster list-addons --cluster-id "$cluster_ocid" --all 2>/dev/null)
@@ -611,7 +619,7 @@ fetch_oke_environment() {
     
     # Get VCN name
     local vcn_name="N/A"
-    if [[ "$vcn_ocid" != "N/A" && "$vcn_ocid" != "null" && -n "$vcn_ocid" ]]; then
+    if is_valid_ocid "$vcn_ocid"; then
         vcn_name=$(oci network vcn get --vcn-id "$vcn_ocid" --query 'data."display-name"' --raw-output 2>/dev/null) || vcn_name="N/A"
     fi
     
@@ -621,7 +629,7 @@ fetch_oke_environment() {
     local pod_subnet_name="N/A" pod_subnet_ocid="N/A"
     local pod_nsg_name="N/A" pod_nsg_ocid="N/A"
     
-    if [[ "$vcn_ocid" != "N/A" && "$vcn_ocid" != "null" && -n "$vcn_ocid" ]]; then
+    if is_valid_ocid "$vcn_ocid"; then
         local subnet_json nsg_json
         subnet_json=$(oci network subnet list --vcn-id "$vcn_ocid" --compartment-id "$compartment_id" --output json 2>/dev/null)
         nsg_json=$(oci network nsg list --compartment-id "$compartment_id" --vcn-id "$vcn_ocid" --output json 2>/dev/null)
@@ -1532,6 +1540,16 @@ color_announcement() {
     [[ "$1" == "-" ]] && echo "$GREEN" || echo "$RED"
 }
 
+# Get color for firmware update state
+color_firmware_state() {
+    case "$1" in
+        UP_TO_DATE|COMPLETED) echo "$GREEN" ;;
+        IN_PROGRESS|UPDATING) echo "$YELLOW" ;;
+        FAILED|ERROR) echo "$RED" ;;
+        *) echo "$WHITE" ;;
+    esac
+}
+
 #===============================================================================
 # TABLE FORMATTING HELPERS
 #===============================================================================
@@ -1768,12 +1786,8 @@ list_fabrics_without_clusters() {
                 fi
                 
                 # Color firmware update state
-                local update_state_color="$WHITE"
-                case "$firmware_update_state" in
-                    UP_TO_DATE|COMPLETED) update_state_color="$GREEN" ;;
-                    IN_PROGRESS|UPDATING) update_state_color="$YELLOW" ;;
-                    FAILED|ERROR) update_state_color="$RED" ;;
-                esac
+                local update_state_color
+                update_state_color=$(color_firmware_state "$firmware_update_state")
                 
                 printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
                     "$firmware_update_state" "$current_short" "$target_short"
@@ -2393,13 +2407,7 @@ display_clique_summary() {
         
         # Color state based on value
         local state_color
-        case "$cluster_state" in
-            ACTIVE) state_color="$GREEN" ;;
-            CREATING) state_color="$CYAN" ;;
-            UPDATING|SCALING) state_color="$YELLOW" ;;
-            INACTIVE|FAILED|DELETED|DELETING) state_color="$RED" ;;
-            *) state_color="$WHITE" ;;
-        esac
+        state_color=$(color_cluster_state "$cluster_state")
         
         # Color available hosts - light green if not 0
         local avail_color="$WHITE"
@@ -2412,26 +2420,38 @@ display_clique_summary() {
         printf "${clique_color}%-48s${NC} ${WHITE}%6s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC} ${WHITE}%6s${NC}       ${WHITE}%6s${NC}       ${state_color}%-12s${NC}\n" \
             "$clique_id" "$nodes" "$healthy_hosts" "$available_hosts" "$total_hosts" "$gpu_cluster_size" "$cluster_state"
         
+        # Fabric (first)
+        if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
+            printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Fabric:" "$fabric_name" "$fabric_ocid"
+        fi
+        
         # GPU Memory Cluster
-        if [[ "$gpu_mem_cluster" != "N/A" && "$gpu_mem_cluster" != "null" && -n "$gpu_mem_cluster" ]]; then
+        if is_valid_ocid "$gpu_mem_cluster"; then
             local gpu_cluster_name
             gpu_cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
             printf "          ${WHITE}├─${NC} ${BOLD}${MAGENTA}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "GPU Mem Cluster:" "$gpu_cluster_name" "$gpu_mem_cluster"
         fi
         
-        if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" && -n "$compute_cluster_id" ]]; then
+        # Compute Cluster
+        if is_valid_ocid "$compute_cluster_id"; then
             local compute_cluster_name
             compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
             printf "          ${WHITE}├─${NC} ${BOLD}${BLUE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_id"
         fi
         
+        # Instance Config
+        if is_valid_ocid "$instance_config_id"; then
+            local instance_config_name
+            instance_config_name=$(get_instance_config_name "$instance_config_id")
+            printf "          ${WHITE}├─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "Instance Config:" "$instance_config_name" "$instance_config_id"
+        fi
+        
+        # Firmware (last)
         if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "Fabric:" "$fabric_name" "$fabric_ocid"
-            
-            # Display firmware bundle IDs if available
             if [[ "$current_firmware" != "N/A" && -n "$current_firmware" ]]; then
                 local current_short="${current_firmware: -5}"
                 local target_short="${target_firmware: -5}"
@@ -2443,23 +2463,12 @@ display_clique_summary() {
                 fi
                 
                 # Color firmware update state
-                local update_state_color="$WHITE"
-                case "$firmware_update_state" in
-                    UP_TO_DATE|COMPLETED) update_state_color="$GREEN" ;;
-                    IN_PROGRESS|UPDATING) update_state_color="$YELLOW" ;;
-                    FAILED|ERROR) update_state_color="$RED" ;;
-                esac
+                local update_state_color
+                update_state_color=$(color_firmware_state "$firmware_update_state")
                 
-                printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
+                printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
                     "$firmware_update_state" "$current_short" "$target_short"
             fi
-        fi
-        
-        if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
-            local instance_config_name
-            instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${WHITE}└─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "Instance Config:" "$instance_config_name" "$instance_config_id"
         fi
         echo ""
     done <<< "$sorted_summary"
@@ -2555,7 +2564,7 @@ list_all_cliques() {
             if [[ "$mem_cluster" != "N/A" ]]; then
                 local instance_config_id
                 instance_config_id=$(get_instance_config_from_cluster "$mem_cluster")
-                if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+                if is_valid_ocid "$instance_config_id"; then
                     local instance_config_name
                     instance_config_name=$(get_instance_config_name "$instance_config_id")
                     echo -e "    ${BOLD}${YELLOW}Instance Config:${NC} ${WHITE}$instance_config_name${NC}"
@@ -2645,7 +2654,7 @@ list_cliques_summary() {
         for mc in $(echo "${!mem_clusters[@]}" | tr ' ' '\n' | sort); do
             if [[ "$mc" != "N/A" && -n "${mem_cluster_instance_configs[$mc]:-}" ]]; then
                 local ic="${mem_cluster_instance_configs[$mc]}"
-                if [[ "$ic" != "N/A" && "$ic" != "null" && -n "$ic" ]]; then
+                if is_valid_ocid "$ic"; then
                     local short_mc="...${mc: -12}"
                     local ic_name
                     ic_name=$(get_instance_config_name "$ic")
@@ -2825,7 +2834,7 @@ get_node_info() {
         cluster_state_color=$(color_cluster_state "$cluster_state")
         echo -e "  ${WHITE}Cluster State:${NC}     ${cluster_state_color}${cluster_state}${NC}"
         
-        if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+        if is_valid_ocid "$instance_config_id"; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
             echo -e "  ${WHITE}Instance Config:${NC}   ${WHITE}$instance_config_name${NC}"
@@ -2965,7 +2974,7 @@ get_node_info() {
             if [[ "$mem_cluster" != "N/A" ]]; then
                 local ic
                 ic=$(get_instance_config_from_cluster "$mem_cluster")
-                if [[ "$ic" != "N/A" && "$ic" != "null" && -n "$ic" ]]; then
+                if is_valid_ocid "$ic"; then
                     local ic_name
                     ic_name=$(get_instance_config_name "$ic")
                     echo -e "    ${BOLD}${YELLOW}Instance Config:${NC} ${WHITE}$ic_name${NC}"
@@ -3025,7 +3034,7 @@ list_instances_by_gpu_cluster() {
     # Get and display instance configuration
     local instance_config_id
     instance_config_id=$(get_instance_config_from_cluster "$gpu_cluster")
-    if [[ "$instance_config_id" != "N/A" && "$instance_config_id" != "null" && -n "$instance_config_id" ]]; then
+    if is_valid_ocid "$instance_config_id"; then
         local instance_config_name
         instance_config_name=$(get_instance_config_name "$instance_config_id")
         echo -e "${CYAN}Instance Configuration:${NC} ${WHITE}$instance_config_name${NC}"
@@ -3183,8 +3192,22 @@ display_gpu_management_menu() {
     local cluster_idx=0
     
     if [[ -f "$FABRIC_CACHE" ]]; then
+        # Sort fabrics by state: OCCUPIED first, then AVAILABLE, PROVISIONING, UNAVAILABLE
+        local sorted_fabrics
+        sorted_fabrics=$(grep -v '^#' "$FABRIC_CACHE" 2>/dev/null | awk -F'|' '
+            {
+                state = $4
+                # Assign sort order based on state
+                if (state == "OCCUPIED") order = 1
+                else if (state == "AVAILABLE") order = 2
+                else if (state == "PROVISIONING") order = 3
+                else if (state == "UNAVAILABLE") order = 4
+                else order = 5
+                print order "|" $0
+            }
+        ' | sort -t'|' -k1,1n | cut -d'|' -f2-)
+        
         while IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_fw target_fw fw_state; do
-            [[ "$fabric_name" =~ ^#.*$ ]] && continue
             [[ -z "$fabric_ocid" ]] && continue
             
             ((fabric_idx++))
@@ -3194,8 +3217,11 @@ display_gpu_management_menu() {
             # Color state
             local state_color
             case "$fabric_state" in
+                OCCUPIED) state_color="$GREEN" ;;
                 AVAILABLE) state_color="$GREEN" ;;
-                *) state_color="$RED" ;;
+                PROVISIONING) state_color="$CYAN" ;;
+                UNAVAILABLE) state_color="$RED" ;;
+                *) state_color="$WHITE" ;;
             esac
             
             # Color available hosts
@@ -3249,24 +3275,18 @@ display_gpu_management_menu() {
                     [[ $cluster_i -eq $num_clusters ]] && { connector="└──"; continuation=" "; }
                     
                     # Determine state color
-                    local state_color="$GREEN"
-                    case "$cluster_state" in
-                        ACTIVE) state_color="$GREEN" ;;
-                        CREATING) state_color="$CYAN" ;;
-                        UPDATING|SCALING) state_color="$YELLOW" ;;
-                        FAILED|INACTIVE|DELETED|DELETING) state_color="$RED" ;;
-                        *) state_color="$WHITE" ;;
-                    esac
+                    local state_color
+                    state_color=$(color_cluster_state "$cluster_state")
                     
                     # Cluster line 1: ID, Name, State (aligned), Size (aligned with Total), OCID on same line
                     printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-37s${NC} ${state_color}%-12s${NC} %8s %6s${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
                         "$gid" "$cluster_name" "$cluster_state" "" "" "$cluster_size" "$cluster_ocid"
                     
-                    # Cluster line 2: Instance Configuration (full name)
-                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Instance Config: ${GREEN}%s${NC}\n" "$ic_name"
-                    
-                    # Cluster line 3: Compute Cluster
+                    # Cluster line 2: Compute Cluster
                     printf "     ${WHITE}${continuation}${NC}            ${GRAY}Compute Cluster: ${BLUE}%s${NC}\n" "$cc_name"
+                    
+                    # Cluster line 3: Instance Configuration (full name)
+                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Instance Config: ${GREEN}%s${NC}\n" "$ic_name"
                 done
             fi
             
@@ -3276,7 +3296,7 @@ display_gpu_management_menu() {
             fi
             
             echo ""
-        done < <(grep -v '^#' "$FABRIC_CACHE" 2>/dev/null)
+        done <<< "$sorted_fabrics"
     fi
     
     [[ $fabric_idx -eq 0 ]] && echo -e "  ${YELLOW}No GPU Memory Fabrics found${NC}"
@@ -4932,15 +4952,16 @@ manage_compute_instances() {
         # Display instances table
         echo -e "${BOLD}${WHITE}═══ Instances ═══${NC}"
         echo ""
-        printf "${BOLD}%-5s %-32s %-12s %-8s %-12s %-26s %-15s %s${NC}\n" \
-            "ID" "Display Name" "State" "K8s" "newNode" "Shape" "Avail Domain" "Instance OCID"
-        print_separator 220
+        printf "${BOLD}%-5s %-32s %-12s %-8s %-12s %-26s %-12s %-20s %s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "newNode" "Shape" "Avail Domain" "Created" "Instance OCID"
+        print_separator 240
         
+        # Sort by time-created (ascending - oldest first, newest last)
         echo "$instances_json" | jq -r '
             .data[] | 
             select(.["lifecycle-state"] != "TERMINATED") |
-            "\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["availability-domain"])|\(.id)"
-        ' 2>/dev/null | sort | while IFS='|' read -r name state shape ad ocid; do
+            "\(.["time-created"] // "N/A")|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["availability-domain"])|\(.id)"
+        ' 2>/dev/null | sort -t'|' -k1,1 | while IFS='|' read -r time_created name state shape ad ocid; do
             ((instance_idx++))
             local iid="i${instance_idx}"
             
@@ -4992,8 +5013,16 @@ manage_compute_instances() {
             local shape_trunc="${shape:0:26}"
             local ad_short="${ad##*:}"
             
-            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${new_node_color}%-12s${NC} %-26s %-15s ${GRAY}%s${NC}\n" \
-                "$iid" "$name_trunc" "$state" "$k8s_status" "$new_node_taint" "$shape_trunc" "$ad_short" "$ocid"
+            # Format time_created - show date and time portion
+            local time_display="$time_created"
+            if [[ "$time_display" != "N/A" && -n "$time_display" ]]; then
+                # Format: 2026-01-27T03:29:11.123Z -> 2026-01-27 03:29
+                time_display="${time_display:0:16}"
+                time_display="${time_display/T/ }"
+            fi
+            
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${new_node_color}%-12s${NC} %-26s %-12s ${GRAY}%-20s${NC} ${GRAY}%s${NC}\n" \
+                "$iid" "$name_trunc" "$state" "$k8s_status" "$new_node_taint" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
         done
         
         # Read map from temp file
@@ -5464,7 +5493,7 @@ display_instance_details() {
                 echo ""
                 echo -e "  ${BOLD}${WHITE}NIC ${nic_index}:${NC} ${GREEN}$vnic_name${NC}${primary_marker}"
                 echo -e "    ${WHITE}Private IP:${NC}  ${CYAN}$private_ip${NC}"
-                if [[ "$public_ip" != "N/A" && "$public_ip" != "null" && -n "$public_ip" ]]; then
+                if is_valid_ocid "$public_ip"; then
                     echo -e "    ${WHITE}Public IP:${NC}   ${CYAN}$public_ip${NC}"
                 fi
                 echo -e "    ${WHITE}MAC Address:${NC} $mac_addr"
