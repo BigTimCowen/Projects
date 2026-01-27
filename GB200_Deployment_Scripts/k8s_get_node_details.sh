@@ -533,7 +533,7 @@ fetch_oke_environment() {
     # Get OKE cluster info
     # Priority: 1) OKE_CLUSTER_ID from variables.sh, 2) Auto-discover first active cluster
     local cluster_json
-    local cluster_name cluster_ocid cluster_state pod_network vcn_ocid
+    local cluster_name cluster_ocid cluster_state cluster_version pod_network vcn_ocid
     
     if [[ -n "$configured_cluster_id" && "$configured_cluster_id" != "N/A" ]]; then
         # Use specific cluster from variables.sh
@@ -544,25 +544,45 @@ fetch_oke_environment() {
             cluster_name=$(echo "$cluster_json" | jq -r '.data.name // "N/A"')
             cluster_ocid=$(echo "$cluster_json" | jq -r '.data.id // "N/A"')
             cluster_state=$(echo "$cluster_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+            cluster_version=$(echo "$cluster_json" | jq -r '.data["kubernetes-version"] // "N/A"')
             pod_network=$(echo "$cluster_json" | jq -r '.data["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
             vcn_ocid=$(echo "$cluster_json" | jq -r '.data["vcn-id"] // "N/A"')
         else
             log_warn "Failed to fetch cluster with OKE_CLUSTER_ID from variables.sh, falling back to auto-discovery"
+            # List to find cluster ID, then get full details
             cluster_json=$(oci ce cluster list --compartment-id "$compartment_id" --region "$region" --lifecycle-state ACTIVE --limit 1 --output json 2>/dev/null)
-            cluster_name=$(echo "$cluster_json" | jq -r '.data[0].name // "N/A"')
             cluster_ocid=$(echo "$cluster_json" | jq -r '.data[0].id // "N/A"')
-            cluster_state=$(echo "$cluster_json" | jq -r '.data[0]["lifecycle-state"] // "N/A"')
-            pod_network=$(echo "$cluster_json" | jq -r '.data[0]["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
-            vcn_ocid=$(echo "$cluster_json" | jq -r '.data[0]["vcn-id"] // "N/A"')
+            
+            # Fetch full details using cluster get
+            if [[ "$cluster_ocid" != "N/A" && -n "$cluster_ocid" ]]; then
+                cluster_json=$(oci ce cluster get --cluster-id "$cluster_ocid" --output json 2>/dev/null)
+                cluster_name=$(echo "$cluster_json" | jq -r '.data.name // "N/A"')
+                cluster_state=$(echo "$cluster_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                cluster_version=$(echo "$cluster_json" | jq -r '.data["kubernetes-version"] // "N/A"')
+                pod_network=$(echo "$cluster_json" | jq -r '.data["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
+                vcn_ocid=$(echo "$cluster_json" | jq -r '.data["vcn-id"] // "N/A"')
+            fi
         fi
     else
-        # Auto-discover first active cluster
+        # Auto-discover first active cluster - list to find ID, then get full details
         cluster_json=$(oci ce cluster list --compartment-id "$compartment_id" --region "$region" --lifecycle-state ACTIVE --limit 1 --output json 2>/dev/null)
-        cluster_name=$(echo "$cluster_json" | jq -r '.data[0].name // "N/A"')
         cluster_ocid=$(echo "$cluster_json" | jq -r '.data[0].id // "N/A"')
-        cluster_state=$(echo "$cluster_json" | jq -r '.data[0]["lifecycle-state"] // "N/A"')
-        pod_network=$(echo "$cluster_json" | jq -r '.data[0]["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
-        vcn_ocid=$(echo "$cluster_json" | jq -r '.data[0]["vcn-id"] // "N/A"')
+        
+        # Fetch full details using cluster get (includes kubernetes-version)
+        if [[ "$cluster_ocid" != "N/A" && -n "$cluster_ocid" ]]; then
+            cluster_json=$(oci ce cluster get --cluster-id "$cluster_ocid" --output json 2>/dev/null)
+            cluster_name=$(echo "$cluster_json" | jq -r '.data.name // "N/A"')
+            cluster_state=$(echo "$cluster_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+            cluster_version=$(echo "$cluster_json" | jq -r '.data["kubernetes-version"] // "N/A"')
+            pod_network=$(echo "$cluster_json" | jq -r '.data["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
+            vcn_ocid=$(echo "$cluster_json" | jq -r '.data["vcn-id"] // "N/A"')
+        else
+            cluster_name="N/A"
+            cluster_state="N/A"
+            cluster_version="N/A"
+            pod_network="N/A"
+            vcn_ocid="N/A"
+        fi
     fi
     
     # Get cluster addons/plugins if we have a cluster OCID
@@ -669,6 +689,7 @@ fetch_oke_environment() {
         echo "CLUSTER_NAME|${cluster_name}"
         echo "OKE_CLUSTER_ID|${cluster_ocid}"
         echo "CLUSTER_STATE|${cluster_state}"
+        echo "CLUSTER_VERSION|${cluster_version}"
         echo "CLUSTER_ADDONS|${cluster_addons}"
         echo "POD_NETWORK|${pod_network}"
         echo "VCN_NAME|${vcn_name}"
@@ -1547,7 +1568,7 @@ display_oke_environment_header() {
     
     # Read values from cache
     local tenancy_ocid compartment_name ads
-    local cluster_name cluster_ocid cluster_state cluster_addons pod_network vcn_name vcn_ocid
+    local cluster_name cluster_ocid cluster_state cluster_version cluster_addons pod_network vcn_name vcn_ocid
     local compute_cluster_name compute_cluster_ocid
     
     tenancy_ocid=$(get_oke_env_value "TENANCY_OCID")
@@ -1556,12 +1577,30 @@ display_oke_environment_header() {
     cluster_name=$(get_oke_env_value "CLUSTER_NAME")
     cluster_ocid=$(get_oke_env_value "OKE_CLUSTER_ID")
     cluster_state=$(get_oke_env_value "CLUSTER_STATE")
+    cluster_version=$(get_oke_env_value "CLUSTER_VERSION")
     cluster_addons=$(get_oke_env_value "CLUSTER_ADDONS")
     pod_network=$(get_oke_env_value "POD_NETWORK")
     vcn_name=$(get_oke_env_value "VCN_NAME")
     vcn_ocid=$(get_oke_env_value "VCN_OCID")
     compute_cluster_name=$(get_oke_env_value "COMPUTE_CLUSTER_NAME")
     compute_cluster_ocid=$(get_oke_env_value "COMPUTE_CLUSTER_OCID")
+    
+    # If cluster version is empty/N/A, fetch directly from OCI (same as manage_oke_cluster)
+    if [[ -z "$cluster_version" || "$cluster_version" == "N/A" ]] && [[ -n "$cluster_ocid" && "$cluster_ocid" != "N/A" ]]; then
+        local cluster_json
+        cluster_json=$(oci ce cluster get --cluster-id "$cluster_ocid" --output json 2>/dev/null)
+        if [[ -n "$cluster_json" ]]; then
+            cluster_version=$(echo "$cluster_json" | jq -r '.data["kubernetes-version"] // "N/A"')
+            # Update cache with the version
+            if [[ -f "$OKE_ENV_CACHE" && -n "$cluster_version" && "$cluster_version" != "N/A" ]]; then
+                if grep -q "^CLUSTER_VERSION|" "$OKE_ENV_CACHE" 2>/dev/null; then
+                    sed -i "s/^CLUSTER_VERSION|.*/CLUSTER_VERSION|${cluster_version}/" "$OKE_ENV_CACHE"
+                else
+                    echo "CLUSTER_VERSION|${cluster_version}" >> "$OKE_ENV_CACHE"
+                fi
+            fi
+        fi
+    fi
     
     # Box width for content (excluding border chars)
     local width=148
@@ -1633,6 +1672,7 @@ display_oke_environment_header() {
     [[ $cluster_padding -lt 0 ]] && cluster_padding=0
     printf "${BOLD}${BLUE}║${NC}  ${CYAN}%-${label_width}s${NC}${WHITE}%s${NC} ${GREEN}[%s]${NC} ${YELLOW}(%s)${NC}%${cluster_padding}s${BOLD}${BLUE}║${NC}\n" "OKE Cluster:" "$cluster_name" "$cluster_state" "$cluster_ocid" ""
     
+    _print_row "OKE Version:" "$cluster_version"
     _print_row "Pod Network:" "$pod_network"
     _print_row "Cluster Addons:" "$cluster_addons"
     _print_row_with_ocid "VCN:" "$vcn_name" "$vcn_ocid"
@@ -1871,7 +1911,7 @@ list_instances_not_in_k8s() {
         return 0
     fi
     
-    # Display numbered list of orphan instances
+    # Display numbered list of instances not in kubernetes
     printf "${BOLD}%-4s %-35s %-10s %-15s %s${NC}\n" \
         "#" "Display Name" "OCI State" "GPU Mem Cluster" "Instance OCID"
     print_separator 160
@@ -1890,7 +1930,7 @@ list_instances_not_in_k8s() {
     done
     
     echo ""
-    echo -e "${YELLOW}Total orphan instances: ${orphan_count}${NC}"
+    echo -e "${YELLOW}Total instances not in kubernetes: ${orphan_count}${NC}"
     
     # Interactive mode - prompt for console history
     if [[ "$interactive" == "true" && -t 0 ]]; then
@@ -1921,7 +1961,7 @@ list_instances_not_in_k8s() {
     fi
 }
 
-# Non-interactive version for scripting - just list orphans
+# Non-interactive version for scripting - just list instances not in kubernetes
 list_instances_not_in_k8s_non_interactive() {
     local oci_temp="$1"
     local k8s_temp="$2"
@@ -2076,7 +2116,7 @@ list_all_instances() {
             IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
             node_state=$(get_node_state_cached "$instance_ocid")
         else
-            # Instance is NOT in Kubernetes (orphan)
+            # Instance is NOT in Kubernetes
             node_name="-"
             clique_id="-"
             node_state="-"
@@ -2294,8 +2334,34 @@ display_clique_summary() {
         "Clique ID" "Nodes" "Healthy" "Avail" "Total" "Size" "State"
     print_separator 106
     
+    # Sort summary: N/A first, NOT_IN_K8S second, NO_INSTANCES third, then by clique ID
+    local sorted_summary
+    sorted_summary=$(sort -t'|' -k1,1 "$summary_temp" | awk -F'|' '
+        /^N\/A / { na[NR] = $0; next }
+        /^NOT_IN_K8S/ { notink8s[NR] = $0; next }
+        /^NO_INSTANCES/ { noinst[NR] = $0; next }
+        { other[NR] = $0 }
+        END {
+            for (i in na) print na[i]
+            for (i in notink8s) print notink8s[i]
+            for (i in other) print other[i]
+            for (i in noinst) print noinst[i]
+        }
+    ')
+    
+    # Calculate totals
+    local total_k8s_nodes=0
+    local total_gpu_cluster_size=0
+    
     local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size
     while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size; do
+        # Add to totals (skip N/A, NOT_IN_K8S, NO_INSTANCES for K8s nodes count)
+        if [[ "$clique_id" != "N/A"* && "$clique_id" != "NOT_IN_K8S"* && "$clique_id" != "NO_INSTANCES"* ]]; then
+            [[ "$nodes" =~ ^[0-9]+$ ]] && total_k8s_nodes=$((total_k8s_nodes + nodes))
+        fi
+        # Add to GPU cluster size totals
+        [[ "$gpu_cluster_size" =~ ^[0-9]+$ ]] && total_gpu_cluster_size=$((total_gpu_cluster_size + gpu_cluster_size))
+        
         # Color state based on value
         local state_color
         case "$cluster_state" in
@@ -2367,7 +2433,15 @@ display_clique_summary() {
                 "Instance Config:" "$instance_config_name" "$instance_config_id"
         fi
         echo ""
-    done < "$summary_temp"
+    done <<< "$sorted_summary"
+    
+    # Print totals
+    print_separator 106
+    printf "${BOLD}${WHITE}%-48s %6s %8s %6s %6s       %6s${NC}\n" \
+        "TOTALS" "$total_k8s_nodes" "" "" "" "$total_gpu_cluster_size"
+    echo -e "${GRAY}  Total K8s Nodes (in GPU cliques): ${WHITE}$total_k8s_nodes${NC}"
+    echo -e "${GRAY}  Total GPU Memory Cluster Size: ${WHITE}$total_gpu_cluster_size${NC}"
+    echo ""
     
     rm -f "$joined_temp" "$summary_temp"
 }
@@ -6960,7 +7034,7 @@ show_help() {
     echo "                      Useful after infrastructure changes or stale data"
     echo ""
     echo -e "${BOLD}Interactive Features:${NC}"
-    echo "  When listing GPU instances, if orphan instances (running in OCI but not in K8s)"
+    echo "  When listing GPU instances, if instances not in kubernetes (running in OCI but not in K8s)"
     echo "  are found, you will be prompted to select one to view its console history."
     echo "  This helps diagnose why an instance failed to join the Kubernetes cluster."
     echo ""
