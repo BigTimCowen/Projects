@@ -1792,6 +1792,17 @@ get_console_history() {
     echo -e "${BOLD}${MAGENTA}--- End of Console Output ---${NC}"
     echo ""
     
+    # Delete the console history to clean up
+    log_info "Cleaning up console history..."
+    if oci compute console-history delete \
+        --instance-console-history-id "$console_history_id" \
+        --force 2>/dev/null; then
+        echo -e "${GREEN}✓ Console history deleted: ${console_history_id}${NC}"
+    else
+        echo -e "${YELLOW}⚠ Failed to delete console history: ${console_history_id}${NC}"
+    fi
+    echo ""
+    
     return 0
 }
 
