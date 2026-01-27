@@ -342,11 +342,11 @@ fetch_instance_configurations() {
         return 1
     fi
     
-    # Write cache header and data
+    # Write cache header and data (now includes time-created)
     {
         echo "# Instance Configurations"
-        echo "# Format: InstanceConfigOCID|DisplayName"
-        jq -r '.data[]? | "\(.id)|\(.["display-name"] // "N/A")"' "$raw_json" 2>/dev/null
+        echo "# Format: InstanceConfigOCID|DisplayName|TimeCreated"
+        jq -r '.data[]? | "\(.id)|\(.["display-name"] // "N/A")|\(.["time-created"] // "N/A")"' "$raw_json" 2>/dev/null
     } > "$INSTANCE_CONFIG_CACHE"
     
     rm -f "$raw_json"
@@ -365,6 +365,60 @@ get_instance_config_name() {
     
     # Lookup from cache
     lookup_cache "$INSTANCE_CONFIG_CACHE" "$config_id" 2
+}
+
+# Extract and display user-data (cloud-init) from an instance configuration
+# Args: $1 = instance configuration OCID
+get_instance_config_user_data() {
+    local ic_ocid="$1"
+    
+    if [[ -z "$ic_ocid" ]]; then
+        log_error "Instance configuration OCID required"
+        return 1
+    fi
+    
+    # Validate OCID format
+    if [[ ! "$ic_ocid" =~ ^ocid1\.instanceconfiguration\. ]]; then
+        log_error "Invalid instance configuration OCID format: $ic_ocid"
+        echo "Expected format: ocid1.instanceconfiguration.oc1.<region>.<unique-id>" >&2
+        return 1
+    fi
+    
+    log_info "Fetching instance configuration..." >&2
+    
+    local ic_json
+    ic_json=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ic_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$ic_json" ]] || ! echo "$ic_json" | jq -e '.data' > /dev/null 2>&1; then
+        log_error "Failed to fetch instance configuration: $ic_ocid"
+        return 1
+    fi
+    
+    local ic_name
+    ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
+    
+    # Extract user_data (base64 encoded)
+    local user_data_b64
+    user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    
+    if [[ -z "$user_data_b64" ]]; then
+        echo "# No user-data found in instance configuration: $ic_name" >&2
+        echo "# OCID: $ic_ocid" >&2
+        return 0
+    fi
+    
+    # Output header as comments (to stderr so stdout is just the yaml)
+    echo "# Instance Configuration: $ic_name" >&2
+    echo "# OCID: $ic_ocid" >&2
+    echo "# Decoded cloud-init user-data:" >&2
+    echo "#" >&2
+    
+    # Decode and output to stdout
+    echo "$user_data_b64" | base64 -d 2>/dev/null
+    
+    return 0
 }
 
 # Fetch and cache compute clusters from OCI
@@ -3310,7 +3364,7 @@ display_gpu_management_menu() {
     
     local ic_idx=0
     if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        while IFS='|' read -r ic_ocid ic_name; do
+        while IFS='|' read -r ic_ocid ic_name _; do
             [[ "$ic_ocid" =~ ^#.*$ ]] && continue
             [[ -z "$ic_ocid" ]] && continue
             
@@ -3378,10 +3432,11 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}2${NC}) ${WHITE}Network Resources${NC}             - View subnets and NSGs grouped by function"
         echo -e "  ${GREEN}3${NC}) ${WHITE}GPU Memory Fabrics & Clusters${NC} - Manage GPU memory fabrics and clusters"
         echo -e "  ${GREEN}4${NC}) ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
+        echo -e "  ${GREEN}5${NC}) ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
         echo ""
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-4, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-5, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3405,13 +3460,16 @@ interactive_management_main_menu() {
             4)
                 manage_compute_instances
                 ;;
+            5)
+                manage_instance_configurations
+                ;;
             q|Q|quit|QUIT|exit|EXIT)
                 echo ""
                 echo -e "${GREEN}Exiting management mode${NC}"
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-4, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-5, or q.${NC}"
                 ;;
         esac
     done
@@ -5595,6 +5653,1039 @@ display_instance_details() {
 }
 
 #===============================================================================
+# INSTANCE CONFIGURATION MANAGEMENT
+#===============================================================================
+
+manage_instance_configurations() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    # Build instance config index map
+    declare -A LOCAL_IC_INDEX_MAP=()
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${GREEN}                                                    INSTANCE CONFIGURATION MANAGEMENT                                                                    ${NC}"
+        echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        # Fetch and display instance configurations
+        fetch_instance_configurations > /dev/null 2>&1
+        
+        echo -e "${BOLD}${WHITE}═══ Instance Configurations ═══${NC}"
+        echo ""
+        printf "${BOLD}%-5s %-55s %-20s %s${NC}\n" "ID" "Name" "Created" "OCID"
+        print_separator 160
+        
+        local ic_idx=0
+        LOCAL_IC_INDEX_MAP=()
+        
+        if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+            # Read from cache (now includes time-created)
+            while IFS='|' read -r ic_ocid ic_name ic_time_created; do
+                [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+                [[ -z "$ic_ocid" ]] && continue
+                
+                ((ic_idx++))
+                local iid="i${ic_idx}"
+                LOCAL_IC_INDEX_MAP[$iid]="$ic_ocid"
+                IC_INDEX_MAP[$iid]="$ic_ocid"
+                
+                # Format time_created from cache
+                local time_display="N/A"
+                if [[ -n "$ic_time_created" && "$ic_time_created" != "N/A" ]]; then
+                    time_display="${ic_time_created:0:16}"
+                    time_display="${time_display/T/ }"
+                fi
+                
+                printf "${YELLOW}%-5s${NC} ${WHITE}%-55s${NC} ${GRAY}%-20s${NC} ${CYAN}%s${NC}\n" \
+                    "$iid" "${ic_name:0:55}" "$time_display" "$ic_ocid"
+            done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+        fi
+        
+        if [[ $ic_idx -eq 0 ]]; then
+            echo -e "  ${GRAY}No instance configurations found${NC}"
+        fi
+        
+        echo ""
+        echo -e "${GRAY}Total: ${ic_idx} instance configurations${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo -e "  ${YELLOW}i#${NC}          - View instance configuration details and user-data (e.g., 'i1', 'i2')"
+        echo -e "  ${GREEN}create${NC}      - Create a new Instance Configuration"
+        echo -e "  ${YELLOW}rename${NC}      - Rename an Instance Configuration (with recommended name)"
+        echo -e "  ${RED}delete${NC}      - Delete an Instance Configuration"
+        echo -e "  ${BLUE}update-all${NC}  - Update ALL GPU Memory Clusters with a selected Instance Configuration"
+        echo -e "  ${MAGENTA}compare${NC}     - Compare cloud-init between two instance configurations"
+        echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
+        echo -e "  ${CYAN}back${NC}        - Return to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection [i#/create/rename/delete/update-all/compare/refresh/back]: ${NC}"
+        
+        local input
+        read -r input
+        
+        # Empty input goes back
+        if [[ -z "$input" ]]; then
+            return
+        fi
+        
+        case "$input" in
+            create|CREATE)
+                create_instance_configuration_interactive
+                ;;
+            rename|RENAME)
+                rename_instance_configuration_interactive
+                ;;
+            delete|DELETE)
+                delete_instance_configuration_interactive
+                ;;
+            update-all|UPDATE-ALL)
+                update_all_clusters_instance_config
+                ;;
+            compare|COMPARE)
+                compare_instance_configurations
+                ;;
+            refresh|REFRESH)
+                echo -e "${YELLOW}Refreshing cache...${NC}"
+                rm -f "$INSTANCE_CONFIG_CACHE"
+                ;;
+            quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
+                return
+                ;;
+            i[0-9]*)
+                view_instance_configuration_detail "$input"
+                ;;
+            *)
+                echo -e "${RED}Unknown command: $input${NC}"
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# View Instance Configuration Detail with user-data decoding
+#--------------------------------------------------------------------------------
+view_instance_configuration_detail() {
+    local ic_id="$1"
+    local ic_ocid="${IC_INDEX_MAP[$ic_id]:-}"
+    
+    if [[ -z "$ic_ocid" ]]; then
+        echo -e "${RED}Invalid instance config ID: $ic_id${NC}"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                       INSTANCE CONFIGURATION DETAILS                          ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    
+    local ic_json
+    ic_json=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ic_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$ic_json" ]]; then
+        echo -e "${RED}Failed to fetch instance configuration details${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    local ic_name ic_time_created ic_compartment
+    ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
+    ic_time_created=$(echo "$ic_json" | jq -r '.data["time-created"] // "N/A"')
+    ic_compartment=$(echo "$ic_json" | jq -r '.data["compartment-id"] // "N/A"')
+    
+    echo ""
+    echo -e "${WHITE}Name:${NC}         ${GREEN}$ic_name${NC}"
+    echo -e "${WHITE}OCID:${NC}         ${YELLOW}$ic_ocid${NC}"
+    echo -e "${WHITE}Time Created:${NC} $ic_time_created"
+    echo -e "${WHITE}Compartment:${NC}  ${GRAY}...${ic_compartment: -30}${NC}"
+    
+    # Show instance details from the configuration
+    echo ""
+    echo -e "${BOLD}${CYAN}Instance Details:${NC}"
+    local shape ad boot_size boot_vpus image_id subnet_id
+    shape=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["shape"] // "N/A"')
+    ad=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["availability-domain"] // "N/A"')
+    boot_size=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["bootVolumeSizeInGBs"] // "N/A"')
+    boot_vpus=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["bootVolumeVpusPerGB"] // "N/A"')
+    image_id=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["image-id"] // "N/A"')
+    subnet_id=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["create-vnic-details"]["subnet-id"] // "N/A"')
+    local max_pods
+    max_pods=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["oke-max-pods"] // "N/A"')
+    
+    echo -e "  ${WHITE}Shape:${NC}              $shape"
+    echo -e "  ${WHITE}Availability Domain:${NC} $ad"
+    echo -e "  ${WHITE}Boot Volume Size:${NC}   ${boot_size} GB"
+    echo -e "  ${WHITE}Boot Volume VPUs:${NC}   ${boot_vpus} VPUs/GB"
+    echo -e "  ${WHITE}Max Pods:${NC}           $max_pods"
+    echo -e "  ${WHITE}Image ID:${NC}           ${GRAY}...${image_id: -25}${NC}"
+    echo -e "  ${WHITE}Subnet ID:${NC}          ${GRAY}...${subnet_id: -25}${NC}"
+    
+    # Check for user_data
+    local user_data_b64
+    user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    
+    local has_user_data="false"
+    [[ -n "$user_data_b64" ]] && has_user_data="true"
+    
+    # Check for SSH keys
+    local ssh_keys
+    ssh_keys=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["ssh_authorized_keys"] // empty' 2>/dev/null)
+    
+    if [[ -n "$ssh_keys" ]]; then
+        echo ""
+        echo -e "${BOLD}${CYAN}SSH Keys:${NC}"
+        echo -e "  ${GREEN}✓ SSH authorized keys are configured${NC}"
+    fi
+    
+    if [[ "$has_user_data" == "true" ]]; then
+        echo ""
+        echo -e "${BOLD}${CYAN}User Data:${NC}"
+        echo -e "  ${GREEN}✓ Cloud-init user-data is configured ($(echo "$user_data_b64" | wc -c) bytes encoded)${NC}"
+    fi
+    
+    # Show actions
+    echo ""
+    echo -e "${BOLD}${WHITE}Actions:${NC}"
+    if [[ "$has_user_data" == "true" ]]; then
+        echo -e "  ${MAGENTA}view${NC}     - View decoded cloud-init user-data"
+        echo -e "  ${MAGENTA}save${NC}     - Save user-data to file"
+    fi
+    echo -e "  ${YELLOW}rename${NC}   - Rename this instance configuration"
+    echo -e "  ${RED}delete${NC}   - Delete this instance configuration"
+    echo -e "  ${CYAN}Enter${NC}    - Return to menu"
+    echo ""
+    echo -n -e "${CYAN}Action [view/save/rename/delete/Enter]: ${NC}"
+    
+    local action
+    read -r action
+    
+    case "$action" in
+        view|VIEW|v|V)
+            if [[ "$has_user_data" == "true" ]]; then
+                echo ""
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${BOLD}${MAGENTA}                         DECODED CLOUD-INIT USER-DATA                          ${NC}"
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo "$user_data_b64" | base64 -d 2>/dev/null
+                echo ""
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            else
+                echo -e "${YELLOW}No user-data found${NC}"
+            fi
+            ;;
+        save|SAVE|s|S)
+            if [[ "$has_user_data" == "true" ]]; then
+                local safe_name
+                safe_name=$(echo "$ic_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                local filename="${safe_name}_cloud-init.yml"
+                
+                echo ""
+                echo -n -e "${CYAN}Save as [${filename}]: ${NC}"
+                local custom_filename
+                read -r custom_filename
+                [[ -n "$custom_filename" ]] && filename="$custom_filename"
+                
+                if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
+                    echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                else
+                    echo -e "${RED}Failed to save user-data${NC}"
+                fi
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            else
+                echo -e "${YELLOW}No user-data found${NC}"
+            fi
+            ;;
+        rename|RENAME|r|R)
+            rename_single_instance_configuration "$ic_ocid" "$ic_name" "$ic_json"
+            ;;
+        delete|DELETE|d|D)
+            delete_single_instance_configuration "$ic_ocid" "$ic_name"
+            ;;
+        *)
+            # Return to menu
+            ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# Compare two Instance Configurations
+#--------------------------------------------------------------------------------
+compare_instance_configurations() {
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══ Compare Instance Configurations ═══${NC}"
+    echo ""
+    
+    # Refresh cache
+    fetch_instance_configurations > /dev/null 2>&1
+    
+    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        echo -e "${RED}No instance configurations found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # List configs
+    local ic_idx=0
+    declare -A COMPARE_IC_MAP=()
+    
+    printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
+    print_separator 80
+    
+    while IFS='|' read -r ic_ocid ic_name _; do
+        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+        [[ -z "$ic_ocid" ]] && continue
+        
+        ((ic_idx++))
+        COMPARE_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
+        printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic_idx" "$ic_name"
+    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+    
+    if [[ $ic_idx -lt 2 ]]; then
+        echo ""
+        echo -e "${YELLOW}Need at least 2 instance configurations to compare${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select first configuration (1-${ic_idx}): ${NC}"
+    local choice1
+    read -r choice1
+    
+    if [[ -z "${COMPARE_IC_MAP[$choice1]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    echo -n -e "${CYAN}Select second configuration (1-${ic_idx}): ${NC}"
+    local choice2
+    read -r choice2
+    
+    if [[ -z "${COMPARE_IC_MAP[$choice2]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local ocid1 name1 ocid2 name2
+    IFS='|' read -r ocid1 name1 <<< "${COMPARE_IC_MAP[$choice1]}"
+    IFS='|' read -r ocid2 name2 <<< "${COMPARE_IC_MAP[$choice2]}"
+    
+    echo ""
+    echo -e "${BOLD}Comparing:${NC}"
+    echo -e "  ${GREEN}A:${NC} $name1"
+    echo -e "  ${BLUE}B:${NC} $name2"
+    echo ""
+    echo -e "${YELLOW}Fetching full configuration details...${NC}"
+    
+    # Get FULL instance configuration JSON for both
+    local json1 json2
+    json1=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ocid1" \
+        --output json 2>/dev/null)
+    
+    json2=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ocid2" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$json1" || -z "$json2" ]]; then
+        echo -e "${RED}Failed to fetch configuration details${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Extract launch-details for comparison
+    local launch1 launch2
+    launch1=$(echo "$json1" | jq '.data["instance-details"]["launch-details"]')
+    launch2=$(echo "$json2" | jq '.data["instance-details"]["launch-details"]')
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}                                                    CONFIGURATION COMPARISON                                                                            ${NC}"
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    
+    # Compare key fields individually
+    local has_diff=false
+    
+    # Shape
+    local shape1 shape2
+    shape1=$(echo "$launch1" | jq -r '.shape // "N/A"')
+    shape2=$(echo "$launch2" | jq -r '.shape // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Shape:${NC}"
+    if [[ "$shape1" == "$shape2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC} $shape1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC} $shape1"
+        echo -e "    ${BLUE}$name2:${NC} $shape2"
+        has_diff=true
+    fi
+    
+    # Availability Domain
+    local ad1 ad2
+    ad1=$(echo "$launch1" | jq -r '.["availability-domain"] // "N/A"')
+    ad2=$(echo "$launch2" | jq -r '.["availability-domain"] // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Availability Domain:${NC}"
+    if [[ "$ad1" == "$ad2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC} $ad1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC} $ad1"
+        echo -e "    ${BLUE}$name2:${NC} $ad2"
+        has_diff=true
+    fi
+    
+    # Boot Volume Size
+    local bvsize1 bvsize2
+    bvsize1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // "N/A"')
+    bvsize2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Boot Volume Size (GB):${NC}"
+    if [[ "$bvsize1" == "$bvsize2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC} $bvsize1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC} $bvsize1"
+        echo -e "    ${BLUE}$name2:${NC} $bvsize2"
+        has_diff=true
+    fi
+    
+    # Boot Volume VPUs
+    local bvvpus1 bvvpus2
+    bvvpus1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // "N/A"')
+    bvvpus2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Boot Volume VPUs/GB:${NC}"
+    if [[ "$bvvpus1" == "$bvvpus2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC} $bvvpus1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC} $bvvpus1"
+        echo -e "    ${BLUE}$name2:${NC} $bvvpus2"
+        has_diff=true
+    fi
+    
+    # Image ID - show full OCID
+    local img1 img2
+    img1=$(echo "$launch1" | jq -r '.["source-details"]["image-id"] // "N/A"')
+    img2=$(echo "$launch2" | jq -r '.["source-details"]["image-id"] // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Image ID:${NC}"
+    if [[ "$img1" == "$img2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC}"
+        echo -e "    $img1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC}"
+        echo -e "      $img1"
+        echo -e "    ${BLUE}$name2:${NC}"
+        echo -e "      $img2"
+        has_diff=true
+    fi
+    
+    # Subnet ID - show full OCID
+    local subnet1 subnet2
+    subnet1=$(echo "$launch1" | jq -r '.["create-vnic-details"]["subnet-id"] // "N/A"')
+    subnet2=$(echo "$launch2" | jq -r '.["create-vnic-details"]["subnet-id"] // "N/A"')
+    echo ""
+    echo -e "${BOLD}${WHITE}Subnet ID:${NC}"
+    if [[ "$subnet1" == "$subnet2" ]]; then
+        echo -e "  ${GREEN}✓ Same:${NC}"
+        echo -e "    $subnet1"
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC}"
+        echo -e "      $subnet1"
+        echo -e "    ${BLUE}$name2:${NC}"
+        echo -e "      $subnet2"
+        has_diff=true
+    fi
+    
+    # NSG IDs - show full OCIDs
+    local nsg1 nsg2
+    nsg1=$(echo "$launch1" | jq -r '.["create-vnic-details"]["nsg-ids"] // []' | jq -r '.[]' 2>/dev/null | sort)
+    nsg2=$(echo "$launch2" | jq -r '.["create-vnic-details"]["nsg-ids"] // []' | jq -r '.[]' 2>/dev/null | sort)
+    echo ""
+    echo -e "${BOLD}${WHITE}NSG IDs:${NC}"
+    if [[ "$nsg1" == "$nsg2" ]]; then
+        if [[ -n "$nsg1" ]]; then
+            echo -e "  ${GREEN}✓ Same:${NC}"
+            echo "$nsg1" | while read -r nsg; do
+                echo -e "    $nsg"
+            done
+        else
+            echo -e "  ${GREEN}✓ Same:${NC} (none)"
+        fi
+    else
+        echo -e "  ${RED}✗ Different:${NC}"
+        echo -e "    ${GREEN}$name1:${NC}"
+        if [[ -n "$nsg1" ]]; then
+            echo "$nsg1" | while read -r nsg; do
+                echo -e "      $nsg"
+            done
+        else
+            echo -e "      (none)"
+        fi
+        echo -e "    ${BLUE}$name2:${NC}"
+        if [[ -n "$nsg2" ]]; then
+            echo "$nsg2" | while read -r nsg; do
+                echo -e "      $nsg"
+            done
+        else
+            echo -e "      (none)"
+        fi
+        has_diff=true
+    fi
+    
+    # Metadata fields (excluding user_data which we'll handle separately)
+    echo ""
+    echo -e "${BOLD}${WHITE}Metadata Fields:${NC}"
+    local meta1_keys meta2_keys
+    meta1_keys=$(echo "$launch1" | jq -r '.metadata // {} | keys[]' 2>/dev/null | grep -v '^user_data$' | sort)
+    meta2_keys=$(echo "$launch2" | jq -r '.metadata // {} | keys[]' 2>/dev/null | grep -v '^user_data$' | sort)
+    
+    # Find all unique keys
+    local all_meta_keys
+    all_meta_keys=$(echo -e "${meta1_keys}\n${meta2_keys}" | sort -u | grep -v '^$')
+    
+    if [[ -z "$all_meta_keys" ]]; then
+        echo -e "  ${GRAY}(no metadata fields other than user_data)${NC}"
+    else
+        while read -r key; do
+            [[ -z "$key" ]] && continue
+            local val1 val2
+            val1=$(echo "$launch1" | jq -r ".metadata[\"$key\"] // \"(not set)\"")
+            val2=$(echo "$launch2" | jq -r ".metadata[\"$key\"] // \"(not set)\"")
+            
+            if [[ "$val1" == "$val2" ]]; then
+                echo -e "  ${GREEN}✓${NC} ${WHITE}$key:${NC} $val1"
+            else
+                echo -e "  ${RED}✗${NC} ${WHITE}$key:${NC}"
+                echo -e "      ${GREEN}$name1:${NC} $val1"
+                echo -e "      ${BLUE}$name2:${NC} $val2"
+                has_diff=true
+            fi
+        done <<< "$all_meta_keys"
+    fi
+    
+    # User Data comparison - improved display
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}                                                  CLOUD-INIT USER-DATA COMPARISON                                                                       ${NC}"
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Legend:${NC}"
+    echo -e "  ${RED}- Lines only in:${NC} ${GREEN}$name1${NC}"
+    echo -e "  ${GREEN}+ Lines only in:${NC} ${BLUE}$name2${NC}"
+    echo ""
+    
+    local ud1 ud2
+    ud1=$(echo "$launch1" | jq -r '.metadata.user_data // empty')
+    ud2=$(echo "$launch2" | jq -r '.metadata.user_data // empty')
+    
+    # Create temp files for diff
+    local tmp1 tmp2
+    tmp1=$(mktemp)
+    tmp2=$(mktemp)
+    
+    if [[ -n "$ud1" ]]; then
+        echo "$ud1" | base64 -d > "$tmp1" 2>/dev/null || echo "# Failed to decode user_data" > "$tmp1"
+    else
+        echo "# No user_data" > "$tmp1"
+    fi
+    
+    if [[ -n "$ud2" ]]; then
+        echo "$ud2" | base64 -d > "$tmp2" 2>/dev/null || echo "# Failed to decode user_data" > "$tmp2"
+    else
+        echo "# No user_data" > "$tmp2"
+    fi
+    
+    if diff -q "$tmp1" "$tmp2" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Cloud-init user-data is identical${NC}"
+    else
+        echo -e "${RED}✗ Cloud-init user-data is DIFFERENT${NC}"
+        echo ""
+        
+        # Show side-by-side differences with context
+        echo -e "${BOLD}${WHITE}Differences found:${NC}"
+        echo ""
+        
+        # Use diff to find changed lines and display them more clearly
+        local diff_output
+        diff_output=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | tail -n +4)  # Skip header lines
+        
+        local in_change=false
+        local line_num=0
+        while IFS= read -r line; do
+            ((line_num++))
+            
+            if [[ "$line" =~ ^@@ ]]; then
+                # Context marker - show section
+                echo ""
+                echo -e "${YELLOW}${line}${NC}"
+                in_change=true
+            elif [[ "$line" =~ ^- ]]; then
+                # Line removed (in config 1 only)
+                echo -e "${RED}${line}${NC}  ${GRAY}← ${name1}${NC}"
+            elif [[ "$line" =~ ^\+ ]]; then
+                # Line added (in config 2 only)
+                echo -e "${GREEN}${line}${NC}  ${GRAY}← ${name2}${NC}"
+            elif [[ "$line" =~ ^[[:space:]] ]] && [[ "$in_change" == "true" ]]; then
+                # Context line
+                echo -e "${GRAY}${line}${NC}"
+            fi
+        done <<< "$diff_output"
+        
+        has_diff=true
+    fi
+    
+    # Cleanup
+    rm -f "$tmp1" "$tmp2"
+    
+    # Summary
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    if [[ "$has_diff" == "true" ]]; then
+        echo -e "${RED}✗ Configurations have differences${NC}"
+    else
+        echo -e "${GREEN}✓ Configurations are identical${NC}"
+    fi
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Rename Instance Configuration interactively
+#--------------------------------------------------------------------------------
+rename_instance_configuration_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    echo ""
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}                                    RENAME INSTANCE CONFIGURATION                                               ${NC}"
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Refresh cache
+    fetch_instance_configurations > /dev/null 2>&1
+    
+    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        echo -e "${RED}No instance configurations found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # List configs
+    local ic_idx=0
+    declare -A RENAME_IC_MAP=()
+    
+    printf "${BOLD}%-4s %-70s${NC}\n" "#" "Current Name"
+    print_separator 100
+    
+    while IFS='|' read -r ic_ocid ic_name _; do
+        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+        [[ -z "$ic_ocid" ]] && continue
+        
+        ((ic_idx++))
+        RENAME_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
+        printf "${YELLOW}%-4s${NC} ${WHITE}%-70s${NC}\n" "$ic_idx" "$ic_name"
+    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+    
+    if [[ $ic_idx -eq 0 ]]; then
+        echo -e "${GRAY}No instance configurations found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select instance configuration to rename (1-${ic_idx}): ${NC}"
+    local choice
+    read -r choice
+    
+    if [[ -z "${RENAME_IC_MAP[$choice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    local ic_ocid ic_current_name
+    IFS='|' read -r ic_ocid ic_current_name <<< "${RENAME_IC_MAP[$choice]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Selected:${NC} ${CYAN}$ic_current_name${NC}"
+    echo -e "${GRAY}OCID: $ic_ocid${NC}"
+    echo ""
+    
+    # Fetch full details to generate recommended name
+    echo -e "${YELLOW}Fetching configuration details...${NC}"
+    local ic_json
+    ic_json=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ic_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$ic_json" ]]; then
+        echo -e "${RED}Failed to fetch instance configuration details${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Extract details for recommended name
+    local shape network_type oke_version
+    shape=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["shape"] // "unknown"')
+    
+    # Determine network type from metadata
+    local native_networking
+    native_networking=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["oke-native-pod-networking"] // "false"')
+    if [[ "$native_networking" == "true" ]]; then
+        network_type="native"
+    else
+        network_type="flannel"
+    fi
+    
+    # Try to extract kubernetes version from user_data
+    local user_data_b64
+    user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty')
+    oke_version="unknown"
+    if [[ -n "$user_data_b64" ]]; then
+        local decoded_ud
+        decoded_ud=$(echo "$user_data_b64" | base64 -d 2>/dev/null)
+        # Look for kubernetes version in the apt source or package name
+        # e.g., kubernetes-1.33 or oci-oke-node-all-1.33.1
+        local extracted_version
+        extracted_version=$(echo "$decoded_ud" | grep -oP 'kubernetes-\K[0-9]+\.[0-9]+' | head -1)
+        if [[ -z "$extracted_version" ]]; then
+            extracted_version=$(echo "$decoded_ud" | grep -oP 'oci-oke-node-all-\K[0-9]+\.[0-9]+' | head -1)
+        fi
+        if [[ -n "$extracted_version" ]]; then
+            oke_version="$extracted_version"
+        fi
+    fi
+    
+    # Count existing configs with similar pattern to determine next number
+    local base_pattern="${shape}-ic-oke-${oke_version}-${network_type}"
+    local existing_count=0
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+    fi
+    local next_num=$((existing_count + 1))
+    
+    # Generate recommended name
+    local recommended_name="${shape}-ic-oke-${oke_version}-${network_type}-${next_num}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Detected Configuration:${NC}"
+    echo -e "  ${CYAN}Shape:${NC}        $shape"
+    echo -e "  ${CYAN}Network Type:${NC} $network_type"
+    echo -e "  ${CYAN}OKE Version:${NC}  $oke_version"
+    echo ""
+    
+    echo -e "${BOLD}${WHITE}Naming Convention:${NC} ${GRAY}<shape>-ic-oke-<version>-<network_type>-<#>${NC}"
+    echo ""
+    echo -e "${BOLD}${GREEN}Recommended Name:${NC} ${WHITE}$recommended_name${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Enter new name [${recommended_name}]: ${NC}"
+    local new_name
+    read -r new_name
+    
+    # Use recommended name if empty
+    [[ -z "$new_name" ]] && new_name="$recommended_name"
+    
+    # Don't rename if same name
+    if [[ "$new_name" == "$ic_current_name" ]]; then
+        echo -e "${YELLOW}New name is the same as current name. No changes made.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Rename Summary:${NC}"
+    echo -e "  ${RED}Current:${NC} $ic_current_name"
+    echo -e "  ${GREEN}New:${NC}     $new_name"
+    echo ""
+    
+    # Show command to be executed
+    echo -e "${BOLD}${YELLOW}─── Command to Execute ───${NC}"
+    echo ""
+    echo -e "${WHITE}oci compute-management instance-configuration update \\${NC}"
+    echo -e "${WHITE}  --instance-configuration-id \"$ic_ocid\" \\${NC}"
+    echo -e "${WHITE}  --display-name \"$new_name\"${NC}"
+    echo ""
+    
+    # Log file for the action
+    local log_file="instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    
+    echo -e "${BOLD}${YELLOW}═══ CONFIRM RENAME ═══${NC}"
+    echo ""
+    echo -e "${WHITE}Log file: ${CYAN}${log_file}${NC}"
+    echo ""
+    echo -n -e "${CYAN}Type 'RENAME' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "RENAME" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Log the command
+    {
+        echo "=========================================="
+        echo "Instance Configuration Rename"
+        echo "Timestamp: $(date)"
+        echo "=========================================="
+        echo ""
+        echo "OCID: $ic_ocid"
+        echo "Current Name: $ic_current_name"
+        echo "New Name: $new_name"
+        echo ""
+        echo "Command:"
+        echo "oci compute-management instance-configuration update \\"
+        echo "  --instance-configuration-id \"$ic_ocid\" \\"
+        echo "  --display-name \"$new_name\""
+        echo ""
+        echo "=========================================="
+        echo "Execution Output:"
+        echo "=========================================="
+    } > "$log_file"
+    
+    # Execute the rename
+    echo ""
+    echo -e "${YELLOW}Renaming instance configuration...${NC}"
+    
+    local result
+    result=$(oci compute-management instance-configuration update \
+        --instance-configuration-id "$ic_ocid" \
+        --display-name "$new_name" 2>&1)
+    local exit_code=$?
+    
+    # Log the result
+    echo "$result" >> "$log_file"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        echo ""
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                 INSTANCE CONFIGURATION RENAMED SUCCESSFULLY                ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${WHITE}Old Name:${NC} ${RED}$ic_current_name${NC}"
+        echo -e "${WHITE}New Name:${NC} ${GREEN}$new_name${NC}"
+        echo -e "${WHITE}Log:${NC}      ${WHITE}$log_file${NC}"
+        echo ""
+        
+        # Invalidate cache
+        rm -f "$INSTANCE_CONFIG_CACHE"
+        
+        echo -e "${GREEN}✓ Rename complete!${NC}"
+    else
+        echo ""
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                    FAILED TO RENAME INSTANCE CONFIGURATION                 ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}Error:${NC}"
+        echo "$result"
+        echo ""
+        echo -e "${WHITE}Log file: ${CYAN}$log_file${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Rename a single Instance Configuration (called from detail view)
+# Args: $1 = OCID, $2 = current name, $3 = JSON (optional, will fetch if not provided)
+#--------------------------------------------------------------------------------
+rename_single_instance_configuration() {
+    local ic_ocid="$1"
+    local ic_current_name="$2"
+    local ic_json="${3:-}"
+    
+    echo ""
+    echo -e "${BOLD}${YELLOW}─── Rename Instance Configuration ───${NC}"
+    echo ""
+    
+    # Fetch JSON if not provided
+    if [[ -z "$ic_json" ]]; then
+        echo -e "${YELLOW}Fetching configuration details...${NC}"
+        ic_json=$(oci compute-management instance-configuration get \
+            --instance-configuration-id "$ic_ocid" \
+            --output json 2>/dev/null)
+        
+        if [[ -z "$ic_json" ]]; then
+            echo -e "${RED}Failed to fetch instance configuration details${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+    fi
+    
+    # Extract details for recommended name
+    local shape network_type oke_version
+    shape=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["shape"] // "unknown"')
+    
+    # Determine network type from metadata
+    local native_networking
+    native_networking=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["oke-native-pod-networking"] // "false"')
+    if [[ "$native_networking" == "true" ]]; then
+        network_type="native"
+    else
+        network_type="flannel"
+    fi
+    
+    # Try to extract kubernetes version from user_data
+    local user_data_b64
+    user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty')
+    oke_version="unknown"
+    if [[ -n "$user_data_b64" ]]; then
+        local decoded_ud
+        decoded_ud=$(echo "$user_data_b64" | base64 -d 2>/dev/null)
+        local extracted_version
+        extracted_version=$(echo "$decoded_ud" | grep -oP 'kubernetes-\K[0-9]+\.[0-9]+' | head -1)
+        if [[ -z "$extracted_version" ]]; then
+            extracted_version=$(echo "$decoded_ud" | grep -oP 'oci-oke-node-all-\K[0-9]+\.[0-9]+' | head -1)
+        fi
+        if [[ -n "$extracted_version" ]]; then
+            oke_version="$extracted_version"
+        fi
+    fi
+    
+    # Count existing configs with similar pattern
+    local base_pattern="${shape}-ic-oke-${oke_version}-${network_type}"
+    local existing_count=0
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+    fi
+    local next_num=$((existing_count + 1))
+    
+    # Generate recommended name
+    local recommended_name="${shape}-ic-oke-${oke_version}-${network_type}-${next_num}"
+    
+    echo -e "${WHITE}Current Name:${NC}     ${CYAN}$ic_current_name${NC}"
+    echo -e "${WHITE}Shape:${NC}            $shape"
+    echo -e "${WHITE}Network Type:${NC}     $network_type"
+    echo -e "${WHITE}OKE Version:${NC}      $oke_version"
+    echo ""
+    echo -e "${BOLD}${GREEN}Recommended:${NC}      ${WHITE}$recommended_name${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Enter new name [${recommended_name}]: ${NC}"
+    local new_name
+    read -r new_name
+    
+    [[ -z "$new_name" ]] && new_name="$recommended_name"
+    
+    if [[ "$new_name" == "$ic_current_name" ]]; then
+        echo -e "${YELLOW}New name is the same as current name. No changes made.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Show command
+    echo ""
+    echo -e "${BOLD}${YELLOW}Command:${NC}"
+    echo -e "oci compute-management instance-configuration update \\"
+    echo -e "  --instance-configuration-id \"$ic_ocid\" \\"
+    echo -e "  --display-name \"$new_name\""
+    echo ""
+    
+    echo -n -e "${CYAN}Type 'RENAME' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "RENAME" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Log file
+    local log_file="instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    
+    {
+        echo "=========================================="
+        echo "Instance Configuration Rename"
+        echo "Timestamp: $(date)"
+        echo "=========================================="
+        echo "OCID: $ic_ocid"
+        echo "Current Name: $ic_current_name"
+        echo "New Name: $new_name"
+        echo ""
+        echo "Command:"
+        echo "oci compute-management instance-configuration update \\"
+        echo "  --instance-configuration-id \"$ic_ocid\" \\"
+        echo "  --display-name \"$new_name\""
+        echo ""
+        echo "=========================================="
+        echo "Execution Output:"
+        echo "=========================================="
+    } > "$log_file"
+    
+    echo ""
+    echo -e "${YELLOW}Renaming...${NC}"
+    
+    local result
+    result=$(oci compute-management instance-configuration update \
+        --instance-configuration-id "$ic_ocid" \
+        --display-name "$new_name" 2>&1)
+    local exit_code=$?
+    
+    echo "$result" >> "$log_file"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "${GREEN}✓ Renamed successfully!${NC}"
+        echo -e "  ${RED}Old:${NC} $ic_current_name"
+        echo -e "  ${GREEN}New:${NC} $new_name"
+        rm -f "$INSTANCE_CONFIG_CACHE"
+    else
+        echo -e "${RED}✗ Failed to rename${NC}"
+        echo "$result"
+    fi
+    
+    echo -e "${WHITE}Log: $log_file${NC}"
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#===============================================================================
 # GPU MEMORY FABRIC & CLUSTER MANAGEMENT
 #===============================================================================
 
@@ -5609,12 +6700,10 @@ interactive_gpu_management() {
         echo -e "  ${YELLOW}f#/g#/i#/c#${NC} - View resource details (e.g., 'f1', 'g2', 'i3', 'c1')"
         echo -e "  ${GREEN}create${NC}      - Create a new GPU Memory Cluster on a Fabric"
         echo -e "  ${YELLOW}update${NC}      - Update an existing GPU Memory Cluster (size/instance config)"
-        echo -e "  ${RED}delete-ic${NC}   - Delete an Instance Configuration"
-        echo -e "  ${BLUE}update-ic${NC}   - Update ALL GPU Memory Clusters with a selected Instance Configuration"
         echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter # or command [f#/g#/i#/c#/create/update/update-ic/delete-ic/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter # or command [f#/g#/i#/c#/create/update/refresh/back]: ${NC}"
         
         local input
         read -r input
@@ -5630,12 +6719,6 @@ interactive_gpu_management() {
                 ;;
             update|UPDATE)
                 update_gpu_memory_cluster_interactive
-                ;;
-            update-ic|UPDATE-IC)
-                update_all_clusters_instance_config
-                ;;
-            delete-ic|DELETE-IC)
-                delete_instance_configuration_interactive
                 ;;
             refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
@@ -5801,18 +6884,85 @@ view_gpu_resource() {
                     echo -e "  Image ID:           ${YELLOW}...${image_id: -20}${NC}"
                 fi
                 
+                # Check if user_data exists
+                local has_user_data="false"
+                local user_data_b64
+                user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+                [[ -n "$user_data_b64" ]] && has_user_data="true"
+                
+                # Check for other metadata
+                local ssh_keys
+                ssh_keys=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["ssh_authorized_keys"] // empty' 2>/dev/null)
+                if [[ -n "$ssh_keys" ]]; then
+                    echo ""
+                    echo -e "${BOLD}${CYAN}SSH Keys:${NC}"
+                    echo -e "  ${GRAY}(SSH authorized keys are configured)${NC}"
+                fi
+                
+                if [[ "$has_user_data" == "true" ]]; then
+                    echo ""
+                    echo -e "${BOLD}${CYAN}User Data:${NC}"
+                    echo -e "  ${GREEN}✓ Cloud-init user-data is configured${NC}"
+                fi
+                
                 # Show action option
                 echo ""
                 echo -e "${BOLD}${WHITE}Actions:${NC}"
-                echo -e "  ${RED}delete${NC} - Delete this instance configuration"
-                echo -e "  ${CYAN}Enter${NC}  - Return to menu"
+                if [[ "$has_user_data" == "true" ]]; then
+                    echo -e "  ${MAGENTA}user-data${NC}  - View decoded cloud-init user-data"
+                    echo -e "  ${MAGENTA}save${NC}       - Save user-data to file (cloud-init.yml)"
+                fi
+                echo -e "  ${RED}delete${NC}     - Delete this instance configuration"
+                echo -e "  ${CYAN}Enter${NC}      - Return to menu"
                 echo ""
-                echo -n -e "${CYAN}Action [delete/Enter]: ${NC}"
+                echo -n -e "${CYAN}Action [user-data/save/delete/Enter]: ${NC}"
                 
                 local action
                 read -r action
                 
-                if [[ "$action" == "delete" || "$action" == "DELETE" ]]; then
+                if [[ "$action" == "user-data" || "$action" == "userdata" || "$action" == "ud" ]]; then
+                    if [[ "$has_user_data" == "true" ]]; then
+                        echo ""
+                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                        echo -e "${BOLD}${MAGENTA}                         DECODED CLOUD-INIT USER-DATA                          ${NC}"
+                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                        echo ""
+                        # Decode and display the user-data
+                        echo "$user_data_b64" | base64 -d 2>/dev/null
+                        echo ""
+                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+                        echo ""
+                        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                        read -r
+                    else
+                        echo -e "${YELLOW}No user-data found in this instance configuration${NC}"
+                    fi
+                elif [[ "$action" == "save" || "$action" == "SAVE" ]]; then
+                    if [[ "$has_user_data" == "true" ]]; then
+                        # Generate safe filename from instance config name
+                        local safe_name
+                        safe_name=$(echo "$ic_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                        local filename="${safe_name}_cloud-init.yml"
+                        
+                        echo ""
+                        echo -n -e "${CYAN}Save as [${filename}]: ${NC}"
+                        local custom_filename
+                        read -r custom_filename
+                        [[ -n "$custom_filename" ]] && filename="$custom_filename"
+                        
+                        # Decode and save
+                        if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
+                            echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                        else
+                            echo -e "${RED}Failed to save user-data${NC}"
+                        fi
+                        echo ""
+                        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                        read -r
+                    else
+                        echo -e "${YELLOW}No user-data found in this instance configuration${NC}"
+                    fi
+                elif [[ "$action" == "delete" || "$action" == "DELETE" ]]; then
                     # Store the ic_ocid for deletion
                     IC_INDEX_MAP["delete_target"]="$ic_ocid"
                     delete_single_instance_configuration "$ic_ocid" "$ic_name"
@@ -6875,6 +8025,506 @@ delete_single_instance_configuration() {
 }
 
 #--------------------------------------------------------------------------------
+# Create Instance Configuration interactively
+#--------------------------------------------------------------------------------
+create_instance_configuration_interactive() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    local ad="${AD:-}"
+    local worker_subnet="${WORKER_SUBNET_ID:-}"
+    local worker_nsg="${WORKER_SUBNET_NSG_ID:-}"
+    local image_id="${IMAGE_ID:-}"
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                    CREATE INSTANCE CONFIGURATION                                               ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Validate required variables
+    local missing_vars=""
+    [[ -z "$compartment_id" ]] && missing_vars+="COMPARTMENT_ID "
+    [[ -z "$region" ]] && missing_vars+="REGION "
+    [[ -z "$ad" ]] && missing_vars+="AD "
+    [[ -z "$worker_subnet" ]] && missing_vars+="WORKER_SUBNET_ID "
+    [[ -z "$worker_nsg" ]] && missing_vars+="WORKER_SUBNET_NSG_ID "
+    [[ -z "$image_id" ]] && missing_vars+="IMAGE_ID "
+    
+    if [[ -n "$missing_vars" ]]; then
+        echo -e "${RED}Missing required variables in variables.sh:${NC}"
+        echo -e "${YELLOW}  $missing_vars${NC}"
+        echo ""
+        echo -e "${WHITE}Please run ${CYAN}--setup${WHITE} or manually configure variables.sh${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    echo -e "${BOLD}${WHITE}Current Environment:${NC}"
+    echo -e "  ${CYAN}Region:${NC}           ${WHITE}${region}${NC}"
+    echo -e "  ${CYAN}Compartment:${NC}      ${YELLOW}...${compartment_id: -20}${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${ad}${NC}"
+    echo -e "  ${CYAN}Worker Subnet:${NC}    ${YELLOW}...${worker_subnet: -20}${NC}"
+    echo -e "  ${CYAN}Worker NSG:${NC}       ${YELLOW}...${worker_nsg: -20}${NC}"
+    echo -e "  ${CYAN}Image ID:${NC}         ${YELLOW}...${image_id: -20}${NC}"
+    echo ""
+    
+    # ========== STEP 1: Cloud-init file selection ==========
+    echo -e "${BOLD}${MAGENTA}─── Step 1: Cloud-Init Configuration ───${NC}"
+    echo ""
+    
+    local cloud_init_file="cloud-init.yml"
+    local cwd
+    cwd=$(pwd)
+    
+    # Check for cloud-init files in current directory
+    local found_files=()
+    for f in "$cwd"/*.yml "$cwd"/*.yaml "$cwd"/cloud-init*; do
+        [[ -f "$f" ]] && found_files+=("$f")
+    done
+    
+    if [[ ${#found_files[@]} -gt 0 ]]; then
+        echo -e "${WHITE}Found cloud-init files in current directory ($cwd):${NC}"
+        local idx=0
+        for f in "${found_files[@]}"; do
+            ((idx++))
+            local fname
+            fname=$(basename "$f")
+            echo -e "  ${YELLOW}${idx}${NC}) $fname"
+        done
+        echo ""
+    fi
+    
+    echo -n -e "${CYAN}Enter cloud-init file path [${cloud_init_file}]: ${NC}"
+    local input_file
+    read -r input_file
+    
+    # Handle numeric selection
+    if [[ "$input_file" =~ ^[0-9]+$ ]] && [[ $input_file -ge 1 ]] && [[ $input_file -le ${#found_files[@]} ]]; then
+        cloud_init_file="${found_files[$((input_file-1))]}"
+    elif [[ -n "$input_file" ]]; then
+        cloud_init_file="$input_file"
+    fi
+    
+    # Validate file exists
+    if [[ ! -f "$cloud_init_file" ]]; then
+        echo -e "${RED}Error: Cloud-init file not found: ${cloud_init_file}${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${GREEN}✓ Using cloud-init file: ${WHITE}${cloud_init_file}${NC}"
+    echo ""
+    
+    # Show preview of cloud-init
+    echo -e "${BOLD}${MAGENTA}─── Cloud-Init Preview (first 30 lines) ───${NC}"
+    echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    head -30 "$cloud_init_file"
+    local total_lines
+    total_lines=$(wc -l < "$cloud_init_file")
+    if [[ $total_lines -gt 30 ]]; then
+        echo -e "${GRAY}... (${total_lines} total lines, showing first 30)${NC}"
+    fi
+    echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Is this the correct cloud-init file? [Y/n]: ${NC}"
+    local confirm_ci
+    read -r confirm_ci
+    if [[ "$confirm_ci" =~ ^[Nn] ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return 0
+    fi
+    
+    # ========== STEP 2: Network Type Selection ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 2: Network Type ───${NC}"
+    echo ""
+    echo -e "  ${GREEN}1${NC}) ${WHITE}flannel${NC}     - OKE Flannel CNI (overlay networking)"
+    echo -e "  ${GREEN}2${NC}) ${WHITE}native${NC}      - OCI VCN Native Pod Networking"
+    echo ""
+    echo -n -e "${CYAN}Select network type [1]: ${NC}"
+    local net_choice
+    read -r net_choice
+    
+    local network_type="flannel"
+    local max_pods="60"
+    case "$net_choice" in
+        2|native|NATIVE)
+            network_type="native"
+            max_pods="31"  # Native networking typically has lower pod limit
+            ;;
+        *)
+            network_type="flannel"
+            max_pods="60"
+            ;;
+    esac
+    echo -e "${GREEN}✓ Network type: ${WHITE}${network_type}${NC}"
+    
+    # ========== STEP 3: Shape Selection ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 3: Instance Shape ───${NC}"
+    echo ""
+    echo -e "${WHITE}Common GPU shapes:${NC}"
+    echo -e "  ${GREEN}1${NC}) BM.GPU.GB200-v3.4  (4x GB200 NVL72)"
+    echo -e "  ${GREEN}2${NC}) BM.GPU.H100.8      (8x H100 80GB)"
+    echo -e "  ${GREEN}3${NC}) BM.GPU.H200.8      (8x H200 141GB)"
+    echo -e "  ${GREEN}4${NC}) BM.GPU.A100-v2.8   (8x A100 80GB)"
+    echo -e "  ${GREEN}5${NC}) BM.GPU4.8          (8x A100 40GB)"
+    echo -e "  ${GREEN}6${NC}) Custom (enter shape name)"
+    echo ""
+    
+    local shape_name="${SHAPE_NAME:-BM.GPU.H100.8}"
+    echo -n -e "${CYAN}Select shape [${shape_name}]: ${NC}"
+    local shape_choice
+    read -r shape_choice
+    
+    case "$shape_choice" in
+        1) shape_name="BM.GPU.GB200-v3.4" ;;
+        2) shape_name="BM.GPU.H100.8" ;;
+        3) shape_name="BM.GPU.H200.8" ;;
+        4) shape_name="BM.GPU.A100-v2.8" ;;
+        5) shape_name="BM.GPU4.8" ;;
+        6)
+            echo -n -e "${CYAN}Enter custom shape name: ${NC}"
+            read -r shape_name
+            ;;
+        "") ;; # Keep default
+        *)
+            # If they typed a shape name directly
+            if [[ "$shape_choice" =~ ^BM\. ]]; then
+                shape_name="$shape_choice"
+            fi
+            ;;
+    esac
+    echo -e "${GREEN}✓ Shape: ${WHITE}${shape_name}${NC}"
+    
+    # ========== STEP 4: Boot Volume Configuration ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 4: Boot Volume Configuration ───${NC}"
+    echo ""
+    
+    local boot_volume_size="4096"
+    echo -n -e "${CYAN}Boot volume size in GB [${boot_volume_size}]: ${NC}"
+    local bv_size_input
+    read -r bv_size_input
+    [[ -n "$bv_size_input" ]] && boot_volume_size="$bv_size_input"
+    echo -e "${GREEN}✓ Boot volume size: ${WHITE}${boot_volume_size} GB${NC}"
+    
+    local boot_volume_vpus="20"
+    echo ""
+    echo -e "${WHITE}VPUs per GB (performance):${NC}"
+    echo -e "  ${GRAY}10 = Balanced, 20 = Higher Performance, 30+ = Ultra High Performance${NC}"
+    echo -n -e "${CYAN}Boot volume VPUs per GB [${boot_volume_vpus}]: ${NC}"
+    local bv_vpus_input
+    read -r bv_vpus_input
+    [[ -n "$bv_vpus_input" ]] && boot_volume_vpus="$bv_vpus_input"
+    echo -e "${GREEN}✓ Boot volume VPUs/GB: ${WHITE}${boot_volume_vpus}${NC}"
+    
+    # ========== STEP 5: Max Pods Configuration ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 5: OKE Max Pods ───${NC}"
+    echo ""
+    echo -n -e "${CYAN}Max pods per node [${max_pods}]: ${NC}"
+    local max_pods_input
+    read -r max_pods_input
+    [[ -n "$max_pods_input" ]] && max_pods="$max_pods_input"
+    echo -e "${GREEN}✓ Max pods: ${WHITE}${max_pods}${NC}"
+    
+    # ========== STEP 6: Generate Display Name ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Step 6: Display Name ───${NC}"
+    echo ""
+    
+    # Get OKE cluster version for naming
+    local oke_version="unknown"
+    if [[ -n "${OKE_CLUSTER_ID:-}" ]]; then
+        oke_version=$(oci ce cluster get --cluster-id "$OKE_CLUSTER_ID" --query 'data["kubernetes-version"]' --raw-output 2>/dev/null | sed 's/v//' | cut -d'.' -f1,2 || echo "unknown")
+    fi
+    [[ "$oke_version" == "null" || -z "$oke_version" ]] && oke_version="unknown"
+    
+    # Count existing instance configs with similar naming pattern
+    local base_pattern="${shape_name}-ic-oke-${network_type}"
+    local existing_count=0
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null || echo "0")
+    fi
+    local next_num=$((existing_count + 1))
+    
+    local display_name="${shape_name}-ic-oke-${oke_version}-${network_type}-${next_num}"
+    
+    echo -e "${WHITE}Auto-generated display name: ${CYAN}${display_name}${NC}"
+    echo -n -e "${CYAN}Accept or enter custom name [${display_name}]: ${NC}"
+    local name_input
+    read -r name_input
+    [[ -n "$name_input" ]] && display_name="$name_input"
+    echo -e "${GREEN}✓ Display name: ${WHITE}${display_name}${NC}"
+    
+    # ========== STEP 7: Compare with Existing Configs ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Existing Instance Configurations ───${NC}"
+    echo ""
+    
+    # Refresh instance configs
+    fetch_instance_configurations > /dev/null 2>&1
+    
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        local ic_count=0
+        printf "${BOLD}%-4s %-60s %s${NC}\n" "#" "Name" "OCID"
+        print_separator 120
+        while IFS='|' read -r ic_ocid ic_name _; do
+            [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$ic_ocid" ]] && continue
+            ((ic_count++))
+            printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC} ${GRAY}...%s${NC}\n" \
+                "$ic_count" "${ic_name:0:60}" "${ic_ocid: -20}"
+        done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+        
+        if [[ $ic_count -eq 0 ]]; then
+            echo -e "  ${GRAY}(No existing instance configurations found)${NC}"
+        fi
+    else
+        echo -e "  ${GRAY}(No existing instance configurations found)${NC}"
+    fi
+    echo ""
+    
+    echo -n -e "${CYAN}Compare with existing config? Enter number or press Enter to continue: ${NC}"
+    local compare_choice
+    read -r compare_choice
+    
+    if [[ -n "$compare_choice" && "$compare_choice" =~ ^[0-9]+$ ]]; then
+        local compare_idx=0
+        local compare_ocid=""
+        while IFS='|' read -r ic_ocid ic_name _; do
+            [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+            [[ -z "$ic_ocid" ]] && continue
+            ((compare_idx++))
+            if [[ $compare_idx -eq $compare_choice ]]; then
+                compare_ocid="$ic_ocid"
+                break
+            fi
+        done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+        
+        if [[ -n "$compare_ocid" ]]; then
+            echo ""
+            echo -e "${BOLD}${CYAN}─── Comparing with: ${ic_name} ───${NC}"
+            # Get user-data from existing config
+            local existing_ud
+            existing_ud=$(oci compute-management instance-configuration get \
+                --instance-configuration-id "$compare_ocid" \
+                --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
+                --raw-output 2>/dev/null)
+            
+            if [[ -n "$existing_ud" && "$existing_ud" != "null" ]]; then
+                echo ""
+                echo -e "${WHITE}Existing cloud-init (first 20 lines):${NC}"
+                echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo "$existing_ud" | base64 -d 2>/dev/null | head -20
+                echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            fi
+            echo ""
+            echo -e "Press Enter to continue..."
+            read -r
+        fi
+    fi
+    
+    # ========== STEP 8: Build and Show Command ==========
+    echo ""
+    echo -e "${BOLD}${MAGENTA}─── Configuration Summary ───${NC}"
+    echo ""
+    echo -e "  ${WHITE}Display Name:${NC}       ${CYAN}${display_name}${NC}"
+    echo -e "  ${WHITE}Shape:${NC}              ${WHITE}${shape_name}${NC}"
+    echo -e "  ${WHITE}Network Type:${NC}       ${WHITE}${network_type}${NC}"
+    echo -e "  ${WHITE}Boot Volume:${NC}        ${WHITE}${boot_volume_size} GB @ ${boot_volume_vpus} VPUs/GB${NC}"
+    echo -e "  ${WHITE}Max Pods:${NC}           ${WHITE}${max_pods}${NC}"
+    echo -e "  ${WHITE}Cloud-Init:${NC}         ${WHITE}${cloud_init_file}${NC}"
+    echo -e "  ${WHITE}Region:${NC}             ${WHITE}${region}${NC}"
+    echo -e "  ${WHITE}Compartment:${NC}        ${YELLOW}...${compartment_id: -25}${NC}"
+    echo -e "  ${WHITE}AD:${NC}                 ${WHITE}${ad}${NC}"
+    echo -e "  ${WHITE}Worker Subnet:${NC}      ${YELLOW}...${worker_subnet: -25}${NC}"
+    echo -e "  ${WHITE}Worker NSG:${NC}         ${YELLOW}...${worker_nsg: -25}${NC}"
+    echo -e "  ${WHITE}Image ID:${NC}           ${YELLOW}...${image_id: -25}${NC}"
+    echo ""
+    
+    # Encode cloud-init
+    local base64_cloud_init
+    base64_cloud_init=$(base64 -w 0 "$cloud_init_file")
+    
+    # Build the JSON payload
+    local instance_details_json
+    instance_details_json=$(cat <<EOF
+{
+  "instanceType": "compute",
+  "launchDetails": {
+    "availabilityDomain": "${ad}",
+    "compartmentId": "${compartment_id}",
+    "createVnicDetails": {
+      "assignIpv6Ip": false,
+      "assignPublicIp": false,
+      "assignPrivateDnsRecord": true,
+      "subnetId": "${worker_subnet}",
+      "nsgIds": [
+        "${worker_nsg}"
+      ]
+    },
+    "metadata": {
+      "user_data": "${base64_cloud_init}",
+      "oke-max-pods": "${max_pods}"
+    },
+    "shape": "${shape_name}",
+    "sourceDetails": {
+      "bootVolumeSizeInGBs": "${boot_volume_size}",
+      "bootVolumeVpusPerGB": "${boot_volume_vpus}",
+      "sourceType": "image",
+      "imageId": "${image_id}"
+    },
+    "agentConfig": {
+      "isMonitoringDisabled": false,
+      "isManagementDisabled": false,
+      "pluginsConfig": [
+        { "name": "WebLogic Management Service", "desiredState": "DISABLED" },
+        { "name": "Vulnerability Scanning", "desiredState": "DISABLED" },
+        { "name": "Oracle Java Management Service", "desiredState": "DISABLED" },
+        { "name": "Oracle Autonomous Linux", "desiredState": "DISABLED" },
+        { "name": "OS Management Service Agent", "desiredState": "DISABLED" },
+        { "name": "OS Management Hub Agent", "desiredState": "DISABLED" },
+        { "name": "Management Agent", "desiredState": "DISABLED" },
+        { "name": "Custom Logs Monitoring", "desiredState": "ENABLED" },
+        { "name": "Compute RDMA GPU Monitoring", "desiredState": "ENABLED" },
+        { "name": "Compute Instance Run Command", "desiredState": "ENABLED" },
+        { "name": "Compute Instance Monitoring", "desiredState": "ENABLED" },
+        { "name": "Compute HPC RDMA Auto-Configuration", "desiredState": "ENABLED" },
+        { "name": "Compute HPC RDMA Authentication", "desiredState": "ENABLED" },
+        { "name": "Cloud Guard Workload Protection", "desiredState": "DISABLED" },
+        { "name": "Block Volume Management", "desiredState": "DISABLED" },
+        { "name": "Bastion", "desiredState": "DISABLED" }
+      ]
+    },
+    "isPvEncryptionInTransitEnabled": false,
+    "instanceOptions": {
+      "areLegacyImdsEndpointsDisabled": false
+    },
+    "availabilityConfig": {
+      "recoveryAction": "RESTORE_INSTANCE"
+    }
+  }
+}
+EOF
+)
+    
+    echo -e "${BOLD}${YELLOW}─── Command to Execute ───${NC}"
+    echo ""
+    echo -e "${WHITE}oci --region \"${region}\" \\${NC}"
+    echo -e "${WHITE}  compute-management instance-configuration create \\${NC}"
+    echo -e "${WHITE}  --compartment-id \"${compartment_id}\" \\${NC}"
+    echo -e "${WHITE}  --display-name \"${display_name}\" \\${NC}"
+    echo -e "${WHITE}  --instance-details '<JSON payload with ${#base64_cloud_init} char user_data>'${NC}"
+    echo ""
+    
+    # Log file for the action
+    local log_file="instance_config_create_$(date +%Y%m%d_%H%M%S).log"
+    
+    echo -e "${BOLD}${RED}═══ CONFIRM CREATION ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}This will create a new Instance Configuration.${NC}"
+    echo -e "${WHITE}Log file: ${CYAN}${log_file}${NC}"
+    echo ""
+    echo -n -e "${CYAN}Type 'CREATE' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "CREATE" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return 0
+    fi
+    
+    # Execute the command
+    echo ""
+    echo -e "${YELLOW}Creating Instance Configuration...${NC}"
+    
+    # Log the command (without the full base64)
+    {
+        echo "=========================================="
+        echo "Instance Configuration Creation"
+        echo "Timestamp: $(date)"
+        echo "=========================================="
+        echo ""
+        echo "Display Name: ${display_name}"
+        echo "Shape: ${shape_name}"
+        echo "Network Type: ${network_type}"
+        echo "Boot Volume: ${boot_volume_size} GB @ ${boot_volume_vpus} VPUs/GB"
+        echo "Max Pods: ${max_pods}"
+        echo "Cloud-Init File: ${cloud_init_file}"
+        echo ""
+        echo "Command:"
+        echo "oci --region \"${region}\" \\"
+        echo "  compute-management instance-configuration create \\"
+        echo "  --compartment-id \"${compartment_id}\" \\"
+        echo "  --display-name \"${display_name}\" \\"
+        echo "  --instance-details '<JSON payload>'"
+        echo ""
+        echo "=========================================="
+        echo "Execution Output:"
+        echo "=========================================="
+    } > "$log_file"
+    
+    local result
+    result=$(oci --region "${region}" \
+        compute-management instance-configuration create \
+        --compartment-id "${compartment_id}" \
+        --display-name "${display_name}" \
+        --instance-details "${instance_details_json}" 2>&1)
+    local exit_code=$?
+    
+    # Log the result
+    echo "$result" >> "$log_file"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        local new_ocid
+        new_ocid=$(echo "$result" | jq -r '.data.id // empty' 2>/dev/null)
+        
+        echo ""
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                    INSTANCE CONFIGURATION CREATED                          ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${WHITE}Name:${NC} ${CYAN}${display_name}${NC}"
+        echo -e "${WHITE}OCID:${NC} ${YELLOW}${new_ocid}${NC}"
+        echo -e "${WHITE}Log:${NC}  ${WHITE}${log_file}${NC}"
+        echo ""
+        
+        # Invalidate cache
+        rm -f "$INSTANCE_CONFIG_CACHE"
+        
+        echo -e "${GREEN}✓ Instance Configuration created successfully!${NC}"
+    else
+        echo ""
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                    FAILED TO CREATE INSTANCE CONFIGURATION                 ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}Error:${NC}"
+        echo "$result"
+        echo ""
+        echo -e "${WHITE}Log file: ${CYAN}${log_file}${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+    
+    # Refresh the menu to show new instance config
+    display_gpu_management_menu > /dev/null 2>&1
+}
+
+#--------------------------------------------------------------------------------
 # Delete Instance Configuration interactively
 #--------------------------------------------------------------------------------
 delete_instance_configuration_interactive() {
@@ -7078,12 +8728,18 @@ show_help() {
     echo "  --list-cluster <gpu-cluster-id>"
     echo "    List all instances in a specific GPU memory cluster with fabric details"
     echo ""
-    echo -e "${BOLD}GPU Management:${NC}"
+    echo -e "${BOLD}Instance Configuration:${NC}"
+    echo "  --get-user-data <instance-config-ocid>"
+    echo "    Extract and display the decoded cloud-init user-data from an instance configuration"
+    echo "    Useful for reviewing or backing up cloud-init configurations"
+    echo ""
+    echo -e "${BOLD}Resource Management:${NC}"
     echo "  --manage            Interactive resource management mode"
     echo "                      - OKE Cluster environment view"
     echo "                      - Network resources (subnets, NSGs)"
     echo "                      - GPU Memory Fabrics & Clusters (create, update, view)"
     echo "                      - Compute Instances (view details, IPs, volumes)"
+    echo "                      - Instance Configurations (create, view, compare, delete)"
     echo ""
     echo -e "${BOLD}Setup & Maintenance:${NC}"
     echo "  --setup             Run initial setup to create/update variables.sh"
@@ -7103,7 +8759,7 @@ show_help() {
     echo "  $0 --region us-ashburn-1                              # Use different region"
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
     echo "  $0 --cliques-summary                                  # Summary table of cliques with fabric"
-    echo "  $0 --manage                                           # Interactive GPU fabric/cluster management"
+    echo "  $0 --manage                                           # Interactive resource management"
     echo "  $0 --setup                                            # Run initial setup wizard"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx                 # Basic node info"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --labels        # Show labels"
@@ -7113,6 +8769,8 @@ show_help() {
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --details       # Full details (network, volumes)"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --console-history  # View console history"
     echo "  $0 --list-cluster ocid1.xxx                           # List cluster instances + fabric"
+    echo "  $0 --get-user-data ocid1.instanceconfig.oc1.xxx       # Extract cloud-init from config"
+    echo "  $0 --get-user-data ocid1.instanceconfig.oc1.xxx > cloud-init.yml  # Save to file"
 }
 
 #===============================================================================
@@ -7698,6 +9356,14 @@ main() {
                 exit 1
             fi
             list_instances_by_gpu_cluster "$2" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
+            ;;
+        --get-user-data)
+            if [[ -z "${2:-}" ]]; then
+                log_error "Instance configuration OCID required"
+                echo "Usage: $0 --get-user-data <instance-config-ocid>"
+                exit 1
+            fi
+            get_instance_config_user_data "$2"
             ;;
         --manage)
             interactive_management_main_menu
