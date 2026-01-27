@@ -1877,16 +1877,13 @@ list_instances_not_in_k8s() {
     echo -e "${BOLD}${MAGENTA}=== $header_text ===${NC}"
     echo ""
     
-    # Collect orphan instances into an array
-    local -a orphan_names=()
-    local -a orphan_ocids=()
-    local -a orphan_states=()
-    local -a orphan_gpu_mems=()
-    local orphan_count=0
+    # Collect instances not in k8s into a temp file for sorting
+    local orphan_temp
+    orphan_temp=$(create_temp_file) || return 1
     
-    # oci_temp format: display_name|status|instance_ocid|gpu_mem|shape
-    local display_name status instance_ocid gpu_mem shape
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape; do
+    # oci_temp format: display_name|status|instance_ocid|gpu_mem|shape|time_created
+    local display_name status instance_ocid gpu_mem shape time_created
+    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
         [[ -z "$instance_ocid" ]] && continue
         
         # Skip bastion and operator instances - they're not supposed to be in K8s
@@ -1897,35 +1894,67 @@ list_instances_not_in_k8s() {
         
         if ! grep -q "^${instance_ocid}|" "$k8s_temp" 2>/dev/null; then
             if [[ "$status" == "RUNNING" ]]; then
-                orphan_names+=("$display_name")
-                orphan_ocids+=("$instance_ocid")
-                orphan_states+=("$status")
-                orphan_gpu_mems+=("$gpu_mem")
-                ((orphan_count++))
+                # Store with time_created for sorting
+                echo "${time_created}|${display_name}|${instance_ocid}|${status}|${gpu_mem}" >> "$orphan_temp"
             fi
         fi
     done < "$oci_temp"
     
+    local orphan_count
+    orphan_count=$(wc -l < "$orphan_temp" 2>/dev/null) || orphan_count=0
+    
     if [[ $orphan_count -eq 0 ]]; then
         echo -e "${GREEN}$all_running_text${NC}"
+        rm -f "$orphan_temp"
         return 0
     fi
     
+    # Sort by time_created (ascending - oldest first, newest last)
+    local sorted_temp
+    sorted_temp=$(create_temp_file) || { rm -f "$orphan_temp"; return 1; }
+    sort -t'|' -k1,1 "$orphan_temp" > "$sorted_temp"
+    
+    # Read sorted data into arrays
+    local -a orphan_names=()
+    local -a orphan_ocids=()
+    local -a orphan_states=()
+    local -a orphan_gpu_mems=()
+    local -a orphan_times=()
+    
+    while IFS='|' read -r time_created display_name instance_ocid status gpu_mem; do
+        orphan_times+=("$time_created")
+        orphan_names+=("$display_name")
+        orphan_ocids+=("$instance_ocid")
+        orphan_states+=("$status")
+        orphan_gpu_mems+=("$gpu_mem")
+    done < "$sorted_temp"
+    
+    rm -f "$orphan_temp" "$sorted_temp"
+    
     # Display numbered list of instances not in kubernetes
-    printf "${BOLD}%-4s %-35s %-10s %-15s %s${NC}\n" \
-        "#" "Display Name" "OCI State" "GPU Mem Cluster" "Instance OCID"
-    print_separator 160
+    printf "${BOLD}%-4s %-35s %-10s %-15s %-22s %s${NC}\n" \
+        "#" "Display Name" "OCI State" "GPU Mem Cluster" "Created" "Instance OCID"
+    print_separator 180
     
     local i
     for ((i=0; i<orphan_count; i++)); do
         local gpu_mem_display="${orphan_gpu_mems[$i]}"
         [[ "$gpu_mem_display" != "N/A" && ${#gpu_mem_display} -gt 12 ]] && gpu_mem_display="...${gpu_mem_display: -9}"
         
-        printf "${YELLOW}%-4s${NC} ${CYAN}%-35s${NC} ${GREEN}%-10s${NC} ${MAGENTA}%-15s${NC} ${WHITE}%s${NC}\n" \
+        # Format time_created - show date and time portion
+        local time_display="${orphan_times[$i]}"
+        if [[ "$time_display" != "N/A" && -n "$time_display" ]]; then
+            # Format: 2026-01-27T03:29:11.123Z -> 2026-01-27 03:29:11
+            time_display="${time_display:0:19}"
+            time_display="${time_display/T/ }"
+        fi
+        
+        printf "${YELLOW}%-4s${NC} ${CYAN}%-35s${NC} ${GREEN}%-10s${NC} ${MAGENTA}%-15s${NC} ${GRAY}%-22s${NC} ${WHITE}%s${NC}\n" \
             "$((i+1))" \
             "$(truncate_string "${orphan_names[$i]}" 35)" \
             "${orphan_states[$i]}" \
             "$gpu_mem_display" \
+            "$time_display" \
             "${orphan_ocids[$i]}"
     done
     
@@ -2050,7 +2079,7 @@ list_all_instances() {
             .data[] | 
             $jq_filter | 
             select(.[\"lifecycle-state\"] != \"TERMINATED\") |
-            \"\(.[\"display-name\"])|\(.[\"lifecycle-state\"])|\(.id)|\(.[\"freeform-tags\"][\"oci:compute:gpumemorycluster\"] // \"N/A\")|\(.shape)\"
+            \"\(.[\"display-name\"])|\(.[\"lifecycle-state\"])|\(.id)|\(.[\"freeform-tags\"][\"oci:compute:gpumemorycluster\"] // \"N/A\")|\(.shape)|\(.[\"time-created\"] // \"N/A\")\"
         " > "$oci_temp"
     
     # Fetch K8s nodes based on filter
@@ -2104,8 +2133,8 @@ list_all_instances() {
     print_separator 280
     
     # Process and collect data for sorting
-    local display_name status instance_ocid gpu_mem shape
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape; do
+    local display_name status instance_ocid gpu_mem shape time_created
+    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
         [[ -z "$instance_ocid" ]] && continue
         
         local k8s_info node_name clique_id node_state
@@ -2199,9 +2228,9 @@ display_clique_summary() {
     local joined_temp
     joined_temp=$(create_temp_file) || return 1
     
-    # Join OCI and K8s data (oci_temp format: display_name|status|instance_ocid|gpu_mem|shape)
-    local display_name status instance_ocid gpu_mem shape
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape; do
+    # Join OCI and K8s data (oci_temp format: display_name|status|instance_ocid|gpu_mem|shape|time_created)
+    local display_name status instance_ocid gpu_mem shape time_created
+    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
         [[ -z "$instance_ocid" ]] && continue
         
         local k8s_info
