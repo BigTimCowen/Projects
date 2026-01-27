@@ -60,6 +60,8 @@ readonly ANNOUNCEMENTS_LIST_CACHE="${CACHE_DIR}/announcements_list.json"
 readonly OKE_ENV_CACHE="${CACHE_DIR}/oke_environment.txt"
 readonly COMPUTE_CLUSTER_CACHE="${CACHE_DIR}/compute_clusters.txt"
 readonly NETWORK_RESOURCES_CACHE="${CACHE_DIR}/network_resources.txt"
+readonly BOOT_VOLUME_CACHE="${CACHE_DIR}/boot_volumes.txt"
+readonly IMAGE_CACHE="${CACHE_DIR}/images.txt"
 
 # Network gateway cache files
 readonly IGW_CACHE="${CACHE_DIR}/internet_gateways.txt"
@@ -794,11 +796,11 @@ fetch_network_resources() {
     # Write cache
     {
         echo "# Network Resources Cache"
-        echo "# Format: SUBNET|NAME|CIDR|ACCESS|STATE|OCID|RT_OCID|SL_IDS"
+        echo "# Format: SUBNET|NAME|CIDR|ACCESS|STATE|OCID|RT_OCID|SL_IDS|DNS_LABEL"
         echo "# Format: NSG|NAME||STATE|OCID"
         
-        # Process subnets (include route-table-id and security-list-ids)
-        echo "$subnet_json" | jq -r '.data[] | "SUBNET|\(."display-name" // "N/A")|\(."cidr-block" // "N/A")|\(if ."prohibit-public-ip-on-vnic" then "Private" else "Public" end)|\(."lifecycle-state" // "N/A")|\(.id // "N/A")|\(."route-table-id" // "N/A")|\((."security-list-ids" // []) | join(","))"' 2>/dev/null
+        # Process subnets (include route-table-id, security-list-ids, and dns-label)
+        echo "$subnet_json" | jq -r '.data[] | "SUBNET|\(."display-name" // "N/A")|\(."cidr-block" // "N/A")|\(if ."prohibit-public-ip-on-vnic" then "Private" else "Public" end)|\(."lifecycle-state" // "N/A")|\(.id // "N/A")|\(."route-table-id" // "N/A")|\((."security-list-ids" // []) | join(","))|\(."dns-label" // "")"' 2>/dev/null
         
         # Process NSGs
         echo "$nsg_json" | jq -r '.data[] | "NSG|\(."display-name" // "N/A")||\(."lifecycle-state" // "N/A")|\(.id // "N/A")"' 2>/dev/null
@@ -1137,6 +1139,18 @@ get_route_table_rule_count() {
     echo "${count:-0}"
 }
 
+# Get security list name by ID (SL_CACHE format: SL_ID|VCN_ID|DISPLAY_NAME|STATE|INGRESS_COUNT|EGRESS_COUNT)
+get_security_list_name() {
+    local sl_id="$1"
+    
+    [[ ! -f "$SL_CACHE" ]] && { echo ""; return; }
+    [[ -z "$sl_id" || "$sl_id" == "N/A" ]] && { echo ""; return; }
+    
+    local name
+    name=$(grep "^${sl_id}|" "$SL_CACHE" 2>/dev/null | head -1 | cut -d'|' -f3)
+    echo "${name:-}"
+}
+
 # Get NSG ingress/egress counts
 get_nsg_rule_counts() {
     local nsg_id="$1"
@@ -1221,16 +1235,16 @@ display_network_resources() {
     declare -a unmatched_nsgs
     declare -a subnet_shortnames
     
-    # Read subnets (now with route-table-id)
-    while IFS='|' read -r type name cidr access state ocid rt_ocid; do
+    # Read subnets (now with route-table-id, security-list-ids, and dns-label)
+    while IFS='|' read -r type name cidr access state ocid rt_ocid sl_ids dns_label; do
         [[ "$type" != "SUBNET" ]] && continue
         local shortname
         shortname=$(get_shortname_match "$name")
         if [[ -n "$shortname" ]]; then
-            subnets_by_shortname[$shortname]="${name}|${cidr}|${access}|${ocid}|${rt_ocid}"
+            subnets_by_shortname[$shortname]="${name}|${cidr}|${access}|${ocid}|${rt_ocid}|${sl_ids}|${dns_label}"
             subnet_shortnames+=("$shortname")
         else
-            unmatched_subnets+=("${name}|${cidr}|${access}|${ocid}|${rt_ocid}")
+            unmatched_subnets+=("${name}|${cidr}|${access}|${ocid}|${rt_ocid}|${sl_ids}|${dns_label}")
         fi
     done < <(grep "^SUBNET|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
     
@@ -1256,8 +1270,8 @@ display_network_resources() {
         local subnet_info="${subnets_by_shortname[$shortname]}"
         [[ -z "$subnet_info" ]] && continue
         
-        local name cidr access ocid rt_ocid
-        IFS='|' read -r name cidr access ocid rt_ocid <<< "$subnet_info"
+        local name cidr access ocid rt_ocid sl_ids dns_label
+        IFS='|' read -r name cidr access ocid rt_ocid sl_ids dns_label <<< "$subnet_info"
         
         local access_color
         [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
@@ -1268,13 +1282,51 @@ display_network_resources() {
         rt_rules=$(get_route_table_rule_count "$rt_ocid")
         rt_display="${rt_name} (${rt_rules})"
         
-        # Subnet line with route table
-        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}RT:${NC} ${CYAN}%-28s${NC}${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-            "$name" "$cidr" "$access" "$rt_display" "$ocid"
+        # DNS label display with fixed width (one space after colon)
+        local dns_display
+        if [[ -n "$dns_label" ]]; then
+            dns_display=$(printf "DNS: %-12s" "$dns_label")
+        else
+            dns_display=$(printf "%-17s" "")
+        fi
+        
+        # Get security list names
+        local sl_display=""
+        if [[ -n "$sl_ids" ]]; then
+            local sl_names=""
+            IFS=',' read -ra sl_array <<< "$sl_ids"
+            for sl_id in "${sl_array[@]}"; do
+                [[ -z "$sl_id" ]] && continue
+                local sl_name
+                sl_name=$(get_security_list_name "$sl_id")
+                if [[ -n "$sl_name" ]]; then
+                    [[ -n "$sl_names" ]] && sl_names+=", "
+                    sl_names+="$sl_name"
+                fi
+            done
+            [[ -n "$sl_names" ]] && sl_display="${sl_names}"
+        fi
+        
+        # Subnet line with route table and DNS label
+        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} ${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            "$name" "$cidr" "$access" "$dns_display" "$rt_display" "$ocid"
+        
+        # Count total items for tree display (SL + NSGs)
+        local nsg_list="${nsgs_by_shortname[$shortname]:-}"
+        local has_sl=false
+        local has_nsg=false
+        [[ -n "$sl_display" ]] && has_sl=true
+        [[ -n "$nsg_list" ]] && has_nsg=true
+        
+        # Display security lists if any
+        if [[ "$has_sl" == "true" ]]; then
+            local sl_prefix="└─"
+            [[ "$has_nsg" == "true" ]] && sl_prefix="├─"
+            printf "          ${MAGENTA}${sl_prefix} SL:${NC}  ${WHITE}%s${NC}\n" "$sl_display"
+        fi
         
         # Display matching NSGs
-        local nsg_list="${nsgs_by_shortname[$shortname]:-}"
-        if [[ -n "$nsg_list" ]]; then
+        if [[ "$has_nsg" == "true" ]]; then
             local nsg_entries
             IFS='#' read -ra nsg_entries <<< "$nsg_list"
             local nsg_count=${#nsg_entries[@]}
@@ -1294,8 +1346,8 @@ display_network_resources() {
                 local prefix="├─"
                 [[ $i -eq $nsg_count ]] && prefix="└─"
                 
-                # NSG line with rule counts - padding 37 to align with subnet OCID
-                printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC}%-37s${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                # NSG line with rule counts - aligned with subnet OCID
+                printf "          ${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC} %-51s ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                     "$nsg_name" "$rules_display" "" "$nsg_ocid"
             done
         fi
@@ -1305,8 +1357,8 @@ display_network_resources() {
     # Display unmatched subnets
     if [[ ${#unmatched_subnets[@]} -gt 0 ]]; then
         for subnet_entry in "${unmatched_subnets[@]}"; do
-            local name cidr access ocid rt_ocid
-            IFS='|' read -r name cidr access ocid rt_ocid <<< "$subnet_entry"
+            local name cidr access ocid rt_ocid sl_ids dns_label
+            IFS='|' read -r name cidr access ocid rt_ocid sl_ids dns_label <<< "$subnet_entry"
             
             local access_color
             [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
@@ -1317,8 +1369,38 @@ display_network_resources() {
             rt_rules=$(get_route_table_rule_count "$rt_ocid")
             rt_display="${rt_name} (${rt_rules})"
             
-            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${WHITE}RT:${NC} ${CYAN}%-28s${NC}${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$name" "$cidr" "$access" "$rt_display" "$ocid"
+            # DNS label display with fixed width (one space after colon)
+            local dns_display
+            if [[ -n "$dns_label" ]]; then
+                dns_display=$(printf "DNS: %-12s" "$dns_label")
+            else
+                dns_display=$(printf "%-17s" "")
+            fi
+            
+            # Get security list names
+            local sl_display=""
+            if [[ -n "$sl_ids" ]]; then
+                local sl_names=""
+                IFS=',' read -ra sl_array <<< "$sl_ids"
+                for sl_id in "${sl_array[@]}"; do
+                    [[ -z "$sl_id" ]] && continue
+                    local sl_name
+                    sl_name=$(get_security_list_name "$sl_id")
+                    if [[ -n "$sl_name" ]]; then
+                        [[ -n "$sl_names" ]] && sl_names+=", "
+                        sl_names+="$sl_name"
+                    fi
+                done
+                [[ -n "$sl_names" ]] && sl_display="${sl_names}"
+            fi
+            
+            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} ${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$name" "$cidr" "$access" "$dns_display" "$rt_display" "$ocid"
+            
+            # Display security lists if any
+            if [[ -n "$sl_display" ]]; then
+                printf "          ${MAGENTA}└─ SL:${NC}  ${WHITE}%s${NC}\n" "$sl_display"
+            fi
             echo ""
         done
     fi
@@ -1343,8 +1425,8 @@ display_network_resources() {
             local prefix="├─"
             [[ $i -eq $total ]] && prefix="└─"
             
-            # NSG line with rule counts - padding 37 to align with subnet OCID
-            printf "          ${BOLD}${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC}%-37s${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            # NSG line with rule counts - aligned with subnet OCID
+            printf "          ${BLUE}${prefix} NSG:${NC} ${WHITE}%-30s${NC} ${CYAN}%-15s${NC} %-51s ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
                 "$nsg_name" "$rules_display" "" "$nsg_ocid"
         done
         echo ""
@@ -3434,9 +3516,10 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}4${NC}) ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
         echo -e "  ${GREEN}5${NC}) ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
         echo ""
+        echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-5, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-5, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3463,16 +3546,219 @@ interactive_management_main_menu() {
             5)
                 manage_instance_configurations
                 ;;
+            c|C|cache|CACHE)
+                display_cache_stats
+                ;;
             q|Q|quit|QUIT|exit|EXIT)
                 echo ""
                 echo -e "${GREEN}Exiting management mode${NC}"
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-5, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-5, c, or q.${NC}"
                 ;;
         esac
     done
+}
+
+#--------------------------------------------------------------------------------
+# Helper: Format time duration for cache display
+#--------------------------------------------------------------------------------
+_format_cache_duration() {
+    local seconds=$1
+    if [[ $seconds -lt 60 ]]; then
+        echo "${seconds}s"
+    elif [[ $seconds -lt 3600 ]]; then
+        echo "$((seconds / 60))m $((seconds % 60))s"
+    else
+        echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# Helper: Get cache status line for a single cache file
+#--------------------------------------------------------------------------------
+_get_cache_status_line() {
+    local cache_file="$1"
+    local cache_name="$2"
+    local ttl="${3:-3600}"  # Default 1 hour
+    
+    if [[ ! -f "$cache_file" ]]; then
+        printf "  ${GRAY}%-30s${NC} ${RED}%-12s${NC} %8s %10s %12s %10s\n" \
+            "$cache_name" "NOT CACHED" "-" "-" "-" "-"
+        return
+    fi
+    
+    local file_mtime
+    file_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+    local current_time=$(date +%s)
+    local age=$((current_time - file_mtime))
+    local expires_in=$((ttl - age))
+    
+    # Count entries (lines for txt, items for json)
+    local entry_count=0
+    if [[ "$cache_file" == *.json ]]; then
+        entry_count=$(jq 'if type == "array" then length else 1 end' "$cache_file" 2>/dev/null || echo 0)
+    else
+        entry_count=$(wc -l < "$cache_file" 2>/dev/null || echo 0)
+    fi
+    
+    # File size
+    local file_size
+    file_size=$(du -h "$cache_file" 2>/dev/null | cut -f1)
+    
+    # Determine status
+    local status status_color
+    if [[ $expires_in -le 0 ]]; then
+        status="EXPIRED"
+        status_color="$RED"
+    elif [[ $expires_in -lt 300 ]]; then  # < 5 minutes
+        status="EXPIRING"
+        status_color="$YELLOW"
+    else
+        status="VALID"
+        status_color="$GREEN"
+    fi
+    
+    # Format times
+    local age_fmt expires_fmt
+    age_fmt=$(_format_cache_duration $age)
+    if [[ $expires_in -gt 0 ]]; then
+        expires_fmt=$(_format_cache_duration $expires_in)
+    else
+        expires_fmt="NOW"
+    fi
+    
+    printf "  %-30s ${status_color}%-12s${NC} %8s %10s %12s %10s\n" \
+        "$cache_name" "$status" "$entry_count" "$file_size" "$age_fmt" "$expires_fmt"
+}
+
+#--------------------------------------------------------------------------------
+# Display Cache Statistics - Show all cache files with status, age, and TTL
+#--------------------------------------------------------------------------------
+display_cache_stats() {
+    echo ""
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                                              CACHE STATISTICS                                                                          ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Cache Directory:${NC} ${YELLOW}${CACHE_DIR}${NC}"
+    echo ""
+    
+    # Header
+    printf "${BOLD}  %-30s %-12s %8s %10s %12s %10s${NC}\n" \
+        "Cache Name" "Status" "Entries" "Size" "Age" "Expires In"
+    print_separator 100
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== GPU Resources ===${NC}"
+    _get_cache_status_line "$FABRIC_CACHE" "GPU Memory Fabrics" 3600
+    _get_cache_status_line "$CLUSTER_CACHE" "GPU Memory Clusters" 3600
+    _get_cache_status_line "$COMPUTE_CLUSTER_CACHE" "Compute Clusters" 3600
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Compute Resources ===${NC}"
+    _get_cache_status_line "$INSTANCE_CONFIG_CACHE" "Instance Configurations" 3600
+    _get_cache_status_line "$BOOT_VOLUME_CACHE" "Boot Volumes" 3600
+    _get_cache_status_line "$IMAGE_CACHE" "Images" 3600
+    _get_cache_status_line "$CAPACITY_TOPOLOGY_CACHE" "Capacity Topology Hosts" 3600
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== OKE Resources ===${NC}"
+    _get_cache_status_line "$OKE_ENV_CACHE" "OKE Environment" 3600
+    _get_cache_status_line "$NODE_STATE_CACHE" "Node States" 300
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Network Resources ===${NC}"
+    _get_cache_status_line "$NETWORK_RESOURCES_CACHE" "Network Resources" 3600
+    _get_cache_status_line "$IGW_CACHE" "Internet Gateways" 3600
+    _get_cache_status_line "$SGW_CACHE" "Service Gateways" 3600
+    _get_cache_status_line "$NAT_CACHE" "NAT Gateways" 3600
+    _get_cache_status_line "$DRG_CACHE" "DRG Attachments" 3600
+    _get_cache_status_line "$LPG_CACHE" "Local Peering Gateways" 3600
+    _get_cache_status_line "$RPC_CACHE" "Remote Peering Connections" 3600
+    _get_cache_status_line "$RT_CACHE" "Route Tables" 3600
+    _get_cache_status_line "$NSG_RULES_CACHE" "NSG Rules" 3600
+    _get_cache_status_line "$SL_CACHE" "Security Lists" 3600
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Other ===${NC}"
+    _get_cache_status_line "$ANNOUNCEMENTS_LIST_CACHE" "Announcements" 3600
+    
+    echo ""
+    print_separator 100
+    echo ""
+    
+    # Show total cache size
+    local total_size="0"
+    if [[ -d "$CACHE_DIR" ]]; then
+        total_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
+    fi
+    echo -e "${WHITE}Total Cache Size:${NC} ${CYAN}${total_size}${NC}"
+    echo ""
+    
+    # Legend
+    echo -e "${BOLD}${WHITE}Status Legend:${NC}"
+    echo -e "  ${GREEN}VALID${NC}     - Cache is fresh and within TTL"
+    echo -e "  ${YELLOW}EXPIRING${NC}  - Cache will expire within 5 minutes"
+    echo -e "  ${RED}EXPIRED${NC}   - Cache has exceeded TTL and will be refreshed on next use"
+    echo -e "  ${RED}NOT CACHED${NC} - No cache file exists"
+    echo ""
+    
+    echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+    echo -e "  ${YELLOW}1${NC} - Clear GPU caches (fabrics, clusters)"
+    echo -e "  ${YELLOW}2${NC} - Clear Compute caches (instances, boot volumes, images)"
+    echo -e "  ${YELLOW}3${NC} - Clear Network caches"
+    echo -e "  ${YELLOW}4${NC} - Clear OKE caches"
+    echo -e "  ${RED}a${NC} - Clear ALL caches"
+    echo -e "  ${CYAN}Enter${NC} - Return to menu"
+    echo ""
+    echo -n -e "${CYAN}Action [1-4/a/Enter]: ${NC}"
+    
+    local action
+    read -r action
+    
+    case "$action" in
+        1)
+            echo -e "${YELLOW}Clearing GPU caches...${NC}"
+            rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$COMPUTE_CLUSTER_CACHE"
+            echo -e "${GREEN}✓ GPU caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        2)
+            echo -e "${YELLOW}Clearing Compute caches...${NC}"
+            rm -f "$INSTANCE_CONFIG_CACHE" "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE" "$CAPACITY_TOPOLOGY_CACHE"
+            echo -e "${GREEN}✓ Compute caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        3)
+            echo -e "${YELLOW}Clearing Network caches...${NC}"
+            rm -f "$NETWORK_RESOURCES_CACHE" "$IGW_CACHE" "$SGW_CACHE" "$NAT_CACHE" "$DRG_CACHE" \
+                  "$LPG_CACHE" "$RPC_CACHE" "$RT_CACHE" "$NSG_RULES_CACHE" "$SL_CACHE"
+            echo -e "${GREEN}✓ Network caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        4)
+            echo -e "${YELLOW}Clearing OKE caches...${NC}"
+            rm -f "$OKE_ENV_CACHE" "$NODE_STATE_CACHE"
+            echo -e "${GREEN}✓ OKE caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        a|A|all|ALL)
+            echo -e "${YELLOW}Clearing ALL caches...${NC}"
+            rm -f "$CACHE_DIR"/*.txt "$CACHE_DIR"/*.json 2>/dev/null
+            echo -e "${GREEN}✓ All caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        *)
+            return
+            ;;
+    esac
 }
 
 #--------------------------------------------------------------------------------
@@ -4020,7 +4306,7 @@ manage_network_resources() {
     
     # Subnets
     if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
-        while IFS='|' read -r type name cidr access state ocid rt_ocid; do
+        while IFS='|' read -r type name cidr access state ocid rt_ocid sl_ids dns_label; do
             [[ "$type" != "SUBNET" ]] && continue
             ((resource_idx++))
             NET_RESOURCE_MAP[$resource_idx]="SUBNET|$ocid"
@@ -4028,8 +4314,17 @@ manage_network_resources() {
             local access_color
             [[ "$access" == "Private" ]] && access_color="$RED" || access_color="$LIGHT_GREEN"
             
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Subnet:${NC} ${GREEN}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${CYAN}%s${WHITE}] [${access_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "$name" "$ocid" "$cidr" "$access"
+            # DNS label display (one space after colon, extended column)
+            local dns_display
+            if [[ -n "$dns_label" ]]; then
+                dns_display=$(printf "DNS: %-13s" "$dns_label")
+            else
+                dns_display=$(printf "%-18s" "")
+            fi
+            
+            # Use printf for alignment
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}Subnet:${NC} ${GREEN}%-35s${NC} ${WHITE}[${CYAN}%-18s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-18s${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "$name" "$cidr" "$access" "$dns_display" "$ocid"
         done < <(grep "^SUBNET|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
     fi
     
@@ -4040,7 +4335,7 @@ manage_network_resources() {
     declare -A ASSIGNED_SL_IDS
     
     if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
-        while IFS='|' read -r type name cidr access state ocid rt_ocid sl_ids; do
+        while IFS='|' read -r type name cidr access state ocid rt_ocid sl_ids dns_label; do
             [[ "$type" != "SUBNET" ]] && continue
             
             # Map route table to subnet
@@ -4084,8 +4379,8 @@ manage_network_resources() {
             ingress=$(echo "$rule_counts" | cut -d'|' -f1)
             egress=$(echo "$rule_counts" | cut -d'|' -f2)
             
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}NSG:${NC} ${CYAN}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[In:${GREEN}%s${WHITE} Out:${GREEN}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "$name" "$ocid" "$ingress" "$egress"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}NSG:${NC} ${CYAN}%-40s${NC} ${WHITE}[In:${GREEN}%-3s${WHITE} Out:${GREEN}%-3s${WHITE}]${NC}      ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "$name" "$ingress" "$egress" "$ocid"
         done < <(grep "^NSG|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
     fi
     
@@ -4098,21 +4393,22 @@ manage_network_resources() {
         while IFS='|' read -r sl_ocid sl_vcn sl_name sl_state sl_ingress sl_egress; do
             [[ -z "$sl_ocid" || "$sl_ocid" == "#"* ]] && continue
             [[ "$sl_vcn" != "$vcn_ocid" ]] && continue
-            # Only show if assigned to a subnet
-            [[ -z "${ASSIGNED_SL_IDS[$sl_ocid]:-}" ]] && continue
             ((resource_idx++))
             ((sl_count++))
             NET_RESOURCE_MAP[$resource_idx]="SECURITY_LIST|$sl_ocid"
             
             # Get assigned subnets
-            local assigned_subnets="${SL_TO_SUBNETS[$sl_ocid]:-none}"
-            
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Security List:${NC} ${MAGENTA}%s${NC} ${YELLOW}(%s)${NC}\n" \
-                "$resource_idx" "$sl_name" "$sl_ocid"
-            printf "      ${WHITE}[In:${GREEN}%s${WHITE} Out:${GREEN}%s${WHITE}]${NC} ${WHITE}→ Subnets:${NC} ${CYAN}%s${NC}\n" "$sl_ingress" "$sl_egress" "$assigned_subnets"
+            local assigned_subnets="${SL_TO_SUBNETS[$sl_ocid]:-}"
+            local subnet_display
+            if [[ -n "$assigned_subnets" ]]; then
+                subnet_display="→ ${assigned_subnets}"
+                echo -e "  ${YELLOW}$(printf '%2d' $resource_idx)${NC}) ${WHITE}SL:${NC} ${MAGENTA}${sl_name}${NC} ${WHITE}[In:${GREEN}${sl_ingress}${WHITE} Out:${GREEN}${sl_egress}${WHITE}]${NC} ${YELLOW}(${sl_ocid})${NC} ${CYAN}${subnet_display}${NC}"
+            else
+                echo -e "  ${YELLOW}$(printf '%2d' $resource_idx)${NC}) ${WHITE}SL:${NC} ${MAGENTA}${sl_name}${NC} ${WHITE}[In:${GREEN}${sl_ingress}${WHITE} Out:${GREEN}${sl_egress}${WHITE}]${NC} ${YELLOW}(${sl_ocid})${NC} ${GRAY}(not assigned)${NC}"
+            fi
         done < "$SL_CACHE"
     fi
-    [[ $sl_count -eq 0 ]] && echo -e "  ${WHITE}(No security lists assigned to subnets)${NC}"
+    [[ $sl_count -eq 0 ]] && echo -e "  ${WHITE}(No security lists found)${NC}"
     
     echo ""
     echo -e "  ${BOLD}${WHITE}── Route Tables ──${NC}"
@@ -4128,9 +4424,8 @@ manage_network_resources() {
             # Get assigned subnets
             local assigned_subnets="${RT_TO_SUBNETS[$rt_ocid]:-none}"
             
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Route Table:${NC} ${MAGENTA}%s${NC} ${YELLOW}(%s)${NC}\n" \
-                "$resource_idx" "$rt_name" "$rt_ocid"
-            printf "      ${WHITE}[Rules:${GREEN}%s${WHITE}]${NC} ${WHITE}→ Subnets:${NC} ${CYAN}%s${NC}\n" "$rt_rules" "$assigned_subnets"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}RT:${NC} ${MAGENTA}%-30s${NC} ${WHITE}[Rules:${GREEN}%-2s${WHITE}]${NC} ${YELLOW}(%s)${NC} ${WHITE}→${NC} ${CYAN}%s${NC}\n" \
+                "$resource_idx" "$rt_name" "$rt_rules" "$rt_ocid" "$assigned_subnets"
         done < "$RT_CACHE"
     fi
     
@@ -4145,8 +4440,8 @@ manage_network_resources() {
             NET_RESOURCE_MAP[$resource_idx]="GATEWAY|IGW|$igw_ocid"
             local state_color="$GREEN"
             [[ "$igw_state" != "AVAILABLE" ]] && state_color="$RED"
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Internet GW:${NC}  ${ORANGE}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${state_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "${igw_name:-N/A}" "$igw_ocid" "$igw_state"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}Internet GW:${NC}   ${ORANGE}%-40s${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "${igw_name:-N/A}" "$igw_state" "$igw_ocid"
         done < "$IGW_CACHE"
     fi
     
@@ -4158,8 +4453,8 @@ manage_network_resources() {
             NET_RESOURCE_MAP[$resource_idx]="GATEWAY|NAT|$nat_ocid"
             local state_color="$GREEN"
             [[ "$nat_state" != "AVAILABLE" ]] && state_color="$RED"
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}NAT GW:${NC}       ${ORANGE}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${state_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "${nat_name:-N/A}" "$nat_ocid" "$nat_state"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}NAT GW:${NC}        ${ORANGE}%-40s${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "${nat_name:-N/A}" "$nat_state" "$nat_ocid"
         done < "$NAT_CACHE"
     fi
     
@@ -4171,8 +4466,8 @@ manage_network_resources() {
             NET_RESOURCE_MAP[$resource_idx]="GATEWAY|SGW|$sgw_ocid"
             local state_color="$GREEN"
             [[ "$sgw_state" != "AVAILABLE" ]] && state_color="$RED"
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Service GW:${NC}   ${ORANGE}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${state_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "${sgw_name:-N/A}" "$sgw_ocid" "$sgw_state"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}Service GW:${NC}    ${ORANGE}%-40s${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "${sgw_name:-N/A}" "$sgw_state" "$sgw_ocid"
         done < "$SGW_CACHE"
     fi
     
@@ -4184,8 +4479,8 @@ manage_network_resources() {
             NET_RESOURCE_MAP[$resource_idx]="GATEWAY|DRG|$drg_ocid"
             local state_color="$GREEN"
             [[ "$drg_state" != "ATTACHED" && "$drg_state" != "AVAILABLE" ]] && state_color="$RED"
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}DRG Attach:${NC}   ${ORANGE}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${state_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "${drg_name:-N/A}" "$drg_ocid" "$drg_state"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}DRG Attach:${NC}    ${ORANGE}%-40s${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "${drg_name:-N/A}" "$drg_state" "$drg_ocid"
         done < "$DRG_CACHE"
     fi
     
@@ -4197,8 +4492,8 @@ manage_network_resources() {
             NET_RESOURCE_MAP[$resource_idx]="GATEWAY|LPG|$lpg_ocid"
             local state_color="$GREEN"
             [[ "$lpg_state" != "AVAILABLE" ]] && state_color="$RED"
-            printf "  ${YELLOW}%2d${NC}) ${WHITE}Local Peer GW:${NC}${ORANGE}%s${NC} ${YELLOW}(%s)${NC} ${WHITE}[${state_color}%s${WHITE}]${NC}\n" \
-                "$resource_idx" "${lpg_name:-N/A}" "$lpg_ocid" "$lpg_state"
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}Local Peer GW:${NC} ${ORANGE}%-40s${NC} ${WHITE}[${state_color}%-9s${WHITE}]${NC} ${YELLOW}(%s)${NC}\n" \
+                "$resource_idx" "${lpg_name:-N/A}" "$lpg_state" "$lpg_ocid"
         done < "$LPG_CACHE"
     fi
     
@@ -5097,17 +5392,18 @@ manage_compute_instances() {
         echo ""
         
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
-        echo -e "  ${YELLOW}i#${NC}      - View instance details (e.g., 'i1', 'i5')"
-        echo -e "  ${YELLOW}ocid1...${NC} - View instance by OCID directly"
-        echo -e "  ${MAGENTA}refresh${NC} - Refresh instance list"
-        echo -e "  ${CYAN}back${NC}    - Return to main menu"
+        echo -e "  ${YELLOW}i#${NC}         - View instance details (e.g., 'i1', 'i5')"
+        echo -e "  ${YELLOW}ocid1...${NC}   - View instance by OCID directly"
+        echo -e "  ${GREEN}p${NC}          - View all instances with OCI properties (shape, mem, boot vol, cloud-init)"
+        echo -e "  ${MAGENTA}refresh${NC}    - Refresh instance list"
+        echo -e "  ${CYAN}back${NC}       - Return to main menu"
         echo ""
         echo -e "${GRAY}Tip: From command line, use:${NC}"
         echo -e "${GRAY}  $0 <instance-ocid>                  # Basic info (OCI + K8s)${NC}"
         echo -e "${GRAY}  $0 <instance-ocid> --details        # Full details (network, volumes)${NC}"
         echo -e "${GRAY}  $0 <instance-ocid> --console-history # Boot logs (debug cloud-init)${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [i#/ocid/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [i#/ocid/p/refresh/back]: ${NC}"
         
         local input
         read -r input
@@ -5118,6 +5414,9 @@ manage_compute_instances() {
         fi
         
         case "$input" in
+            properties|PROPERTIES|props|p)
+                display_instances_properties_view
+                ;;
             refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing...${NC}"
                 ;;
@@ -5145,6 +5444,362 @@ manage_compute_instances() {
                 ;;
         esac
     done
+}
+
+#--------------------------------------------------------------------------------
+# Display all instances with OCI properties in consolidated view
+# Shows: Name, State, Shape config, Boot Vol, Image, Oracle-Tags, Cloud-Init
+# Uses parallel fetching and caching for boot volumes and images
+#--------------------------------------------------------------------------------
+display_instances_properties_view() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    local max_parallel=10  # Max parallel API calls
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                                                                    INSTANCE PROPERTIES VIEW                                                                                                                          ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Check cache freshness (1 hour = 3600 seconds)
+    local cache_max_age=3600
+    local bv_cache_valid=false
+    local img_cache_valid=false
+    
+    if [[ -f "$BOOT_VOLUME_CACHE" ]]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)))
+        [[ $cache_age -lt $cache_max_age ]] && bv_cache_valid=true
+    fi
+    if [[ -f "$IMAGE_CACHE" ]]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$IMAGE_CACHE" 2>/dev/null || echo 0)))
+        [[ $cache_age -lt $cache_max_age ]] && img_cache_valid=true
+    fi
+    
+    echo -e "${YELLOW}Fetching instances...${NC}"
+    
+    # Fetch all instances with full details
+    local instances_json
+    instances_json=$(oci compute instance list \
+        --compartment-id "$compartment_id" \
+        --region "$region" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data[]' > /dev/null 2>&1; then
+        echo -e "${RED}No instances found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Count instances
+    local total_count
+    total_count=$(echo "$instances_json" | jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | length')
+    echo -e "${GREEN}Found ${total_count} instances${NC}"
+    
+    # Extract unique image IDs and instance OCIDs for parallel fetching
+    local unique_images unique_instances
+    unique_images=$(echo "$instances_json" | jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .["image-id"] // empty' | sort -u | grep -v '^$')
+    unique_instances=$(echo "$instances_json" | jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | "\(.id)|\(.["availability-domain"])"')
+    
+    # ========== PARALLEL BOOT VOLUME FETCHING ==========
+    if [[ "$bv_cache_valid" == "true" ]]; then
+        echo -e "${CYAN}Using cached boot volume data (< 1 hour old)${NC}"
+    else
+        echo -e "${YELLOW}Fetching boot volumes in parallel...${NC}"
+        
+        # Create temp directory for parallel results
+        local tmp_bv_dir="/tmp/bv_fetch_$$"
+        mkdir -p "$tmp_bv_dir"
+        
+        local bv_count=0
+        local bv_total
+        bv_total=$(echo "$unique_instances" | grep -c . || echo 0)
+        
+        # Fetch boot volume attachments and details in parallel
+        while IFS='|' read -r inst_ocid inst_ad; do
+            [[ -z "$inst_ocid" ]] && continue
+            
+            # Run in background
+            (
+                # Get boot volume attachment - try with instance's compartment first
+                local bv_attach_json
+                bv_attach_json=$(oci compute boot-volume-attachment list \
+                    --compartment-id "$compartment_id" \
+                    --availability-domain "$inst_ad" \
+                    --instance-id "$inst_ocid" \
+                    --output json 2>/dev/null)
+                
+                local bv_id
+                bv_id=$(echo "$bv_attach_json" | jq -r '.data[0]["boot-volume-id"] // empty' 2>/dev/null)
+                
+                if [[ -n "$bv_id" && "$bv_id" != "null" && "$bv_id" != "None" && "$bv_id" != "" ]]; then
+                    # Get boot volume details using size-in-gbs and vpus-per-gb
+                    local bv_json
+                    bv_json=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
+                    
+                    if [[ -n "$bv_json" ]]; then
+                        local bv_size bv_vpus
+                        bv_size=$(echo "$bv_json" | jq -r '.data["size-in-gbs"] // empty' 2>/dev/null)
+                        bv_vpus=$(echo "$bv_json" | jq -r '.data["vpus-per-gb"] // empty' 2>/dev/null)
+                        
+                        # Only write if we got values
+                        if [[ -n "$bv_size" && "$bv_size" != "null" ]]; then
+                            [[ -z "$bv_vpus" || "$bv_vpus" == "null" ]] && bv_vpus="-"
+                            echo "${inst_ocid}|${bv_size}|${bv_vpus}" > "${tmp_bv_dir}/${inst_ocid##*.}"
+                        fi
+                    fi
+                fi
+            ) &
+            
+            ((bv_count++))
+            
+            # Limit parallel jobs
+            if (( bv_count % max_parallel == 0 )); then
+                wait
+                printf "\r${GRAY}  Boot volumes: %d/%d${NC}          " "$bv_count" "$bv_total"
+            fi
+        done <<< "$unique_instances"
+        
+        # Wait for remaining jobs
+        wait
+        printf "\r${GRAY}  Boot volumes: %d/%d - Done${NC}          \n" "$bv_total" "$bv_total"
+        
+        # Consolidate results into cache
+        if [[ -d "$tmp_bv_dir" ]] && ls "${tmp_bv_dir}"/* >/dev/null 2>&1; then
+            cat "${tmp_bv_dir}"/* > "$BOOT_VOLUME_CACHE" 2>/dev/null
+            local cached_count
+            cached_count=$(wc -l < "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)
+            echo -e "${GREEN}  Cached ${cached_count} boot volumes${NC}"
+        else
+            echo -e "${YELLOW}  No boot volume data retrieved${NC}"
+        fi
+        rm -rf "$tmp_bv_dir"
+    fi
+    
+    # ========== PARALLEL IMAGE FETCHING ==========
+    if [[ "$img_cache_valid" == "true" ]]; then
+        echo -e "${CYAN}Using cached image data (< 1 hour old)${NC}"
+    else
+        echo -e "${YELLOW}Fetching images in parallel...${NC}"
+        
+        local tmp_img_dir="/tmp/img_fetch_$$"
+        mkdir -p "$tmp_img_dir"
+        
+        local img_count=0
+        local img_total
+        img_total=$(echo "$unique_images" | wc -l)
+        
+        while read -r image_id; do
+            [[ -z "$image_id" ]] && continue
+            
+            # Check if already in cache
+            if grep -q "^${image_id}|" "$IMAGE_CACHE" 2>/dev/null; then
+                ((img_count++))
+                continue
+            fi
+            
+            # Run in background
+            (
+                local img_name
+                img_name=$(oci compute image get --image-id "$image_id" \
+                    --query 'data."display-name"' --raw-output 2>/dev/null) || img_name="-"
+                echo "${image_id}|${img_name}" > "${tmp_img_dir}/${image_id##*.}"
+            ) &
+            
+            ((img_count++))
+            
+            # Limit parallel jobs
+            if (( img_count % max_parallel == 0 )); then
+                wait
+                printf "\r${GRAY}  Images: %d/%d${NC}          " "$img_count" "$img_total"
+            fi
+        done <<< "$unique_images"
+        
+        # Wait for remaining jobs
+        wait
+        printf "\r${GRAY}  Images: %d/%d - Done${NC}          \n" "$img_total" "$img_total"
+        
+        # Consolidate results into cache (append new entries)
+        if [[ -d "$tmp_img_dir" ]]; then
+            cat "${tmp_img_dir}"/* >> "$IMAGE_CACHE" 2>/dev/null
+            rm -rf "$tmp_img_dir"
+        fi
+    fi
+    
+    # ========== BUILD DISPLAY DATA ==========
+    echo -e "${YELLOW}Building display...${NC}"
+    
+    local tmp_data="/tmp/instance_props_$$"
+    rm -f "$tmp_data"
+    
+    # Load caches into associative arrays for fast lookup
+    declare -A BV_CACHE_MAP
+    declare -A IMG_CACHE_MAP
+    
+    if [[ -f "$BOOT_VOLUME_CACHE" && -s "$BOOT_VOLUME_CACHE" ]]; then
+        local bv_loaded=0
+        while IFS='|' read -r inst_id bv_sz bv_vp; do
+            if [[ -n "$inst_id" && -n "$bv_sz" ]]; then
+                BV_CACHE_MAP["$inst_id"]="${bv_sz}|${bv_vp}"
+                ((bv_loaded++))
+            fi
+        done < "$BOOT_VOLUME_CACHE"
+        echo -e "${GRAY}  Loaded ${bv_loaded} boot volume entries from cache${NC}"
+    else
+        echo -e "${YELLOW}  No boot volume cache available${NC}"
+    fi
+    
+    if [[ -f "$IMAGE_CACHE" && -s "$IMAGE_CACHE" ]]; then
+        local img_loaded=0
+        while IFS='|' read -r img_id img_nm; do
+            if [[ -n "$img_id" ]]; then
+                IMG_CACHE_MAP["$img_id"]="$img_nm"
+                ((img_loaded++))
+            fi
+        done < "$IMAGE_CACHE"
+        echo -e "${GRAY}  Loaded ${img_loaded} image entries from cache${NC}"
+    fi
+    
+    # Process each instance using cached data
+    while IFS='|' read -r ocid name state shape ocpus memory gpus net_bw max_vnics ad image_id launch_mode user_data created_by created_on; do
+        [[ -z "$ocid" ]] && continue
+        
+        # Get boot volume from cache - use size-in-gbs and vpus-per-gb values
+        local bv_size="-" bv_vpus="-"
+        if [[ -n "${BV_CACHE_MAP[$ocid]:-}" ]]; then
+            IFS='|' read -r bv_size bv_vpus <<< "${BV_CACHE_MAP[$ocid]}"
+            # Ensure we have valid values
+            [[ -z "$bv_size" || "$bv_size" == "null" ]] && bv_size="-"
+            [[ -z "$bv_vpus" || "$bv_vpus" == "null" ]] && bv_vpus="-"
+        fi
+        
+        # Get image name from cache
+        local image_name="-"
+        if [[ -n "$image_id" && "$image_id" != "null" && -n "${IMG_CACHE_MAP[$image_id]:-}" ]]; then
+            image_name="${IMG_CACHE_MAP[$image_id]:0:35}"
+        fi
+        
+        # Cloud-init fingerprint (last 7 chars)
+        local ci_fp="-"
+        if [[ -n "$user_data" && "$user_data" != "null" && "$user_data" != "" ]]; then
+            ci_fp="${user_data: -7}"
+        fi
+        
+        # Handle null values
+        [[ "$gpus" == "null" || -z "$gpus" ]] && gpus="0"
+        [[ "$net_bw" == "null" || -z "$net_bw" ]] && net_bw="-"
+        [[ "$max_vnics" == "null" || -z "$max_vnics" ]] && max_vnics="-"
+        [[ "$launch_mode" == "null" || -z "$launch_mode" ]] && launch_mode="-"
+        [[ "$created_by" == "null" || -z "$created_by" ]] && created_by="-"
+        [[ "$created_on" == "null" || -z "$created_on" ]] && created_on="-"
+        
+        # Format created_on date
+        [[ "$created_on" != "-" ]] && created_on="${created_on:0:10}"
+        
+        # Store data
+        echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${launch_mode}|${created_by}|${created_on}|${ci_fp}" >> "$tmp_data"
+        
+    done < <(echo "$instances_json" | jq -r '
+        .data[] | 
+        select(.["lifecycle-state"] != "TERMINATED") |
+        "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["shape-config"]["ocpus"] // "")|\(.["shape-config"]["memory-in-gbs"] // "")|\(.["shape-config"]["gpus"] // "0")|\(.["shape-config"]["networking-bandwidth-in-gbps"] // "")|\(.["shape-config"]["max-vnic-attachments"] // "")|\(.["availability-domain"])|\(.["image-id"] // "")|\(.["launch-mode"] // "")|\(.metadata.user_data // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedBy"] // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedOn"] // "")"
+    ' 2>/dev/null)
+    
+    if [[ ! -f "$tmp_data" ]]; then
+        echo -e "${RED}No instance data collected${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Display header
+    echo ""
+    printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-35s %-10s %-45s %-10s %-7s${NC}\n" \
+        "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "LaunchMode" "CreatedBy" "CreatedOn" "CI"
+    print_separator 255
+    
+    # Display data sorted by name
+    sort -t'|' -k1,1 "$tmp_data" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp; do
+        # Color state
+        local state_color="$GREEN"
+        case "$state" in
+            RUNNING) state_color="$GREEN" ;;
+            STOPPED) state_color="$RED" ;;
+            STARTING|STOPPING) state_color="$YELLOW" ;;
+            PROVISIONING) state_color="$CYAN" ;;
+            *) state_color="$WHITE" ;;
+        esac
+        
+        # GPU display
+        local gpu_disp="$gpus"
+        [[ "$gpus" == "0" ]] && gpu_disp="-"
+        
+        # Truncate fields
+        local name_t="${name:0:35}"
+        local shape_t="${shape:0:22}"
+        local created_by_t="${created_by:0:45}"
+        
+        printf "%-35s ${state_color}%-8s${NC} ${CYAN}%-22s${NC} %5s %6s ${GREEN}%3s${NC} %6s %4s %5s %4s %-35s %-10s ${BLUE}%-45s${NC} ${GRAY}%-10s${NC} ${MAGENTA}%-7s${NC}\n" \
+            "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$launch_mode" "$created_by_t" "$created_on" "$ci_fp"
+    done
+    
+    rm -f "$tmp_data"
+    
+    echo ""
+    print_separator 255
+    echo ""
+    echo -e "${BOLD}${WHITE}Column Legend:${NC}"
+    echo -e "  ${WHITE}OCPUs${NC}      - Number of OCPUs (shape-config.ocpus)"
+    echo -e "  ${WHITE}Mem${NC}        - Memory in GB (shape-config.memory-in-gbs)"
+    echo -e "  ${WHITE}GPU${NC}        - Number of GPUs (shape-config.gpus)"
+    echo -e "  ${WHITE}NetBW${NC}      - Network bandwidth in Gbps (shape-config.networking-bandwidth-in-gbps)"
+    echo -e "  ${WHITE}VNIC${NC}       - Max VNIC attachments (shape-config.max-vnic-attachments)"
+    echo -e "  ${WHITE}BV GB${NC}      - Boot Volume size in GB (boot-volume.size-in-gbs)"
+    echo -e "  ${WHITE}VPUs${NC}       - Boot Volume VPUs/GB (boot-volume.vpus-per-gb) [10=Balanced, 20=Higher, 30+=Ultra]"
+    echo -e "  ${WHITE}LaunchMode${NC} - NATIVE, EMULATED, PARAVIRTUALIZED, or CUSTOM (instance.launch-mode)"
+    echo -e "  ${BLUE}CreatedBy${NC}  - Oracle-Tags CreatedBy (defined-tags.Oracle-Tags.CreatedBy)"
+    echo -e "  ${GRAY}CreatedOn${NC}  - Oracle-Tags CreatedOn date (defined-tags.Oracle-Tags.CreatedOn)"
+    echo -e "  ${WHITE}CI${NC}         - Cloud-Init fingerprint (last 7 chars of metadata.user_data)"
+    echo ""
+    echo -e "${GRAY}Instances with matching CI fingerprints have identical cloud-init configurations${NC}"
+    echo ""
+    
+    # Show cache info
+    echo -e "${BOLD}${WHITE}Cache Info:${NC}"
+    if [[ -f "$BOOT_VOLUME_CACHE" ]]; then
+        local bv_cache_age=$(($(date +%s) - $(stat -c %Y "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)))
+        local bv_cache_count=$(wc -l < "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)
+        echo -e "  ${WHITE}Boot Volumes:${NC} ${bv_cache_count} cached, age: $((bv_cache_age / 60)) min"
+    fi
+    if [[ -f "$IMAGE_CACHE" ]]; then
+        local img_cache_age=$(($(date +%s) - $(stat -c %Y "$IMAGE_CACHE" 2>/dev/null || echo 0)))
+        local img_cache_count=$(wc -l < "$IMAGE_CACHE" 2>/dev/null || echo 0)
+        echo -e "  ${WHITE}Images:${NC}       ${img_cache_count} cached, age: $((img_cache_age / 60)) min"
+    fi
+    echo ""
+    echo -e "${BOLD}${WHITE}Options:${NC}"
+    echo -e "  ${MAGENTA}refresh${NC} - Clear cache and re-fetch all data"
+    echo -e "  ${CYAN}Enter${NC}   - Return to menu"
+    echo ""
+    echo -n -e "${CYAN}Action [refresh/Enter]: ${NC}"
+    
+    local action
+    read -r action
+    
+    case "$action" in
+        refresh|REFRESH|r|R)
+            echo -e "${YELLOW}Clearing cache...${NC}"
+            rm -f "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE"
+            echo -e "${GREEN}Cache cleared. Re-running...${NC}"
+            sleep 1
+            display_instances_properties_view
+            ;;
+        *)
+            return
+            ;;
+    esac
 }
 
 #--------------------------------------------------------------------------------
@@ -5419,7 +6074,9 @@ display_instance_details() {
     local region="${EFFECTIVE_REGION:-$REGION}"
     
     echo ""
-    echo -e "${BOLD}${CYAN}=== Instance Details ===${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                                         INSTANCE DETAILS                                                                               ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     
     # Fetch instance details
     local instance_json
@@ -5431,21 +6088,50 @@ display_instance_details() {
     fi
     
     # Extract basic info
-    local display_name state shape ad fd time_created
+    local display_name state shape ad fd time_created launch_mode image_id
     display_name=$(echo "$instance_json" | jq -r '.data["display-name"] // "N/A"')
     state=$(echo "$instance_json" | jq -r '.data["lifecycle-state"] // "N/A"')
     shape=$(echo "$instance_json" | jq -r '.data.shape // "N/A"')
     ad=$(echo "$instance_json" | jq -r '.data["availability-domain"] // "N/A"')
     fd=$(echo "$instance_json" | jq -r '.data["fault-domain"] // "N/A"')
     time_created=$(echo "$instance_json" | jq -r '.data["time-created"] // "N/A"')
+    launch_mode=$(echo "$instance_json" | jq -r '.data["launch-mode"] // "N/A"')
+    image_id=$(echo "$instance_json" | jq -r '.data["image-id"] // empty')
+    
+    # Extract shape config
+    local shape_ocpus shape_memory_gb shape_gpus shape_gpu_desc shape_nvmes shape_network_bw shape_max_nics
+    shape_ocpus=$(echo "$instance_json" | jq -r '.data["shape-config"]["ocpus"] // "N/A"')
+    shape_memory_gb=$(echo "$instance_json" | jq -r '.data["shape-config"]["memory-in-gbs"] // "N/A"')
+    shape_gpus=$(echo "$instance_json" | jq -r '.data["shape-config"]["gpus"] // "0"')
+    shape_gpu_desc=$(echo "$instance_json" | jq -r '.data["shape-config"]["gpu-description"] // empty')
+    shape_nvmes=$(echo "$instance_json" | jq -r '.data["shape-config"]["local-disks"] // "0"')
+    shape_network_bw=$(echo "$instance_json" | jq -r '.data["shape-config"]["networking-bandwidth-in-gbps"] // "N/A"')
+    shape_max_nics=$(echo "$instance_json" | jq -r '.data["shape-config"]["max-vnic-attachments"] // "N/A"')
     
     # Extract GPU memory cluster tag
     local gpu_mem_cluster
-    gpu_mem_cluster=$(echo "$instance_json" | jq -r '.data["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A"')
+    gpu_mem_cluster=$(echo "$instance_json" | jq -r '.data["freeform-tags"]["oci:compute:gpumemorycluster"] // empty')
     
     # Extract compute cluster ID
     local compute_cluster_id
-    compute_cluster_id=$(echo "$instance_json" | jq -r '.data["compute-cluster-id"] // "N/A"')
+    compute_cluster_id=$(echo "$instance_json" | jq -r '.data["compute-cluster-id"] // empty')
+    
+    # Check for OKE-related tags (created by)
+    local oke_cluster_id oke_nodepool_id
+    oke_cluster_id=$(echo "$instance_json" | jq -r '.data["defined-tags"]["oke-apisystem"]["ClusterId"] // empty')
+    oke_nodepool_id=$(echo "$instance_json" | jq -r '.data["defined-tags"]["oke-apisystem"]["NodePoolId"] // empty')
+    [[ -z "$oke_cluster_id" ]] && oke_cluster_id=$(echo "$instance_json" | jq -r '.data["freeform-tags"]["oke-clusterId"] // empty')
+    [[ -z "$oke_nodepool_id" ]] && oke_nodepool_id=$(echo "$instance_json" | jq -r '.data["freeform-tags"]["oke-nodePoolId"] // empty')
+    
+    # Check for instance pool / instance configuration
+    local instance_pool_id instance_config_id
+    instance_pool_id=$(echo "$instance_json" | jq -r '.data["metadata"]["oci:compute:instancepool:id"] // empty')
+    instance_config_id=$(echo "$instance_json" | jq -r '.data["metadata"]["oci:compute:instanceconfiguration:id"] // empty')
+    
+    # Extract Oracle-Tags
+    local oracle_created_by oracle_created_on
+    oracle_created_by=$(echo "$instance_json" | jq -r '.data["defined-tags"]["Oracle-Tags"]["CreatedBy"] // empty')
+    oracle_created_on=$(echo "$instance_json" | jq -r '.data["defined-tags"]["Oracle-Tags"]["CreatedOn"] // empty')
     
     # Color state
     local state_color="$GREEN"
@@ -5457,35 +6143,123 @@ display_instance_details() {
         *) state_color="$WHITE" ;;
     esac
     
-    echo -e "${WHITE}Name:${NC}              ${GREEN}$display_name${NC}"
-    echo -e "${WHITE}OCID:${NC}              ${YELLOW}$instance_ocid${NC}"
+    # ========== BASIC INFO ==========
     echo ""
-    echo -e "${WHITE}State:${NC}             ${state_color}$state${NC}"
-    echo -e "${WHITE}Shape:${NC}             $shape"
-    echo -e "${WHITE}Availability Domain:${NC} $ad"
-    echo -e "${WHITE}Fault Domain:${NC}      $fd"
-    echo -e "${WHITE}Time Created:${NC}      $time_created"
+    echo -e "${BOLD}${WHITE}=== Basic Info ===${NC}"
+    echo -e "  ${WHITE}Name:${NC}           ${GREEN}$display_name${NC}"
+    echo -e "  ${WHITE}Instance${NC}        ${GRAY}(${YELLOW}$instance_ocid${GRAY})${NC}"
+    echo -e "  ${WHITE}State:${NC}          ${state_color}$state${NC}"
+    echo -e "  ${WHITE}Time Created:${NC}   ${time_created:0:19}"
+    echo -e "  ${WHITE}AD / FD:${NC}        $ad / $fd"
+    echo -e "  ${WHITE}Launch Mode:${NC}    $launch_mode"
     
-    if [[ "$gpu_mem_cluster" != "N/A" && "$gpu_mem_cluster" != "null" ]]; then
-        local cluster_name
-        cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
-        echo ""
-        echo -e "${WHITE}GPU Memory Cluster:${NC} ${GREEN}$cluster_name${NC}"
-        echo -e "                    ${YELLOW}$gpu_mem_cluster${NC}"
+    # ========== ORACLE-TAGS & CREATED BY ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Oracle-Tags & Created By ===${NC}"
+    
+    # Oracle-Tags first
+    if [[ -n "$oracle_created_by" ]]; then
+        echo -e "  ${WHITE}Oracle-Tags CreatedBy:${NC}  ${CYAN}$oracle_created_by${NC}"
+    fi
+    if [[ -n "$oracle_created_on" ]]; then
+        echo -e "  ${WHITE}Oracle-Tags CreatedOn:${NC}  ${CYAN}${oracle_created_on:0:19}${NC}"
+    fi
+    if [[ -z "$oracle_created_by" && -z "$oracle_created_on" ]]; then
+        echo -e "  ${GRAY}Oracle-Tags not set${NC}"
     fi
     
-    if [[ "$compute_cluster_id" != "N/A" && "$compute_cluster_id" != "null" ]]; then
-        local cc_name
-        cc_name=$(get_compute_cluster_name "$compute_cluster_id")
-        echo -e "${WHITE}Compute Cluster:${NC}   ${GREEN}$cc_name${NC}"
-        echo -e "                    ${YELLOW}$compute_cluster_id${NC}"
+    # OKE / Instance Pool / Instance Config
+    echo ""
+    if [[ -n "$oke_cluster_id" ]]; then
+        echo -e "  ${WHITE}OKE Cluster${NC}     ${GRAY}(${YELLOW}$oke_cluster_id${GRAY})${NC}"
+        if [[ -n "$oke_nodepool_id" ]]; then
+            echo -e "  ${WHITE}OKE Node Pool${NC}   ${GRAY}(${YELLOW}$oke_nodepool_id${GRAY})${NC}"
+        fi
+    fi
+    if [[ -n "$instance_pool_id" ]]; then
+        echo -e "  ${WHITE}Instance Pool${NC}   ${GRAY}(${YELLOW}$instance_pool_id${GRAY})${NC}"
+    fi
+    if [[ -n "$instance_config_id" ]]; then
+        local ic_name
+        ic_name=$(get_instance_config_name "$instance_config_id")
+        echo -e "  ${WHITE}Instance Config${NC} ${GREEN}$ic_name${NC}"
+        echo -e "  ${WHITE}               ${NC} ${GRAY}(${YELLOW}$instance_config_id${GRAY})${NC}"
+    fi
+    if [[ -z "$oke_cluster_id" && -z "$instance_pool_id" && -z "$instance_config_id" ]]; then
+        echo -e "  ${GRAY}No OKE/Instance Pool/Instance Config association${NC}"
+    fi
+    
+    # ========== IMAGE ===========
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Image ===${NC}"
+    if [[ -n "$image_id" ]]; then
+        local image_name image_os image_os_version
+        local image_json
+        image_json=$(oci compute image get --image-id "$image_id" --output json 2>/dev/null)
+        if [[ -n "$image_json" ]]; then
+            image_name=$(echo "$image_json" | jq -r '.data["display-name"] // "N/A"')
+            image_os=$(echo "$image_json" | jq -r '.data["operating-system"] // "N/A"')
+            image_os_version=$(echo "$image_json" | jq -r '.data["operating-system-version"] // "N/A"')
+            echo -e "  ${WHITE}Name:${NC}           ${GREEN}$image_name${NC}"
+            echo -e "  ${WHITE}OS:${NC}             $image_os $image_os_version"
+        fi
+        echo -e "  ${WHITE}Image${NC}           ${GRAY}(${YELLOW}$image_id${GRAY})${NC}"
+    else
+        echo -e "  ${GRAY}Image information not available${NC}"
+    fi
+    
+    # ========== SHAPE CONFIGURATION ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Shape Configuration ===${NC}"
+    echo -e "  ${WHITE}Shape:${NC}          ${CYAN}$shape${NC}"
+    echo -e "  ${WHITE}OCPUs:${NC}          $shape_ocpus"
+    echo -e "  ${WHITE}Memory:${NC}         $shape_memory_gb GB"
+    if [[ "$shape_gpus" != "0" && "$shape_gpus" != "N/A" ]]; then
+        echo -e "  ${WHITE}GPUs:${NC}           ${GREEN}$shape_gpus${NC}"
+        [[ -n "$shape_gpu_desc" ]] && echo -e "  ${WHITE}GPU Type:${NC}       ${GREEN}$shape_gpu_desc${NC}"
+    fi
+    if [[ "$shape_nvmes" != "0" && "$shape_nvmes" != "N/A" ]]; then
+        echo -e "  ${WHITE}Local NVMes:${NC}    $shape_nvmes"
+    fi
+    echo -e "  ${WHITE}Network BW:${NC}     $shape_network_bw Gbps"
+    echo -e "  ${WHITE}Max VNICs:${NC}      $shape_max_nics"
+    
+    # ========== CLUSTER ASSOCIATIONS ==========
+    if [[ -n "$gpu_mem_cluster" || -n "$compute_cluster_id" ]]; then
+        echo ""
+        echo -e "${BOLD}${WHITE}=== Cluster Associations ===${NC}"
+        if [[ -n "$gpu_mem_cluster" ]]; then
+            local cluster_name
+            cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
+            echo -e "  ${WHITE}GPU Memory Cluster${NC} ${GREEN}$cluster_name${NC}"
+            echo -e "  ${WHITE}                  ${NC} ${GRAY}(${YELLOW}$gpu_mem_cluster${GRAY})${NC}"
+        fi
+        if [[ -n "$compute_cluster_id" ]]; then
+            local cc_name
+            cc_name=$(get_compute_cluster_name "$compute_cluster_id")
+            echo -e "  ${WHITE}Compute Cluster${NC}    ${GREEN}$cc_name${NC}"
+            echo -e "  ${WHITE}               ${NC}    ${GRAY}(${YELLOW}$compute_cluster_id${GRAY})${NC}"
+        fi
+    fi
+    
+    # Check for user_data (cloud-init)
+    local user_data_b64
+    user_data_b64=$(echo "$instance_json" | jq -r '.data.metadata.user_data // empty')
+    
+    local has_cloud_init="false"
+    if [[ -n "$user_data_b64" ]]; then
+        has_cloud_init="true"
+        local ud_decoded_size
+        ud_decoded_size=$(echo "$user_data_b64" | base64 -d 2>/dev/null | wc -c)
+        echo ""
+        echo -e "${BOLD}${WHITE}=== Cloud-Init ===${NC}"
+        echo -e "  ${WHITE}Status:${NC}         ${GREEN}Present${NC} (~${ud_decoded_size} bytes)"
     fi
     
     # ========== KUBERNETES STATUS ==========
     echo ""
-    echo -e "${BOLD}${CYAN}=== Kubernetes Status ===${NC}"
+    echo -e "${BOLD}${WHITE}=== Kubernetes Status ===${NC}"
     
-    # Check if instance is in K8s
     local k8s_node_info
     k8s_node_info=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '
         .items[] | select(.spec.providerID | contains($ocid)) | 
@@ -5499,22 +6273,21 @@ display_instance_details() {
         local ready_color="$GREEN"
         [[ "$k8s_ready" != "True" ]] && ready_color="$RED"
         
-        echo -e "  ${WHITE}In Kubernetes:${NC}   ${GREEN}Yes${NC}"
-        echo -e "  ${WHITE}Node Name:${NC}       ${GREEN}$k8s_node_name${NC}"
-        echo -e "  ${WHITE}Ready:${NC}           ${ready_color}$k8s_ready${NC}"
+        echo -e "  ${WHITE}In Kubernetes:${NC}  ${GREEN}Yes${NC}"
+        echo -e "  ${WHITE}Node Name:${NC}      ${GREEN}$k8s_node_name${NC}"
+        echo -e "  ${WHITE}Ready:${NC}          ${ready_color}$k8s_ready${NC}"
         if [[ "$k8s_gpu_present" == "true" ]]; then
-            echo -e "  ${WHITE}GPU Present:${NC}     ${GREEN}Yes${NC}"
-            [[ "$k8s_clique" != "N/A" ]] && echo -e "  ${WHITE}GPU Clique:${NC}      ${CYAN}$k8s_clique${NC}"
+            echo -e "  ${WHITE}GPU Present:${NC}    ${GREEN}Yes${NC}"
+            [[ "$k8s_clique" != "N/A" ]] && echo -e "  ${WHITE}GPU Clique:${NC}     ${CYAN}$k8s_clique${NC}"
         fi
     else
-        echo -e "  ${WHITE}In Kubernetes:${NC}   ${YELLOW}No${NC} (not joined or not found)"
+        echo -e "  ${WHITE}In Kubernetes:${NC}  ${YELLOW}No${NC} (not joined or not found)"
     fi
     
     # ========== NETWORK / VNIC INFORMATION ==========
     echo ""
-    echo -e "${BOLD}${CYAN}=== Network (VNICs) ===${NC}"
+    echo -e "${BOLD}${WHITE}=== Network (VNICs) ===${NC}"
     
-    # Get VNIC attachments
     local vnic_attachments
     vnic_attachments=$(oci compute vnic-attachment list \
         --compartment-id "$compartment_id" \
@@ -5526,7 +6299,6 @@ display_instance_details() {
         while IFS='|' read -r vnic_id vnic_attach_name nic_index; do
             [[ -z "$vnic_id" ]] && continue
             
-            # Get VNIC details
             local vnic_json
             vnic_json=$(oci network vnic get --vnic-id "$vnic_id" --output json 2>/dev/null)
             
@@ -5539,7 +6311,6 @@ display_instance_details() {
                 mac_addr=$(echo "$vnic_json" | jq -r '.data["mac-address"] // "N/A"')
                 is_primary=$(echo "$vnic_json" | jq -r '.data["is-primary"] // false')
                 
-                # Resolve subnet name
                 local subnet_name="N/A"
                 if [[ "$subnet_id" != "N/A" && -n "$subnet_id" ]]; then
                     subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
@@ -5550,13 +6321,13 @@ display_instance_details() {
                 
                 echo ""
                 echo -e "  ${BOLD}${WHITE}NIC ${nic_index}:${NC} ${GREEN}$vnic_name${NC}${primary_marker}"
-                echo -e "    ${WHITE}Private IP:${NC}  ${CYAN}$private_ip${NC}"
-                if is_valid_ocid "$public_ip"; then
-                    echo -e "    ${WHITE}Public IP:${NC}   ${CYAN}$public_ip${NC}"
+                echo -e "    ${WHITE}Private IP:${NC}   ${CYAN}$private_ip${NC}"
+                if [[ -n "$public_ip" && "$public_ip" != "null" && "$public_ip" != "N/A" ]]; then
+                    echo -e "    ${WHITE}Public IP:${NC}    ${CYAN}$public_ip${NC}"
                 fi
-                echo -e "    ${WHITE}MAC Address:${NC} $mac_addr"
-                echo -e "    ${WHITE}Subnet:${NC}      ${GREEN}$subnet_name${NC}"
-                echo -e "                  ${YELLOW}$subnet_id${NC}"
+                echo -e "    ${WHITE}MAC Address:${NC}  $mac_addr"
+                echo -e "    ${WHITE}Subnet${NC}        ${GREEN}$subnet_name${NC}"
+                echo -e "    ${WHITE}      ${NC}        ${GRAY}(${YELLOW}$subnet_id${GRAY})${NC}"
             fi
         done
     else
@@ -5565,7 +6336,7 @@ display_instance_details() {
     
     # ========== BOOT VOLUME ==========
     echo ""
-    echo -e "${BOLD}${CYAN}=== Boot Volume ===${NC}"
+    echo -e "${BOLD}${WHITE}=== Boot Volume ===${NC}"
     
     local boot_vol_attachments
     boot_vol_attachments=$(oci compute boot-volume-attachment list \
@@ -5579,7 +6350,6 @@ display_instance_details() {
         while IFS='|' read -r bv_id bv_attach_state; do
             [[ -z "$bv_id" ]] && continue
             
-            # Get boot volume details
             local bv_json
             bv_json=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
             
@@ -5593,11 +6363,11 @@ display_instance_details() {
                 local bv_state_color="$GREEN"
                 [[ "$bv_state" != "AVAILABLE" ]] && bv_state_color="$YELLOW"
                 
-                echo -e "  ${WHITE}Name:${NC}   ${GREEN}$bv_name${NC}"
-                echo -e "  ${WHITE}OCID:${NC}   ${YELLOW}$bv_id${NC}"
-                echo -e "  ${WHITE}State:${NC}  ${bv_state_color}$bv_state${NC}"
-                echo -e "  ${WHITE}Size:${NC}   ${bv_size_gb} GB"
-                echo -e "  ${WHITE}VPUs:${NC}   ${bv_vpus} per GB"
+                echo -e "  ${WHITE}Name:${NC}           ${GREEN}$bv_name${NC}"
+                echo -e "  ${WHITE}Boot Volume${NC}     ${GRAY}(${YELLOW}$bv_id${GRAY})${NC}"
+                echo -e "  ${WHITE}State:${NC}          ${bv_state_color}$bv_state${NC}"
+                echo -e "  ${WHITE}Size:${NC}           ${bv_size_gb} GB"
+                echo -e "  ${WHITE}VPUs:${NC}           ${bv_vpus} per GB"
             fi
         done
     else
@@ -5606,7 +6376,7 @@ display_instance_details() {
     
     # ========== BLOCK VOLUMES ==========
     echo ""
-    echo -e "${BOLD}${CYAN}=== Block Volumes ===${NC}"
+    echo -e "${BOLD}${WHITE}=== Block Volumes ===${NC}"
     
     local block_vol_attachments
     block_vol_attachments=$(oci compute volume-attachment list \
@@ -5620,7 +6390,6 @@ display_instance_details() {
             [[ -z "$vol_id" ]] && continue
             ((vol_count++))
             
-            # Get block volume details
             local vol_json
             vol_json=$(oci bv volume get --volume-id "$vol_id" --output json 2>/dev/null)
             
@@ -5639,17 +6408,402 @@ display_instance_details() {
                 
                 echo ""
                 echo -e "  ${BOLD}${WHITE}Volume ${vol_count}:${NC} ${GREEN}$vol_name${NC}${readonly_marker}"
-                echo -e "    ${WHITE}OCID:${NC}       ${YELLOW}$vol_id${NC}"
-                echo -e "    ${WHITE}State:${NC}      ${vol_state_color}$vol_state${NC}"
-                echo -e "    ${WHITE}Size:${NC}       ${vol_size_gb} GB"
-                echo -e "    ${WHITE}VPUs:${NC}       ${vol_vpus} per GB"
-                echo -e "    ${WHITE}Attachment:${NC} $attach_type"
-                [[ "$device" != "N/A" && -n "$device" ]] && echo -e "    ${WHITE}Device:${NC}     $device"
+                echo -e "    ${WHITE}Block Volume${NC}  ${GRAY}(${YELLOW}$vol_id${GRAY})${NC}"
+                echo -e "    ${WHITE}State:${NC}        ${vol_state_color}$vol_state${NC}"
+                echo -e "    ${WHITE}Size:${NC}         ${vol_size_gb} GB"
+                echo -e "    ${WHITE}VPUs:${NC}         ${vol_vpus} per GB"
+                echo -e "    ${WHITE}Attachment:${NC}   $attach_type"
+                [[ "$device" != "N/A" && -n "$device" ]] && echo -e "    ${WHITE}Device:${NC}       $device"
             fi
         done < <(echo "$block_vol_attachments" | jq -r '.data[] | "\(.["volume-id"])|\(.["lifecycle-state"])|\(.["attachment-type"])|\(.device // "N/A")|\(.["is-read-only"] // false)"' 2>/dev/null)
     fi
     
     [[ $vol_count -eq 0 ]] && echo -e "  ${GRAY}No block volumes attached${NC}"
+    
+    # ========== ACTIONS ==========
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+    if [[ "$has_cloud_init" == "true" ]]; then
+        echo -e "  ${MAGENTA}cloud-init${NC}  - View decoded cloud-init user-data"
+        echo -e "  ${MAGENTA}save${NC}        - Save cloud-init to file"
+        echo -e "  ${BLUE}compare${NC}     - Compare cloud-init with another instance or instance configuration"
+    fi
+    echo -e "  ${CYAN}Enter${NC}       - Return to menu"
+    echo ""
+    echo -n -e "${CYAN}Action [cloud-init/save/compare/Enter]: ${NC}"
+    
+    local action
+    read -r action
+    
+    case "$action" in
+        cloud-init|cloudinit|ci|view|VIEW)
+            if [[ "$has_cloud_init" == "true" ]]; then
+                echo ""
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${BOLD}${MAGENTA}                                    CLOUD-INIT USER-DATA                                                       ${NC}"
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${GRAY}Instance: ${WHITE}$display_name${NC}"
+                echo -e "${GRAY}OCID:     ${YELLOW}$instance_ocid${NC}"
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo "$user_data_b64" | base64 -d 2>/dev/null
+                echo ""
+                echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            else
+                echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+            fi
+            ;;
+        save|SAVE|s|S)
+            if [[ "$has_cloud_init" == "true" ]]; then
+                local safe_name
+                safe_name=$(echo "$display_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                local filename="${safe_name}_cloud-init.yml"
+                
+                echo ""
+                echo -n -e "${CYAN}Save as [${filename}]: ${NC}"
+                local custom_filename
+                read -r custom_filename
+                [[ -n "$custom_filename" ]] && filename="$custom_filename"
+                
+                if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
+                    echo -e "${GREEN}✓ Cloud-init saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                else
+                    echo -e "${RED}Failed to save cloud-init${NC}"
+                fi
+                echo ""
+                echo -n -e "${CYAN}Press Enter to continue...${NC}"
+                read -r
+            else
+                echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+            fi
+            ;;
+        compare|COMPARE|c|C)
+            if [[ "$has_cloud_init" == "true" ]]; then
+                compare_instance_cloud_init "$instance_ocid" "$display_name" "$user_data_b64"
+            else
+                echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
+            fi
+            ;;
+        *)
+            # Return to menu
+            ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# Compare instance cloud-init - offers choice of another instance or instance config
+# Args: $1 = instance OCID, $2 = instance display name, $3 = instance user_data base64
+#--------------------------------------------------------------------------------
+compare_instance_cloud_init() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    local instance_ud_b64="$3"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}═══ Compare Cloud-Init ═══${NC}"
+    echo ""
+    echo -e "${WHITE}Current Instance:${NC} ${GREEN}$instance_name${NC}"
+    echo ""
+    echo -e "${BOLD}${WHITE}Compare against:${NC}"
+    echo -e "  ${YELLOW}1${NC}) Another Compute Instance"
+    echo -e "  ${YELLOW}2${NC}) An Instance Configuration"
+    echo -e "  ${CYAN}q${NC}) Cancel"
+    echo ""
+    echo -n -e "${CYAN}Select option [1/2/q]: ${NC}"
+    
+    local choice
+    read -r choice
+    
+    case "$choice" in
+        1)
+            compare_instance_to_instance "$instance_ocid" "$instance_name" "$instance_ud_b64"
+            ;;
+        2)
+            compare_instance_to_config "$instance_ocid" "$instance_name" "$instance_ud_b64"
+            ;;
+        *)
+            return
+            ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# Compare instance cloud-init to another instance
+# Args: $1 = instance OCID, $2 = instance display name, $3 = instance user_data base64
+#--------------------------------------------------------------------------------
+compare_instance_to_instance() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    local instance_ud_b64="$3"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}═══ Compare to Another Instance ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}Fetching compute instances...${NC}"
+    
+    # Get list of instances
+    local instances_json
+    instances_json=$(oci compute instance list \
+        --compartment-id "$compartment_id" \
+        --lifecycle-state RUNNING \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data[]' > /dev/null 2>&1; then
+        echo -e "${RED}No running instances found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # List instances (excluding current one)
+    local inst_idx=0
+    declare -A COMPARE_INST_MAP=()
+    
+    printf "${BOLD}%-4s %-50s %-25s${NC}\n" "#" "Instance Name" "Shape"
+    print_separator 90
+    
+    while IFS='|' read -r inst_ocid inst_name inst_shape; do
+        [[ -z "$inst_ocid" ]] && continue
+        [[ "$inst_ocid" == "$instance_ocid" ]] && continue  # Skip current instance
+        
+        ((inst_idx++))
+        COMPARE_INST_MAP[$inst_idx]="$inst_ocid|$inst_name"
+        printf "${YELLOW}%-4s${NC} ${WHITE}%-50s${NC} ${CYAN}%-25s${NC}\n" "$inst_idx" "${inst_name:0:50}" "$inst_shape"
+    done < <(echo "$instances_json" | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.shape)"' 2>/dev/null)
+    
+    if [[ $inst_idx -eq 0 ]]; then
+        echo -e "${GRAY}No other instances found to compare${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select instance to compare against (1-${inst_idx}): ${NC}"
+    local select_choice
+    read -r select_choice
+    
+    if [[ -z "${COMPARE_INST_MAP[$select_choice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    local other_ocid other_name
+    IFS='|' read -r other_ocid other_name <<< "${COMPARE_INST_MAP[$select_choice]}"
+    
+    echo ""
+    echo -e "${YELLOW}Fetching instance details...${NC}"
+    
+    # Get the other instance's user_data
+    local other_ud_b64
+    other_ud_b64=$(oci compute instance get \
+        --instance-id "$other_ocid" \
+        --query 'data.metadata.user_data' \
+        --raw-output 2>/dev/null)
+    
+    if [[ -z "$other_ud_b64" || "$other_ud_b64" == "null" ]]; then
+        echo -e "${YELLOW}The selected instance has no cloud-init user_data${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Create temp files for diff
+    local tmp1 tmp2
+    tmp1=$(mktemp)
+    tmp2=$(mktemp)
+    
+    echo "$instance_ud_b64" | base64 -d > "$tmp1" 2>/dev/null
+    echo "$other_ud_b64" | base64 -d > "$tmp2" 2>/dev/null
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}                                           INSTANCE CLOUD-INIT COMPARISON                                                                              ${NC}"
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Comparing:${NC}"
+    echo -e "  ${RED}- Instance A:${NC} ${GREEN}$instance_name${NC}"
+    echo -e "  ${GREEN}+ Instance B:${NC} ${BLUE}$other_name${NC}"
+    echo ""
+    
+    if diff -q "$tmp1" "$tmp2" > /dev/null 2>&1; then
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                                                 ✓ CLOUD-INIT IS IDENTICAL                                                                              ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    else
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                                                 ✗ CLOUD-INIT DIFFERS                                                                                    ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${BOLD}${WHITE}Differences:${NC}"
+        echo ""
+        
+        local diff_output
+        diff_output=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | tail -n +4)
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^@@ ]]; then
+                echo -e "${YELLOW}${line}${NC}"
+            elif [[ "$line" =~ ^- ]]; then
+                echo -e "${RED}${line}${NC}  ${GRAY}← $instance_name${NC}"
+            elif [[ "$line" =~ ^\+ ]]; then
+                echo -e "${GREEN}${line}${NC}  ${GRAY}← $other_name${NC}"
+            elif [[ "$line" =~ ^[[:space:]] ]]; then
+                echo -e "${GRAY}${line}${NC}"
+            fi
+        done <<< "$diff_output"
+    fi
+    
+    rm -f "$tmp1" "$tmp2"
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Compare instance cloud-init against an instance configuration
+# Args: $1 = instance OCID, $2 = instance display name, $3 = instance user_data base64
+#--------------------------------------------------------------------------------
+compare_instance_to_config() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    local instance_ud_b64="$3"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}═══ Compare Instance Cloud-Init to Instance Configuration ═══${NC}"
+    echo ""
+    echo -e "${WHITE}Instance:${NC} ${GREEN}$instance_name${NC}"
+    echo ""
+    
+    # Refresh instance config cache
+    fetch_instance_configurations > /dev/null 2>&1
+    
+    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        echo -e "${RED}No instance configurations found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # List configs
+    local ic_idx=0
+    declare -A COMPARE_IC_MAP=()
+    
+    printf "${BOLD}%-4s %-70s${NC}\n" "#" "Instance Configuration Name"
+    print_separator 90
+    
+    while IFS='|' read -r ic_ocid ic_name _; do
+        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+        [[ -z "$ic_ocid" ]] && continue
+        
+        ((ic_idx++))
+        COMPARE_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
+        printf "${YELLOW}%-4s${NC} ${WHITE}%-70s${NC}\n" "$ic_idx" "$ic_name"
+    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+    
+    if [[ $ic_idx -eq 0 ]]; then
+        echo -e "${GRAY}No instance configurations found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select instance configuration to compare against (1-${ic_idx}): ${NC}"
+    local choice
+    read -r choice
+    
+    if [[ -z "${COMPARE_IC_MAP[$choice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    local ic_ocid ic_name
+    IFS='|' read -r ic_ocid ic_name <<< "${COMPARE_IC_MAP[$choice]}"
+    
+    echo ""
+    echo -e "${YELLOW}Fetching instance configuration...${NC}"
+    
+    # Get instance config user_data
+    local ic_ud_b64
+    ic_ud_b64=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ic_ocid" \
+        --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
+        --raw-output 2>/dev/null)
+    
+    if [[ -z "$ic_ud_b64" || "$ic_ud_b64" == "null" ]]; then
+        echo -e "${YELLOW}Instance configuration has no user_data${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Create temp files for diff
+    local tmp_instance tmp_ic
+    tmp_instance=$(mktemp)
+    tmp_ic=$(mktemp)
+    
+    echo "$instance_ud_b64" | base64 -d > "$tmp_instance" 2>/dev/null
+    echo "$ic_ud_b64" | base64 -d > "$tmp_ic" 2>/dev/null
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}                                              CLOUD-INIT COMPARISON                                                                                    ${NC}"
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Comparing:${NC}"
+    echo -e "  ${RED}- (Instance):${NC}        ${GREEN}$instance_name${NC}"
+    echo -e "  ${GREEN}+ (Instance Config):${NC} ${BLUE}$ic_name${NC}"
+    echo ""
+    
+    if diff -q "$tmp_instance" "$tmp_ic" > /dev/null 2>&1; then
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                                           ✓ CLOUD-INIT IS IDENTICAL - NO DRIFT DETECTED                                                               ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    else
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                                           ✗ DRIFT DETECTED - CLOUD-INIT DIFFERS                                                                        ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${BOLD}${WHITE}Differences:${NC}"
+        echo ""
+        
+        # Show annotated diff
+        local diff_output
+        diff_output=$(diff -u "$tmp_instance" "$tmp_ic" 2>/dev/null | tail -n +4)
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^@@ ]]; then
+                echo -e "${YELLOW}${line}${NC}"
+            elif [[ "$line" =~ ^- ]]; then
+                echo -e "${RED}${line}${NC}  ${GRAY}← Instance (current)${NC}"
+            elif [[ "$line" =~ ^\+ ]]; then
+                echo -e "${GREEN}${line}${NC}  ${GRAY}← Instance Config (expected)${NC}"
+            elif [[ "$line" =~ ^[[:space:]] ]]; then
+                echo -e "${GRAY}${line}${NC}"
+            fi
+        done <<< "$diff_output"
+    fi
+    
+    # Cleanup
+    rm -f "$tmp_instance" "$tmp_ic"
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
 }
 
 #===============================================================================
