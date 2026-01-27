@@ -20,6 +20,8 @@
 #   Optional: OKE_CLUSTER_ID to specify which OKE cluster to manage
 #
 # Author: GPU Infrastructure Team
+# This is an unofficial oci console management to help streamline large deployments and quickly troubleshoot
+# Please use at your own risk.
 # Version: 2.2
 #
 
