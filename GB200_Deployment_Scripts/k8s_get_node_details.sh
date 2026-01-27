@@ -420,10 +420,105 @@ get_instance_config_user_data() {
     echo "# Decoded cloud-init user-data:" >&2
     echo "#" >&2
     
-    # Decode and output to stdout
-    echo "$user_data_b64" | base64 -d 2>/dev/null
+    # Decode and output to stdout (handles gzip compressed data)
+    decode_user_data "$user_data_b64"
     
     return 0
+}
+
+#--------------------------------------------------------------------------------
+# Decode base64 user_data, handling gzip compression
+# Args: $1 = base64 encoded user_data
+# Output: decoded (and decompressed if gzip) data to stdout
+#--------------------------------------------------------------------------------
+decode_user_data() {
+    local user_data_b64="$1"
+    
+    [[ -z "$user_data_b64" ]] && return 1
+    
+    # Decode to temp file
+    local tmp_decoded
+    tmp_decoded=$(mktemp)
+    echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
+    
+    # Check if gzip compressed (magic bytes: 1f 8b)
+    local magic_bytes
+    magic_bytes=$(xxd -l 2 -p "$tmp_decoded" 2>/dev/null)
+    
+    if [[ "$magic_bytes" == "1f8b" ]]; then
+        # Gzip compressed - decompress
+        gunzip -c "$tmp_decoded" 2>/dev/null
+    else
+        # Plain text
+        cat "$tmp_decoded"
+    fi
+    
+    rm -f "$tmp_decoded"
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# Decode base64 user_data to file, handling gzip compression
+# Args: $1 = base64 encoded user_data, $2 = output filename
+# Returns: 0 on success, 1 on failure
+#--------------------------------------------------------------------------------
+decode_user_data_to_file() {
+    local user_data_b64="$1"
+    local output_file="$2"
+    
+    [[ -z "$user_data_b64" || -z "$output_file" ]] && return 1
+    
+    # Decode to temp file
+    local tmp_decoded
+    tmp_decoded=$(mktemp)
+    echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
+    
+    # Check if gzip compressed (magic bytes: 1f 8b)
+    local magic_bytes
+    magic_bytes=$(xxd -l 2 -p "$tmp_decoded" 2>/dev/null)
+    
+    local result=0
+    if [[ "$magic_bytes" == "1f8b" ]]; then
+        # Gzip compressed - decompress
+        if gunzip -c "$tmp_decoded" > "$output_file" 2>/dev/null; then
+            result=0
+        else
+            result=1
+        fi
+    else
+        # Plain text
+        if cp "$tmp_decoded" "$output_file" 2>/dev/null; then
+            result=0
+        else
+            result=1
+        fi
+    fi
+    
+    rm -f "$tmp_decoded"
+    return $result
+}
+
+#--------------------------------------------------------------------------------
+# Check if user_data is gzip compressed
+# Args: $1 = base64 encoded user_data
+# Returns: 0 if gzip compressed, 1 if not
+#--------------------------------------------------------------------------------
+is_user_data_gzip() {
+    local user_data_b64="$1"
+    
+    [[ -z "$user_data_b64" ]] && return 1
+    
+    # Decode to temp file and check magic bytes
+    local tmp_decoded
+    tmp_decoded=$(mktemp)
+    echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
+    
+    local magic_bytes
+    magic_bytes=$(xxd -l 2 -p "$tmp_decoded" 2>/dev/null)
+    
+    rm -f "$tmp_decoded"
+    
+    [[ "$magic_bytes" == "1f8b" ]]
 }
 
 # Fetch and cache compute clusters from OCI
@@ -6452,9 +6547,10 @@ display_instance_details() {
         echo -e "  ${MAGENTA}save${NC}        - Save cloud-init to file"
         echo -e "  ${BLUE}compare${NC}     - Compare cloud-init with another instance or instance configuration"
     fi
+    echo -e "  ${YELLOW}console${NC}     - Capture and view console history"
     echo -e "  ${CYAN}Enter${NC}       - Return to menu"
     echo ""
-    echo -n -e "${CYAN}Action [cloud-init/save/compare/Enter]: ${NC}"
+    echo -n -e "${CYAN}Action [cloud-init/save/compare/console/Enter]: ${NC}"
     
     local action
     read -r action
@@ -6470,7 +6566,16 @@ display_instance_details() {
                 echo -e "${GRAY}OCID:     ${YELLOW}$instance_ocid${NC}"
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
                 echo ""
-                echo "$user_data_b64" | base64 -d 2>/dev/null
+                
+                # Check if gzip compressed and show message
+                if is_user_data_gzip "$user_data_b64"; then
+                    echo -e "${GRAY}(gzip compressed - decompressing)${NC}"
+                    echo ""
+                fi
+                
+                # Decode and display (handles gzip)
+                decode_user_data "$user_data_b64"
+                
                 echo ""
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
                 echo ""
@@ -6492,8 +6597,13 @@ display_instance_details() {
                 read -r custom_filename
                 [[ -n "$custom_filename" ]] && filename="$custom_filename"
                 
-                if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
-                    echo -e "${GREEN}✓ Cloud-init saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                local gzip_msg=""
+                if is_user_data_gzip "$user_data_b64"; then
+                    gzip_msg=" ${GRAY}(decompressed from gzip)${NC}"
+                fi
+                
+                if decode_user_data_to_file "$user_data_b64" "$filename"; then
+                    echo -e "${GREEN}✓ Cloud-init saved to: ${WHITE}$(pwd)/${filename}${NC}${gzip_msg}"
                 else
                     echo -e "${RED}Failed to save cloud-init${NC}"
                 fi
@@ -6511,10 +6621,241 @@ display_instance_details() {
                 echo -e "${YELLOW}No cloud-init user-data found for this instance${NC}"
             fi
             ;;
+        console|CONSOLE|con|CON|history|HISTORY)
+            capture_console_history "$instance_ocid" "$display_name"
+            ;;
         *)
             # Return to menu
             ;;
     esac
+}
+
+#--------------------------------------------------------------------------------
+# Capture and display instance console history
+# Args: $1 = instance OCID, $2 = instance display name
+#--------------------------------------------------------------------------------
+capture_console_history() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    
+    echo ""
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}                                         CONSOLE HISTORY                                                        ${NC}"
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Instance:${NC} ${GREEN}$instance_name${NC}"
+    echo -e "${WHITE}OCID:${NC}     ${YELLOW}$instance_ocid${NC}"
+    echo ""
+    
+    # Check for existing console history captures
+    echo -e "${YELLOW}Checking for existing console history captures...${NC}"
+    
+    local existing_history
+    existing_history=$(oci compute instance-console-history list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$instance_ocid" \
+        --lifecycle-state "SUCCEEDED" \
+        --sort-by "TIMECREATED" \
+        --sort-order "DESC" \
+        --limit 5 \
+        --output json 2>/dev/null)
+    
+    local history_count=0
+    [[ -n "$existing_history" ]] && history_count=$(echo "$existing_history" | jq -r '.data | length' 2>/dev/null) || history_count=0
+    [[ ! "$history_count" =~ ^[0-9]+$ ]] && history_count=0
+    
+    if [[ $history_count -gt 0 ]]; then
+        echo ""
+        echo -e "${WHITE}Recent console history captures:${NC}"
+        echo ""
+        
+        declare -a HISTORY_LIST=()
+        local idx=0
+        
+        printf "  ${GRAY}%-4s %-25s %-20s${NC}\n" "#" "Time Created" "State"
+        echo -e "  ${GRAY}────────────────────────────────────────────────────────────${NC}"
+        
+        while IFS='|' read -r hist_id hist_time hist_state; do
+            [[ -z "$hist_id" ]] && continue
+            ((idx++))
+            HISTORY_LIST+=("$hist_id")
+            printf "  ${YELLOW}%-4s${NC} ${WHITE}%-25s${NC} ${GREEN}%-20s${NC}\n" "${idx})" "${hist_time:0:19}" "$hist_state"
+        done < <(echo "$existing_history" | jq -r '.data[] | "\(.id)|\(.["time-created"])|\(.["lifecycle-state"])"' 2>/dev/null)
+        
+        echo ""
+        echo -e "  ${CYAN}n${NC}) Capture new console history"
+        echo -e "  ${WHITE}b${NC}) Back"
+        echo ""
+        echo -n -e "${CYAN}Select existing capture [1-${idx}] or 'n' for new: ${NC}"
+        local choice
+        read -r choice
+        
+        if [[ "$choice" == "n" || "$choice" == "N" ]]; then
+            capture_new_console_history "$instance_ocid" "$instance_name"
+        elif [[ "$choice" == "b" || "$choice" == "B" || -z "$choice" ]]; then
+            return
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le ${#HISTORY_LIST[@]} ]]; then
+            local selected_id="${HISTORY_LIST[$((choice-1))]}"
+            display_console_history_content "$selected_id" "$instance_name"
+        else
+            echo -e "${RED}Invalid selection${NC}"
+            sleep 1
+        fi
+    else
+        echo ""
+        echo -e "${GRAY}No existing console history captures found.${NC}"
+        echo ""
+        echo -n -e "${CYAN}Capture new console history? [Y/n]: ${NC}"
+        local confirm
+        read -r confirm
+        
+        if [[ ! "$confirm" =~ ^[Nn] ]]; then
+            capture_new_console_history "$instance_ocid" "$instance_name"
+        fi
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# Capture new console history
+# Args: $1 = instance OCID, $2 = instance display name
+#--------------------------------------------------------------------------------
+capture_new_console_history() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    
+    echo ""
+    echo -e "${YELLOW}Capturing console history...${NC}"
+    echo ""
+    
+    # Build command
+    printf "%s\n" "oci compute instance-console-history capture \\"
+    printf "%s\n" "  --instance-id \"$instance_ocid\""
+    echo ""
+    
+    local result
+    result=$(oci compute instance-console-history capture \
+        --instance-id "$instance_ocid" \
+        --output json 2>&1)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        local history_id
+        history_id=$(echo "$result" | jq -r '.data.id // empty' 2>/dev/null)
+        
+        if [[ -n "$history_id" ]]; then
+            echo -e "${GREEN}✓ Console history capture initiated${NC}"
+            echo -e "  ${CYAN}History ID:${NC} ${YELLOW}$history_id${NC}"
+            echo ""
+            
+            # Wait for capture to complete
+            echo -e "${YELLOW}Waiting for capture to complete...${NC}"
+            local max_wait=60
+            local wait_count=0
+            local capture_state="REQUESTED"
+            
+            while [[ "$capture_state" != "SUCCEEDED" && "$capture_state" != "FAILED" && $wait_count -lt $max_wait ]]; do
+                sleep 2
+                ((wait_count+=2))
+                
+                local status_json
+                status_json=$(oci compute instance-console-history get \
+                    --instance-console-history-id "$history_id" \
+                    --output json 2>/dev/null)
+                
+                capture_state=$(echo "$status_json" | jq -r '.data["lifecycle-state"] // "UNKNOWN"' 2>/dev/null)
+                echo -ne "\r${YELLOW}  Status: ${WHITE}${capture_state}${NC} (${wait_count}s)    "
+            done
+            echo ""
+            
+            if [[ "$capture_state" == "SUCCEEDED" ]]; then
+                echo ""
+                echo -e "${GREEN}✓ Console history capture completed${NC}"
+                echo ""
+                echo -n -e "${CYAN}View console output now? [Y/n]: ${NC}"
+                local view_now
+                read -r view_now
+                
+                if [[ ! "$view_now" =~ ^[Nn] ]]; then
+                    display_console_history_content "$history_id" "$instance_name"
+                fi
+            else
+                echo ""
+                echo -e "${RED}Console history capture failed or timed out${NC}"
+                echo -e "${WHITE}State: ${YELLOW}$capture_state${NC}"
+            fi
+        else
+            echo -e "${RED}Failed to get console history ID from response${NC}"
+            echo "$result"
+        fi
+    else
+        echo -e "${RED}Failed to capture console history${NC}"
+        echo "$result"
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Press Enter to continue...${NC}"
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Display console history content
+# Args: $1 = console history OCID, $2 = instance display name
+#--------------------------------------------------------------------------------
+display_console_history_content() {
+    local history_id="$1"
+    local instance_name="$2"
+    
+    echo ""
+    echo -e "${YELLOW}Fetching console output...${NC}"
+    
+    local content
+    content=$(oci compute instance-console-history get-content \
+        --instance-console-history-id "$history_id" \
+        --length 100000 2>/dev/null)
+    
+    if [[ -n "$content" ]]; then
+        echo ""
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}                                       CONSOLE OUTPUT                                                          ${NC}"
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}Instance: ${WHITE}$instance_name${NC}"
+        echo -e "${GRAY}History ID: ${YELLOW}$history_id${NC}"
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "$content"
+        echo ""
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        # Option to save
+        echo -n -e "${CYAN}Save to file? [y/N]: ${NC}"
+        local save_choice
+        read -r save_choice
+        
+        if [[ "$save_choice" =~ ^[Yy] ]]; then
+            local safe_name
+            safe_name=$(echo "$instance_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+            local filename="${safe_name}_console_$(date +%Y%m%d_%H%M%S).log"
+            
+            echo -n -e "${CYAN}Filename [${filename}]: ${NC}"
+            local custom_filename
+            read -r custom_filename
+            [[ -n "$custom_filename" ]] && filename="$custom_filename"
+            
+            if echo "$content" > "$filename" 2>/dev/null; then
+                echo -e "${GREEN}✓ Console output saved to: ${WHITE}$(pwd)/${filename}${NC}"
+            else
+                echo -e "${RED}Failed to save console output${NC}"
+            fi
+        fi
+    else
+        echo -e "${RED}Failed to fetch console history content${NC}"
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Press Enter to continue...${NC}"
+    read -r
 }
 
 #--------------------------------------------------------------------------------
@@ -6643,8 +6984,9 @@ compare_instance_to_instance() {
     tmp1=$(mktemp)
     tmp2=$(mktemp)
     
-    echo "$instance_ud_b64" | base64 -d > "$tmp1" 2>/dev/null
-    echo "$other_ud_b64" | base64 -d > "$tmp2" 2>/dev/null
+    # Decode user_data (handles gzip compression)
+    decode_user_data_to_file "$instance_ud_b64" "$tmp1"
+    decode_user_data_to_file "$other_ud_b64" "$tmp2"
     
     echo ""
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -6778,8 +7120,9 @@ compare_instance_to_config() {
     tmp_instance=$(mktemp)
     tmp_ic=$(mktemp)
     
-    echo "$instance_ud_b64" | base64 -d > "$tmp_instance" 2>/dev/null
-    echo "$ic_ud_b64" | base64 -d > "$tmp_ic" 2>/dev/null
+    # Decode user_data (handles gzip compression)
+    decode_user_data_to_file "$instance_ud_b64" "$tmp_instance"
+    decode_user_data_to_file "$ic_ud_b64" "$tmp_ic"
     
     echo ""
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -7057,7 +7400,14 @@ view_instance_configuration_detail() {
                 echo -e "${BOLD}${MAGENTA}                         DECODED CLOUD-INIT USER-DATA                          ${NC}"
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
                 echo ""
-                echo "$user_data_b64" | base64 -d 2>/dev/null
+                
+                # Check if gzip compressed and decompress
+                if is_user_data_gzip "$user_data_b64"; then
+                    echo -e "${GRAY}(gzip compressed - decompressing)${NC}"
+                    echo ""
+                fi
+                decode_user_data "$user_data_b64"
+                
                 echo ""
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
                 echo ""
@@ -7079,8 +7429,13 @@ view_instance_configuration_detail() {
                 read -r custom_filename
                 [[ -n "$custom_filename" ]] && filename="$custom_filename"
                 
-                if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
-                    echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                local gzip_msg=""
+                if is_user_data_gzip "$user_data_b64"; then
+                    gzip_msg=" ${GRAY}(decompressed from gzip)${NC}"
+                fi
+                
+                if decode_user_data_to_file "$user_data_b64" "$filename"; then
+                    echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}${gzip_msg}"
                 else
                     echo -e "${RED}Failed to save user-data${NC}"
                 fi
@@ -7389,13 +7744,13 @@ compare_instance_configurations() {
     tmp2=$(mktemp)
     
     if [[ -n "$ud1" ]]; then
-        echo "$ud1" | base64 -d > "$tmp1" 2>/dev/null || echo "# Failed to decode user_data" > "$tmp1"
+        decode_user_data_to_file "$ud1" "$tmp1" || echo "# Failed to decode user_data" > "$tmp1"
     else
         echo "# No user_data" > "$tmp1"
     fi
     
     if [[ -n "$ud2" ]]; then
-        echo "$ud2" | base64 -d > "$tmp2" 2>/dev/null || echo "# Failed to decode user_data" > "$tmp2"
+        decode_user_data_to_file "$ud2" "$tmp2" || echo "# Failed to decode user_data" > "$tmp2"
     else
         echo "# No user_data" > "$tmp2"
     fi
@@ -8107,8 +8462,12 @@ view_gpu_resource() {
                         echo -e "${BOLD}${MAGENTA}                         DECODED CLOUD-INIT USER-DATA                          ${NC}"
                         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
                         echo ""
-                        # Decode and display the user-data
-                        echo "$user_data_b64" | base64 -d 2>/dev/null
+                        # Decode and display the user-data (handles gzip)
+                        if is_user_data_gzip "$user_data_b64"; then
+                            echo -e "${GRAY}(gzip compressed - decompressing)${NC}"
+                            echo ""
+                        fi
+                        decode_user_data "$user_data_b64"
                         echo ""
                         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
                         echo ""
@@ -8130,9 +8489,14 @@ view_gpu_resource() {
                         read -r custom_filename
                         [[ -n "$custom_filename" ]] && filename="$custom_filename"
                         
-                        # Decode and save
-                        if echo "$user_data_b64" | base64 -d > "$filename" 2>/dev/null; then
-                            echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}"
+                        # Decode and save (handles gzip)
+                        local gzip_msg=""
+                        if is_user_data_gzip "$user_data_b64"; then
+                            gzip_msg=" ${GRAY}(decompressed from gzip)${NC}"
+                        fi
+                        
+                        if decode_user_data_to_file "$user_data_b64" "$filename"; then
+                            echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}${gzip_msg}"
                         else
                             echo -e "${RED}Failed to save user-data${NC}"
                         fi
