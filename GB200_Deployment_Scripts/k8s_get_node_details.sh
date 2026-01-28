@@ -20,8 +20,6 @@
 #   Optional: OKE_CLUSTER_ID to specify which OKE cluster to manage
 #
 # Author: GPU Infrastructure Team
-# This is an unofficial oci console management to help streamline large deployments and quickly troubleshoot
-# Please use at your own risk.
 # Version: 2.2
 #
 
@@ -565,6 +563,66 @@ is_user_data_gzip() {
     rm -f "$tmp_decoded"
     
     [[ "$magic_bytes" == "1f8b" ]]
+}
+
+#--------------------------------------------------------------------------------
+# Get user-data from an instance OCID
+# Args: $1 = instance OCID
+# Output: decoded user-data to stdout
+#--------------------------------------------------------------------------------
+get_instance_user_data() {
+    local instance_ocid="$1"
+    
+    if [[ -z "$instance_ocid" ]]; then
+        log_error "Instance OCID required"
+        return 1
+    fi
+    
+    # Validate OCID format
+    if [[ ! "$instance_ocid" =~ ^ocid1\.instance\. ]]; then
+        log_error "Invalid instance OCID format: $instance_ocid"
+        echo "Expected format: ocid1.instance.oc1.<region>.<unique-id>" >&2
+        return 1
+    fi
+    
+    log_info "Fetching instance metadata..." >&2
+    
+    local instance_json
+    instance_json=$(oci compute instance get \
+        --instance-id "$instance_ocid" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$instance_json" ]] || ! echo "$instance_json" | jq -e '.data' > /dev/null 2>&1; then
+        log_error "Failed to fetch instance: $instance_ocid"
+        return 1
+    fi
+    
+    local instance_name
+    instance_name=$(echo "$instance_json" | jq -r '.data["display-name"] // "N/A"')
+    
+    # Extract user_data (base64 encoded)
+    local user_data_b64
+    user_data_b64=$(echo "$instance_json" | jq -r '.data.metadata.user_data // empty' 2>/dev/null)
+    
+    if [[ -z "$user_data_b64" ]]; then
+        echo "# No user-data found in instance metadata: $instance_name" >&2
+        echo "# OCID: $instance_ocid" >&2
+        echo "" >&2
+        echo "# Note: user_data is typically only available if the instance was launched with" >&2
+        echo "# cloud-init user-data specified in the metadata." >&2
+        return 0
+    fi
+    
+    # Output header as comments (to stderr so stdout is just the yaml)
+    echo "# Instance: $instance_name" >&2
+    echo "# OCID: $instance_ocid" >&2
+    echo "# Decoded cloud-init user-data:" >&2
+    echo "#" >&2
+    
+    # Decode and output to stdout (handles gzip compressed data)
+    decode_user_data "$user_data_b64"
+    
+    return 0
 }
 
 # Fetch and cache compute clusters from OCI
@@ -1982,6 +2040,43 @@ display_oke_environment_header() {
     # Compute Cluster section
     _print_row_with_ocid "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_ocid"
     
+    # Section separator - Helm Deployments
+    echo -e "${BOLD}${BLUE}╠${h_line}╣${NC}"
+    
+    # Helm Deployments section - check for GPU-related helm releases
+    local helm_available=false
+    if command -v helm &>/dev/null && command -v kubectl &>/dev/null; then
+        helm_available=true
+    fi
+    
+    if [[ "$helm_available" == "true" ]]; then
+        # Check gpu-operator namespace
+        local gpu_operator_info gpu_op_json
+        gpu_op_json=$(helm list -n gpu-operator -o json 2>/dev/null)
+        if [[ -n "$gpu_op_json" && "$gpu_op_json" != "[]" ]]; then
+            gpu_operator_info=$(echo "$gpu_op_json" | jq -r '.[0] | select(.name == "gpu-operator") | "\(.chart) [\(.status)] rev:\(.revision) updated:\(.updated | split(".")[0])"' 2>/dev/null)
+        fi
+        if [[ -n "$gpu_operator_info" && "$gpu_operator_info" != "null" ]]; then
+            _print_row "GPU Operator:" "$gpu_operator_info"
+        else
+            _print_row "GPU Operator:" "Not installed"
+        fi
+        
+        # Check nvidia-dra-driver-gpu namespace
+        local dra_driver_info dra_json
+        dra_json=$(helm list -n nvidia-dra-driver-gpu -o json 2>/dev/null)
+        if [[ -n "$dra_json" && "$dra_json" != "[]" ]]; then
+            dra_driver_info=$(echo "$dra_json" | jq -r '.[0] | select(.name == "nvidia-dra-driver-gpu") | "\(.chart) [\(.status)] rev:\(.revision) updated:\(.updated | split(".")[0])"' 2>/dev/null)
+        fi
+        if [[ -n "$dra_driver_info" && "$dra_driver_info" != "null" ]]; then
+            _print_row "DRA Driver:" "$dra_driver_info"
+        else
+            _print_row "DRA Driver:" "Not installed"
+        fi
+    else
+        _print_row "Helm Deploys:" "(helm/kubectl not available)"
+    fi
+    
     # Bottom border
     echo -e "${BOLD}${BLUE}╚${h_line}╝${NC}"
     echo ""
@@ -2339,7 +2434,7 @@ list_instances_not_in_k8s() {
     local interactive="${3:-true}"  # Default to interactive mode
     
     # Dynamic header based on instance filter
-    local instance_filter="${INSTANCE_FILTER:-gpu}"
+    local instance_filter="${INSTANCE_FILTER:-all}"
     local header_text all_running_text
     case "$instance_filter" in
         gpu)
@@ -2378,7 +2473,8 @@ list_instances_not_in_k8s() {
             continue
         fi
         
-        if ! grep -q "^${instance_ocid}|" "$k8s_temp" 2>/dev/null; then
+        # Use grep without ^ anchor because providerID has oci:// prefix
+        if ! grep -q "$instance_ocid" "$k8s_temp" 2>/dev/null; then
             if [[ "$status" == "RUNNING" ]]; then
                 # Store with time_created for sorting
                 echo "${time_created}|${display_name}|${instance_ocid}|${status}|${gpu_mem}" >> "$orphan_temp"
@@ -2503,7 +2599,7 @@ list_all_instances() {
     fi
     
     # Get instance filter (default to "gpu" for backward compatibility)
-    local instance_filter="${INSTANCE_FILTER:-gpu}"
+    local instance_filter="${INSTANCE_FILTER:-all}"
     
     # Display OKE environment header
     display_oke_environment_header "$compartment_id" "$region"
@@ -2526,8 +2622,8 @@ list_all_instances() {
             header_text="All Instances in Compartment"
             ;;
         *)
-            header_text="All GPU Instances in Compartment"
-            instance_filter="gpu"
+            header_text="All Instances in Compartment"
+            instance_filter="all"
             ;;
     esac
     
@@ -2568,25 +2664,13 @@ list_all_instances() {
             \"\(.[\"display-name\"])|\(.[\"lifecycle-state\"])|\(.id)|\(.[\"freeform-tags\"][\"oci:compute:gpumemorycluster\"] // \"N/A\")|\(.shape)|\(.[\"time-created\"] // \"N/A\")\"
         " > "$oci_temp"
     
-    # Fetch K8s nodes based on filter
+    # Fetch K8s nodes - fetch ALL nodes to avoid missing nodes without GPU labels
+    # The label nvidia.com/gpu.present may not be set immediately on new nodes
     log_info "Fetching nodes from Kubernetes..."
-    if [[ "$instance_filter" == "gpu" ]]; then
-        kubectl get nodes -l nvidia.com/gpu.present=true -o json 2>/dev/null | jq -r '
-            .items[] | 
-            "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")"
-        ' > "$k8s_temp"
-    elif [[ "$instance_filter" == "non-gpu" ]]; then
-        kubectl get nodes -l 'nvidia.com/gpu.present!=true' -o json 2>/dev/null | jq -r '
-            .items[] | 
-            "\(.spec.providerID)|\(.metadata.name)|N/A"
-        ' > "$k8s_temp"
-    else
-        # All nodes
-        kubectl get nodes -o json 2>/dev/null | jq -r '
-            .items[] | 
-            "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")"
-        ' > "$k8s_temp"
-    fi
+    kubectl get nodes -o json 2>/dev/null | jq -r '
+        .items[] | 
+        "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")"
+    ' > "$k8s_temp"
     
     # Fetch additional data
     log_info "Fetching node states..."
@@ -2605,16 +2689,15 @@ list_all_instances() {
     echo ""
     
     # Print table header with spanning headers
-    # Column positions: DisplayName(28) Node(15) State(11) CliqueID(40) State(10) OCID(95) Name(12) State(12) State(10) Announce(18)
-    # K8s spans Node+State+CliqueID (67), OCI Instance spans State+OCID (106), GPU Mem Cluster spans Name+State (25), CapTopo spans State (10)
-    printf "${BOLD}%-28s%-67s%-125s%-31s%-12s%-11s${NC}\n" \
+    # Column positions: DisplayName(28) Node(15) State(7) CliqueID(43) State(11) OCID(95) Name(12) State(10) State(10) Announce(18)
+    printf "${BOLD}%-28s%-66s%-107s%-23s%-11s%-11s${NC}\n" \
     "" \
-    "┌───────────────────────────────── K8s ───────────────────────────┐" \
-    "┌──────────────────────────────────────────── OCI Instance ─────────────────────────────────────────────┐" \
+    "┌──────────────────────────── K8s ────────────────────────────┐" \
+    "┌──────────────────────────────────── OCI Instance ──────────────────────────────────────┐" \
     "┌─ GPU Mem Cluster ─┐" \
     "CapTopo" \
     "Maintenance"
-    printf "${BOLD}%-28s %-15s %-7s %-43s %-11s %-95s %-9s %-9s %-10s %-18s${NC}\n" \
+    printf "${BOLD}%-28s %-15s %-7s %-43s %-11s %-95s %-12s %-10s %-10s %-18s${NC}\n" \
         "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "Name" "State" "State" "Announce"
     print_separator 280
     
@@ -2624,11 +2707,12 @@ list_all_instances() {
         [[ -z "$instance_ocid" ]] && continue
         
         local k8s_info node_name clique_id node_state
-        k8s_info=$(grep "^${instance_ocid}|" "$k8s_temp" 2>/dev/null)
+        # k8s_temp format: providerID|nodeName|clique|gpuPresent
+        k8s_info=$(grep "$instance_ocid" "$k8s_temp" 2>/dev/null)
         
         if [[ -n "$k8s_info" ]]; then
             # Instance is in Kubernetes
-            IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+            IFS='|' read -r _ node_name clique_id _ <<< "$k8s_info"
             node_state=$(get_node_state_cached "$instance_ocid")
         else
             # Instance is NOT in Kubernetes
@@ -2644,12 +2728,14 @@ list_all_instances() {
         cap_topo_state=$(get_capacity_topology_state "$instance_ocid")
         announcements=$(get_resource_announcements "$instance_ocid" "$gpu_mem")
         
-        # Truncate for display
+        # Truncate for display - ensure consistent widths
         local gpu_mem_display="$gpu_mem"
         [[ "$gpu_mem" != "N/A" && ${#gpu_mem} -gt 12 ]] && gpu_mem_display="...${gpu_mem: -9}"
+        [[ "$gpu_mem" == "N/A" ]] && gpu_mem_display="-"
         
         local cluster_state_display
-        cluster_state_display=$(truncate_string "$cluster_state" 12)
+        cluster_state_display=$(truncate_string "$cluster_state" 10)
+        [[ "$cluster_state" == "N/A" ]] && cluster_state_display="-"
         
         # Truncate display name to 28 characters
         local display_name_truncated
@@ -2668,7 +2754,7 @@ list_all_instances() {
         ann_color=$(color_announcement "$ann")
         cs_color=$(color_cluster_state "$cs")
         
-        printf "%-28s %-15s ${ns_color}%-7s${NC} %-43s ${st_color}%-11s${NC} %-92s %-5s ${cs_color}%-8s${NC} ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
+        printf "%-28s %-15s ${ns_color}%-7s${NC} %-43s ${st_color}%-11s${NC} %-95s %-12s ${cs_color}%-10s${NC} ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
             "$dn" "$nn" "$ns" "$ci" "$st" "$io" "$gm" "$cs" "$ct" "$ann"
     done
     
@@ -2706,6 +2792,896 @@ list_all_instances() {
     rm -f "$oci_temp" "$k8s_temp" "$output_temp"
 }
 
+#--------------------------------------------------------------------------------
+# List instances requiring maintenance attention
+# Shows instances with DEGRADED capacity topology state or active announcements
+#--------------------------------------------------------------------------------
+list_maintenance_instances() {
+    local compartment_id="${1:-$EFFECTIVE_COMPARTMENT_ID}"
+    local region="${2:-$EFFECTIVE_REGION}"
+    
+    # Validate required parameters
+    if [[ -z "$compartment_id" ]]; then
+        log_error "COMPARTMENT_ID not set"
+        return 1
+    fi
+    if [[ -z "$region" ]]; then
+        log_error "REGION not set"
+        return 1
+    fi
+    
+    # Display header
+    display_oke_environment_header "$compartment_id" "$region"
+    
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}                                    INSTANCES REQUIRING MAINTENANCE ATTENTION                                    ${NC}"
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GRAY}Showing instances with: DEGRADED capacity topology state OR active maintenance announcements${NC}"
+    echo ""
+    
+    # Fetch required data
+    log_info "Fetching capacity topology data..."
+    fetch_capacity_topology
+    
+    log_info "Fetching announcements..."
+    build_announcement_lookup "$compartment_id"
+    
+    log_info "Fetching GPU memory clusters..."
+    fetch_gpu_clusters
+    
+    log_info "Fetching GPU fabrics..."
+    fetch_gpu_fabrics
+    
+    log_info "Fetching OCI instances..."
+    local oci_temp
+    oci_temp=$(create_temp_file) || return 1
+    
+    oci compute instance list \
+        --compartment-id "$compartment_id" \
+        --region "$region" \
+        --all \
+        --output json 2>/dev/null | jq -r '
+            .data[] | 
+            select(.["lifecycle-state"] != "TERMINATED") |
+            "\(.["display-name"])|\(.["lifecycle-state"])|\(.id)|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")|\(.shape)|\(.["availability-domain"])"
+        ' > "$oci_temp"
+    
+    log_info "Fetching Kubernetes node data..."
+    local k8s_temp
+    k8s_temp=$(create_temp_file) || { rm -f "$oci_temp"; return 1; }
+    
+    # Format: providerID|nodeName|ready|unschedulable|serialNumber
+    kubectl get nodes -o json 2>/dev/null | jq -r '
+        .items[] | 
+        "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.spec.unschedulable // false)|\(.metadata.labels["oci.oraclecloud.com/host.serial_number"] // "N/A")"
+    ' > "$k8s_temp"
+    
+    log_info "Fetching pod counts per node..."
+    local pods_per_node
+    pods_per_node=$(kubectl get pods --all-namespaces --field-selector=status.phase=Running -o json 2>/dev/null | \
+        jq -r '.items[] | .spec.nodeName' 2>/dev/null | sort | uniq -c | awk '{print $2"|"$1}')
+    
+    echo ""
+    
+    # Print table header
+    printf "${BOLD}%-4s %-26s %-10s %-18s %-6s %-6s %-5s %-10s %-14s %-16s %-20s %s${NC}\n" \
+        "ID" "Display Name" "OCI State" "K8s Node" "Ready" "Cordon" "Pods" "CapTopo" "Serial Number" "Announcement" "Shape" "Instance OCID"
+    print_separator 240
+    
+    # Process instances and filter for maintenance
+    local found_count=0
+    local output_temp
+    output_temp=$(create_temp_file) || { rm -f "$oci_temp" "$k8s_temp"; return 1; }
+    
+    local display_name oci_state instance_ocid gpu_mem shape ad
+    while IFS='|' read -r display_name oci_state instance_ocid gpu_mem shape ad; do
+        [[ -z "$instance_ocid" ]] && continue
+        
+        # Get capacity topology state
+        local cap_topo_state
+        cap_topo_state=$(get_capacity_topology_state "$instance_ocid")
+        [[ -z "$cap_topo_state" ]] && cap_topo_state="N/A"
+        
+        # Get announcements
+        local announcements
+        announcements=$(get_resource_announcements "$instance_ocid" "$gpu_mem")
+        [[ -z "$announcements" ]] && announcements="-"
+        
+        # Check if this instance needs attention
+        local needs_attention="false"
+        if [[ "$cap_topo_state" == "DEGRADED" ]]; then
+            needs_attention="true"
+        fi
+        if [[ "$announcements" != "-" && -n "$announcements" ]]; then
+            needs_attention="true"
+        fi
+        
+        # Skip if no maintenance needed
+        [[ "$needs_attention" != "true" ]] && continue
+        
+        ((found_count++))
+        
+        # Get K8s info
+        local k8s_node_name="N/A"
+        local k8s_ready="N/A"
+        local k8s_cordon="-"
+        local k8s_pods="-"
+        local k8s_serial="N/A"
+        local k8s_info
+        k8s_info=$(grep "$instance_ocid" "$k8s_temp" 2>/dev/null)
+        if [[ -n "$k8s_info" ]]; then
+            k8s_node_name=$(echo "$k8s_info" | cut -d'|' -f2)
+            k8s_ready=$(echo "$k8s_info" | cut -d'|' -f3)
+            local unschedulable
+            unschedulable=$(echo "$k8s_info" | cut -d'|' -f4)
+            k8s_serial=$(echo "$k8s_info" | cut -d'|' -f5)
+            if [[ "$unschedulable" == "true" ]]; then
+                k8s_cordon="Yes"
+            else
+                k8s_cordon="-"
+            fi
+            # Get pod count for this node
+            local node_pod_count
+            node_pod_count=$(echo "$pods_per_node" | grep "^${k8s_node_name}|" | cut -d'|' -f2)
+            k8s_pods="${node_pod_count:-0}"
+        fi
+        
+        # Store for output (sort by cap_topo state, then announcement)
+        echo "${cap_topo_state}|${announcements}|${display_name}|${oci_state}|${k8s_node_name}|${k8s_ready}|${k8s_cordon}|${k8s_pods}|${k8s_serial}|${shape}|${instance_ocid}" >> "$output_temp"
+    done < "$oci_temp"
+    
+    # Build instance index map for interactive selection
+    declare -A MAINT_INSTANCE_MAP
+    local instance_idx=0
+    
+    # Sort and display results with index
+    sort -t'|' -k1,1r -k2,2 "$output_temp" | while IFS='|' read -r cap_topo ann dn oci_st k8s_node k8s_rdy k8s_cordon k8s_pods k8s_serial shp ocid; do
+        ((instance_idx++))
+        
+        # Store mapping in temp file (subshell workaround)
+        echo "m${instance_idx}|${ocid}|${k8s_node}|${dn}|${k8s_cordon}" >> /tmp/maint_map_$$
+        
+        # Color coding
+        local oci_color="$GREEN"
+        case "$oci_st" in
+            RUNNING) oci_color="$GREEN" ;;
+            STOPPED) oci_color="$RED" ;;
+            *) oci_color="$YELLOW" ;;
+        esac
+        
+        local k8s_rdy_color="$GREEN"
+        [[ "$k8s_rdy" != "True" ]] && k8s_rdy_color="$RED"
+        [[ "$k8s_rdy" == "N/A" ]] && k8s_rdy_color="$GRAY"
+        
+        local cordon_color="$GRAY"
+        [[ "$k8s_cordon" == "Yes" ]] && cordon_color="$YELLOW"
+        
+        local pods_color="$CYAN"
+        [[ "$k8s_pods" == "-" || "$k8s_pods" == "0" ]] && pods_color="$GRAY"
+        
+        local cap_color="$GREEN"
+        [[ "$cap_topo" == "DEGRADED" ]] && cap_color="$RED"
+        [[ "$cap_topo" == "N/A" ]] && cap_color="$GRAY"
+        
+        local ann_color="$GRAY"
+        [[ "$ann" != "-" && -n "$ann" ]] && ann_color="$YELLOW"
+        
+        local serial_color="$GRAY"
+        [[ "$k8s_serial" != "N/A" && -n "$k8s_serial" ]] && serial_color="$CYAN"
+        
+        # Truncate fields
+        local dn_trunc="${dn:0:26}"
+        local k8s_node_trunc="${k8s_node:0:18}"
+        local shape_trunc="${shp:0:20}"
+        local ann_trunc="${ann:0:16}"
+        local serial_trunc="${k8s_serial:0:14}"
+        
+        printf "${YELLOW}%-4s${NC} %-26s ${oci_color}%-10s${NC} %-18s ${k8s_rdy_color}%-6s${NC} ${cordon_color}%-6s${NC} ${pods_color}%-5s${NC} ${cap_color}%-10s${NC} ${serial_color}%-14s${NC} ${ann_color}%-16s${NC} %-20s ${GRAY}%s${NC}\n" \
+            "m${instance_idx}" "$dn_trunc" "$oci_st" "$k8s_node_trunc" "$k8s_rdy" "$k8s_cordon" "$k8s_pods" "$cap_topo" "$serial_trunc" "$ann_trunc" "$shape_trunc" "$ocid"
+    done
+    
+    # Read instance map from temp file
+    if [[ -f /tmp/maint_map_$$ ]]; then
+        while IFS='|' read -r idx ocid k8s_node dn cordon_status; do
+            MAINT_INSTANCE_MAP[$idx]="${ocid}|${k8s_node}|${dn}|${cordon_status}"
+        done < /tmp/maint_map_$$
+        rm -f /tmp/maint_map_$$
+    fi
+    
+    echo ""
+    print_separator 240
+    
+    if [[ $found_count -eq 0 ]]; then
+        echo ""
+        echo -e "${GREEN}✓ No instances require maintenance attention${NC}"
+        echo -e "${GRAY}  All instances have healthy capacity topology and no active announcements${NC}"
+        rm -f "$oci_temp" "$k8s_temp" "$output_temp"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Found ${WHITE}${found_count}${YELLOW} instance(s) requiring attention${NC}"
+    echo ""
+    
+    # Show announcement details in column format
+    echo -e "${BOLD}${CYAN}─── Announcement Details ─────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    printf "${BOLD}%-4s %-10s %-28s %-20s %-20s %-70s${NC}\n" \
+        "ID" "Ticket" "Type" "Start" "End" "Description"
+    print_separator 160
+    
+    # Collect unique announcements with index
+    local ann_idx=0
+    declare -A ANN_TICKET_MAP
+    local shown_announcements=""
+    
+    while IFS='|' read -r _ ann _ _ _ _ _ _ _ _ _; do
+        [[ "$ann" == "-" || -z "$ann" ]] && continue
+        
+        # Process each ticket in comma-separated list
+        local ticket
+        for ticket in ${ann//,/ }; do
+            [[ "$shown_announcements" == *"|${ticket}|"* ]] && continue
+            shown_announcements="${shown_announcements}|${ticket}|"
+            
+            ((ann_idx++))
+            
+            # Look up announcement details
+            local ann_detail_file=""
+            local cache_file
+            for cache_file in "$CACHE_DIR"/*.json; do
+                [[ ! -f "$cache_file" ]] && continue
+                [[ "$cache_file" == "$ANNOUNCEMENTS_LIST_CACHE" ]] && continue
+                
+                local ref_ticket
+                ref_ticket=$(jq -r '.data."reference-ticket-number" // ""' "$cache_file" 2>/dev/null)
+                if [[ "${ref_ticket:0:8}" == "$ticket" ]]; then
+                    ann_detail_file="$cache_file"
+                    break
+                fi
+            done
+            
+            if [[ -n "$ann_detail_file" && -f "$ann_detail_file" ]]; then
+                local ann_type ann_time_start ann_time_end ann_description
+                ann_type=$(jq -r '.data["announcement-type"] // "N/A"' "$ann_detail_file" 2>/dev/null)
+                ann_time_start=$(jq -r '.data["time-one-value"] // "N/A"' "$ann_detail_file" 2>/dev/null)
+                ann_time_end=$(jq -r '.data["time-two-value"] // "N/A"' "$ann_detail_file" 2>/dev/null)
+                ann_description=$(jq -r '.data.description // "N/A"' "$ann_detail_file" 2>/dev/null)
+                
+                # Format times
+                local start_display="${ann_time_start:0:16}"
+                local end_display="${ann_time_end:0:16}"
+                [[ "$ann_time_start" == "N/A" || "$ann_time_start" == "null" ]] && start_display="-"
+                [[ "$ann_time_end" == "N/A" || "$ann_time_end" == "null" ]] && end_display="-"
+                
+                # Truncate description to 70 chars
+                local desc_trunc="${ann_description:0:70}"
+                [[ ${#ann_description} -gt 70 ]] && desc_trunc="${desc_trunc}..."
+                
+                # Store mapping
+                ANN_TICKET_MAP["a${ann_idx}"]="${ticket}|${ann_detail_file}"
+                
+                # Color based on type
+                local type_color="$WHITE"
+                case "$ann_type" in
+                    ACTION_REQUIRED) type_color="$RED" ;;
+                    EMERGENCY_MAINTENANCE) type_color="$RED" ;;
+                    SCHEDULED_MAINTENANCE) type_color="$YELLOW" ;;
+                    *) type_color="$CYAN" ;;
+                esac
+                
+                printf "${YELLOW}%-4s${NC} %-10s ${type_color}%-28s${NC} %-20s %-20s ${GRAY}%-70s${NC}\n" \
+                    "a${ann_idx}" "$ticket" "$ann_type" "$start_display" "$end_display" "$desc_trunc"
+            else
+                ANN_TICKET_MAP["a${ann_idx}"]="${ticket}|"
+                printf "${YELLOW}%-4s${NC} %-10s %-28s %-20s %-20s ${GRAY}%-70s${NC}\n" \
+                    "a${ann_idx}" "$ticket" "(not cached)" "-" "-" "Run --refresh to fetch details"
+            fi
+        done
+    done < "$output_temp"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Legend:${NC}"
+    echo -e "  ${RED}DEGRADED${NC}   - Capacity topology indicates degraded infrastructure"
+    echo -e "  ${YELLOW}Cordon${NC}     - Node is cordoned (unschedulable) in Kubernetes"
+    echo -e "  ${RED}ACTION_REQUIRED${NC} / ${RED}EMERGENCY_MAINTENANCE${NC} - Immediate attention needed"
+    echo ""
+    
+    # Interactive menu
+    while true; do
+        echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
+        echo -e "  Enter ${YELLOW}m#${NC} (e.g., m1) to manage an instance (cordon/drain/terminate)"
+        echo -e "  Enter ${YELLOW}a#${NC} (e.g., a1) to view full announcement details"
+        echo -e "  Enter ${YELLOW}q${NC} to quit"
+        echo ""
+        echo -n -e "${CYAN}Selection: ${NC}"
+        read -r selection
+        
+        [[ -z "$selection" || "$selection" == "q" || "$selection" == "Q" ]] && break
+        
+        if [[ "$selection" =~ ^m[0-9]+$ ]]; then
+            # Instance management
+            local inst_info="${MAINT_INSTANCE_MAP[$selection]:-}"
+            if [[ -z "$inst_info" ]]; then
+                echo -e "${RED}Invalid selection: $selection${NC}"
+                continue
+            fi
+            
+            local inst_ocid inst_k8s_node inst_name inst_cordon
+            IFS='|' read -r inst_ocid inst_k8s_node inst_name inst_cordon <<< "$inst_info"
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}═══ Instance: ${CYAN}${inst_name}${NC} ${BOLD}${WHITE}═══${NC}"
+            echo -e "  ${WHITE}OCID:${NC}     $inst_ocid"
+            echo -e "  ${WHITE}K8s Node:${NC} $inst_k8s_node"
+            echo -e "  ${WHITE}Cordoned:${NC} $inst_cordon"
+            echo ""
+            echo -e "${BOLD}${WHITE}Actions:${NC}"
+            echo -e "  ${YELLOW}1${NC}) Cordon node (mark unschedulable)"
+            echo -e "  ${YELLOW}2${NC}) Drain node (cordon + evict pods)"
+            echo -e "  ${YELLOW}3${NC}) Uncordon node (mark schedulable)"
+            echo -e "  ${YELLOW}4${NC}) Terminate instance"
+            echo -e "  ${YELLOW}5${NC}) View instance details"
+            echo -e "  ${YELLOW}b${NC}) Back"
+            echo ""
+            echo -n -e "${CYAN}Action: ${NC}"
+            read -r action
+            
+            case "$action" in
+                1)
+                    # Cordon
+                    if [[ "$inst_k8s_node" == "N/A" || -z "$inst_k8s_node" ]]; then
+                        echo -e "${RED}Cannot cordon: Instance is not in Kubernetes${NC}"
+                        continue
+                    fi
+                    echo ""
+                    echo -e "${YELLOW}Command to execute:${NC}"
+                    echo -e "  ${WHITE}kubectl cordon ${inst_k8s_node}${NC}"
+                    echo ""
+                    echo -n -e "${RED}Confirm cordon node '${inst_k8s_node}'? (yes/no): ${NC}"
+                    read -r confirm
+                    if [[ "$confirm" == "yes" ]]; then
+                        echo ""
+                        echo -e "${YELLOW}Executing: kubectl cordon ${inst_k8s_node}${NC}"
+                        if kubectl cordon "$inst_k8s_node" 2>&1; then
+                            echo -e "${GREEN}✓ Node cordoned successfully${NC}"
+                            # Log action
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] CORDON: kubectl cordon ${inst_k8s_node}" >> "${LOG_FILE:-/tmp/k8s_maintenance.log}"
+                        else
+                            echo -e "${RED}✗ Failed to cordon node${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}Cancelled${NC}"
+                    fi
+                    ;;
+                2)
+                    # Drain
+                    if [[ "$inst_k8s_node" == "N/A" || -z "$inst_k8s_node" ]]; then
+                        echo -e "${RED}Cannot drain: Instance is not in Kubernetes${NC}"
+                        continue
+                    fi
+                    echo ""
+                    echo -e "${YELLOW}Command to execute:${NC}"
+                    echo -e "  ${WHITE}kubectl drain ${inst_k8s_node} --ignore-daemonsets --delete-emptydir-data --force${NC}"
+                    echo ""
+                    echo -e "${RED}⚠️  WARNING: This will evict all pods from the node!${NC}"
+                    echo -n -e "${RED}Confirm drain node '${inst_k8s_node}'? (yes/no): ${NC}"
+                    read -r confirm
+                    if [[ "$confirm" == "yes" ]]; then
+                        echo ""
+                        echo -e "${YELLOW}Executing: kubectl drain ${inst_k8s_node} --ignore-daemonsets --delete-emptydir-data --force${NC}"
+                        if kubectl drain "$inst_k8s_node" --ignore-daemonsets --delete-emptydir-data --force 2>&1; then
+                            echo -e "${GREEN}✓ Node drained successfully${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] DRAIN: kubectl drain ${inst_k8s_node} --ignore-daemonsets --delete-emptydir-data --force" >> "${LOG_FILE:-/tmp/k8s_maintenance.log}"
+                        else
+                            echo -e "${RED}✗ Failed to drain node${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}Cancelled${NC}"
+                    fi
+                    ;;
+                3)
+                    # Uncordon
+                    if [[ "$inst_k8s_node" == "N/A" || -z "$inst_k8s_node" ]]; then
+                        echo -e "${RED}Cannot uncordon: Instance is not in Kubernetes${NC}"
+                        continue
+                    fi
+                    echo ""
+                    echo -e "${YELLOW}Command to execute:${NC}"
+                    echo -e "  ${WHITE}kubectl uncordon ${inst_k8s_node}${NC}"
+                    echo ""
+                    echo -n -e "${CYAN}Confirm uncordon node '${inst_k8s_node}'? (yes/no): ${NC}"
+                    read -r confirm
+                    if [[ "$confirm" == "yes" ]]; then
+                        echo ""
+                        echo -e "${YELLOW}Executing: kubectl uncordon ${inst_k8s_node}${NC}"
+                        if kubectl uncordon "$inst_k8s_node" 2>&1; then
+                            echo -e "${GREEN}✓ Node uncordoned successfully${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] UNCORDON: kubectl uncordon ${inst_k8s_node}" >> "${LOG_FILE:-/tmp/k8s_maintenance.log}"
+                        else
+                            echo -e "${RED}✗ Failed to uncordon node${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}Cancelled${NC}"
+                    fi
+                    ;;
+                4)
+                    # Terminate
+                    echo ""
+                    echo -e "${YELLOW}Command to execute:${NC}"
+                    echo -e "  ${WHITE}oci compute instance terminate --instance-id ${inst_ocid} --preserve-boot-volume false --force${NC}"
+                    echo ""
+                    echo -e "${RED}⚠️  WARNING: This will PERMANENTLY TERMINATE the instance!${NC}"
+                    echo -e "${RED}    Instance: ${inst_name}${NC}"
+                    echo -e "${RED}    OCID: ${inst_ocid}${NC}"
+                    echo ""
+                    echo -n -e "${RED}Type 'TERMINATE' to confirm: ${NC}"
+                    read -r confirm
+                    if [[ "$confirm" == "TERMINATE" ]]; then
+                        echo ""
+                        echo -e "${YELLOW}Executing: oci compute instance terminate --instance-id ${inst_ocid} --preserve-boot-volume false --force${NC}"
+                        if oci compute instance terminate --instance-id "$inst_ocid" --preserve-boot-volume false --force 2>&1; then
+                            echo -e "${GREEN}✓ Instance termination initiated${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] TERMINATE: oci compute instance terminate --instance-id ${inst_ocid} --preserve-boot-volume false --force" >> "${LOG_FILE:-/tmp/k8s_maintenance.log}"
+                        else
+                            echo -e "${RED}✗ Failed to terminate instance${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}Cancelled (must type 'TERMINATE' exactly)${NC}"
+                    fi
+                    ;;
+                5)
+                    # View details
+                    display_instance_details "$inst_ocid"
+                    ;;
+                b|B)
+                    ;;
+                *)
+                    echo -e "${RED}Invalid action${NC}"
+                    ;;
+            esac
+            echo ""
+            
+        elif [[ "$selection" =~ ^a[0-9]+$ ]]; then
+            # Announcement details
+            local ann_info="${ANN_TICKET_MAP[$selection]:-}"
+            if [[ -z "$ann_info" ]]; then
+                echo -e "${RED}Invalid selection: $selection${NC}"
+                continue
+            fi
+            
+            local ann_ticket ann_file
+            IFS='|' read -r ann_ticket ann_file <<< "$ann_info"
+            
+            echo ""
+            echo -e "${BOLD}${YELLOW}═══ Announcement: ${ann_ticket} ═══${NC}"
+            
+            if [[ -n "$ann_file" && -f "$ann_file" ]]; then
+                local full_ticket ann_type ann_summary ann_description ann_services
+                local ann_time_start ann_time_end ann_time_created platform_type lifecycle_state
+                
+                full_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$ann_file")
+                ann_type=$(jq -r '.data["announcement-type"] // "N/A"' "$ann_file")
+                ann_summary=$(jq -r '.data.summary // "N/A"' "$ann_file")
+                ann_description=$(jq -r '.data.description // "N/A"' "$ann_file")
+                ann_services=$(jq -r '.data["affected-services"] // [] | join(", ")' "$ann_file")
+                ann_time_start=$(jq -r '.data["time-one-value"] // "N/A"' "$ann_file")
+                ann_time_end=$(jq -r '.data["time-two-value"] // "N/A"' "$ann_file")
+                ann_time_created=$(jq -r '.data["time-created"] // "N/A"' "$ann_file")
+                platform_type=$(jq -r '.data["platform-type"] // "N/A"' "$ann_file")
+                lifecycle_state=$(jq -r '.data["lifecycle-state"] // "N/A"' "$ann_file")
+                
+                echo ""
+                echo -e "  ${WHITE}Full Ticket:${NC}  $full_ticket"
+                echo -e "  ${WHITE}Type:${NC}         $ann_type"
+                echo -e "  ${WHITE}State:${NC}        $lifecycle_state"
+                echo -e "  ${WHITE}Platform:${NC}     $platform_type"
+                echo -e "  ${WHITE}Services:${NC}     $ann_services"
+                echo -e "  ${WHITE}Created:${NC}      ${ann_time_created:0:19}"
+                [[ "$ann_time_start" != "N/A" && "$ann_time_start" != "null" ]] && echo -e "  ${WHITE}Start Time:${NC}   ${ann_time_start:0:19}"
+                [[ "$ann_time_end" != "N/A" && "$ann_time_end" != "null" ]] && echo -e "  ${WHITE}End Time:${NC}     ${ann_time_end:0:19}"
+                echo ""
+                echo -e "  ${WHITE}Summary:${NC}"
+                echo -e "    ${CYAN}$ann_summary${NC}"
+                echo ""
+                if [[ "$ann_description" != "N/A" && "$ann_description" != "null" && -n "$ann_description" ]]; then
+                    echo -e "  ${WHITE}Description:${NC}"
+                    echo "$ann_description" | fold -s -w 90 | while IFS= read -r line; do
+                        echo -e "    ${GRAY}${line}${NC}"
+                    done
+                fi
+                
+                # Show affected resources count
+                local resource_count
+                resource_count=$(jq '.data."affected-resources" | length' "$ann_file" 2>/dev/null) || resource_count=0
+                echo ""
+                echo -e "  ${WHITE}Affected Resources:${NC} $resource_count"
+            else
+                echo -e "${RED}  Announcement details not cached. Run --refresh to fetch.${NC}"
+            fi
+            echo ""
+        else
+            echo -e "${RED}Invalid selection. Use m# for instance or a# for announcement.${NC}"
+        fi
+    done
+    
+    # Cleanup
+    rm -f "$oci_temp" "$k8s_temp" "$output_temp"
+}
+
+#--------------------------------------------------------------------------------
+# List all announcements with affected resource details
+# Shows all announcements and validates if affected instances still exist
+#--------------------------------------------------------------------------------
+list_all_announcements() {
+    local compartment_id="${1:-$EFFECTIVE_COMPARTMENT_ID}"
+    local region="${2:-$EFFECTIVE_REGION}"
+    
+    # Validate required parameters
+    if [[ -z "$compartment_id" ]]; then
+        log_error "COMPARTMENT_ID not set"
+        return 1
+    fi
+    
+    # Display header
+    display_oke_environment_header "$compartment_id" "$region"
+    
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                         ALL ANNOUNCEMENTS                                                       ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Fetch announcements
+    log_info "Fetching announcements from OCI..."
+    
+    # Force refresh of announcements cache
+    rm -f "$ANNOUNCEMENTS_LIST_CACHE"
+    
+    if ! oci announce announcements list \
+            --compartment-id "$compartment_id" \
+            --all > "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null; then
+        log_error "Failed to fetch announcements"
+        return 1
+    fi
+    
+    # Get announcement count
+    local ann_count
+    ann_count=$(jq '.data.items | length' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null) || ann_count=0
+    
+    if [[ "$ann_count" -eq 0 ]]; then
+        echo -e "${GREEN}✓ No announcements found${NC}"
+        echo ""
+        return 0
+    fi
+    
+    echo -e "${GRAY}Found ${WHITE}${ann_count}${GRAY} announcement(s)${NC}"
+    echo ""
+    
+    # Fetch all instances in compartment for validation
+    log_info "Fetching instances for validation..."
+    local instances_json
+    instances_json=$(oci compute instance list \
+        --compartment-id "$compartment_id" \
+        --region "$region" \
+        --all \
+        --output json 2>/dev/null)
+    
+    # Build instance lookup (OCID -> display_name|state)
+    declare -A INSTANCE_LOOKUP
+    if [[ -n "$instances_json" ]]; then
+        while IFS='|' read -r ocid name state; do
+            [[ -n "$ocid" ]] && INSTANCE_LOOKUP[$ocid]="${name}|${state}"
+        done < <(echo "$instances_json" | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])"' 2>/dev/null)
+    fi
+    
+    # Fetch details for each announcement
+    log_info "Fetching announcement details..."
+    local announcement_ids
+    announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
+    
+    # Fetch details in parallel
+    local ann_id
+    for ann_id in $announcement_ids; do
+        local detail_file="${CACHE_DIR}/${ann_id##*.}.json"
+        oci announce announcements get --announcement-id "$ann_id" > "$detail_file" 2>/dev/null &
+    done
+    wait
+    
+    echo ""
+    
+    # Print announcements table header
+    printf "${BOLD}%-4s %-10s %-10s %-24s %-16s %-16s %-30s %-14s %-42s %-80s${NC}\n" \
+        "ID" "Ticket" "State" "Type" "Start" "End" "Display Name" "OCI State" "Instance OCID" "Description"
+    print_separator 260
+    
+    # Build announcement index map for interactive selection
+    declare -A ANN_INDEX_MAP
+    local ann_idx=0
+    
+    # Process each announcement
+    for ann_id in $announcement_ids; do
+        local detail_file="${CACHE_DIR}/${ann_id##*.}.json"
+        
+        if [[ ! -f "$detail_file" ]]; then
+            continue
+        fi
+        
+        ((ann_idx++))
+        
+        # Extract announcement fields
+        local ref_ticket lifecycle_state ann_type description
+        local time_one time_two resource_count
+        
+        ref_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$detail_file")
+        lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
+        ann_type=$(jq -r '.data."announcement-type" // "N/A"' "$detail_file")
+        description=$(jq -r '.data.description // ""' "$detail_file")
+        time_one=$(jq -r '.data."time-one-value" // "N/A"' "$detail_file")
+        time_two=$(jq -r '.data."time-two-value" // "N/A"' "$detail_file")
+        resource_count=$(jq '.data."affected-resources" | length' "$detail_file" 2>/dev/null) || resource_count=0
+        
+        # Store mapping
+        ANN_INDEX_MAP["a${ann_idx}"]="${detail_file}"
+        
+        # Format times
+        local start_display="${time_one:0:16}"
+        local end_display="${time_two:0:16}"
+        [[ "$time_one" == "N/A" || "$time_one" == "null" ]] && start_display="-"
+        [[ "$time_two" == "N/A" || "$time_two" == "null" ]] && end_display="-"
+        
+        # Truncate description to 80 chars
+        local desc_trunc="${description:0:80}"
+        [[ ${#description} -gt 80 ]] && desc_trunc="${desc_trunc}..."
+        
+        # Color based on lifecycle state
+        local state_color="$GREEN"
+        case "$lifecycle_state" in
+            ACTIVE) state_color="$YELLOW" ;;
+            INACTIVE) state_color="$GRAY" ;;
+            *) state_color="$WHITE" ;;
+        esac
+        
+        # Color based on announcement type
+        local type_color="$WHITE"
+        case "$ann_type" in
+            ACTION_REQUIRED) type_color="$RED" ;;
+            SCHEDULED_MAINTENANCE) type_color="$YELLOW" ;;
+            EMERGENCY_MAINTENANCE) type_color="$RED" ;;
+            PRODUCTION_EVENT_NOTIFICATION) type_color="$CYAN" ;;
+            *) type_color="$WHITE" ;;
+        esac
+        
+        # Truncate ticket for display
+        local ticket_display="${ref_ticket:0:10}"
+        
+        # If no affected resources, show one row with N/A for instance info
+        if [[ $resource_count -eq 0 ]]; then
+            printf "${YELLOW}%-4s${NC} %-10s ${state_color}%-10s${NC} ${type_color}%-24s${NC} %-16s %-16s ${GRAY}%-30s${NC} ${GRAY}%-14s${NC} ${GRAY}%-42s${NC} ${GRAY}%-80s${NC}\n" \
+                "a${ann_idx}" "$ticket_display" "$lifecycle_state" "$ann_type" "$start_display" "$end_display" "-" "-" "-" "$desc_trunc"
+        else
+            # Loop through affected resources
+            local i
+            local first_row=true
+            for ((i=0; i<resource_count; i++)); do
+                # Get resource details
+                local resource_id resource_name
+                
+                resource_id=$(jq -r ".data.\"affected-resources\"[$i] | 
+                    if .properties then
+                        (.properties[] | select(.name == \"resourceId\" or .name == \"instanceId\") | .value) // \"N/A\"
+                    else
+                        (.\"resource-id\" // .\"instance-id\" // \"N/A\")
+                    end" "$detail_file" 2>/dev/null)
+                
+                resource_name=$(jq -r ".data.\"affected-resources\"[$i] |
+                    if .properties then
+                        (.properties[] | select(.name == \"resourceName\" or .name == \"instanceName\") | .value) // \"N/A\"
+                    else
+                        (.\"resource-name\" // .\"instance-name\" // \"N/A\")
+                    end" "$detail_file" 2>/dev/null)
+                
+                # Check if instance still exists and get current state
+                local instance_state="UNKNOWN"
+                local instance_display_name="$resource_name"
+                local inst_state_color="$GRAY"
+                
+                if [[ "$resource_id" != "N/A" && -n "$resource_id" ]]; then
+                    if [[ -n "${INSTANCE_LOOKUP[$resource_id]:-}" ]]; then
+                        local lookup_info="${INSTANCE_LOOKUP[$resource_id]}"
+                        instance_display_name=$(echo "$lookup_info" | cut -d'|' -f1)
+                        instance_state=$(echo "$lookup_info" | cut -d'|' -f2)
+                        
+                        case "$instance_state" in
+                            RUNNING) inst_state_color="$GREEN" ;;
+                            STOPPED) inst_state_color="$RED" ;;
+                            TERMINATED) inst_state_color="$RED" ;;
+                            *) inst_state_color="$YELLOW" ;;
+                        esac
+                    else
+                        instance_state="DELETED"
+                        inst_state_color="$RED"
+                        [[ "$instance_display_name" == "N/A" ]] && instance_display_name="(deleted)"
+                    fi
+                fi
+                
+                # Truncate display name and OCID
+                local name_trunc="${instance_display_name:0:30}"
+                local ocid_trunc="N/A"
+                if [[ "$resource_id" != "N/A" && -n "$resource_id" ]]; then
+                    ocid_trunc="...${resource_id: -39}"
+                fi
+                
+                # Print row - only show announcement details on first row
+                if [[ "$first_row" == "true" ]]; then
+                    printf "${YELLOW}%-4s${NC} %-10s ${state_color}%-10s${NC} ${type_color}%-24s${NC} %-16s %-16s %-30s ${inst_state_color}%-14s${NC} %-42s ${GRAY}%-80s${NC}\n" \
+                        "a${ann_idx}" "$ticket_display" "$lifecycle_state" "$ann_type" "$start_display" "$end_display" "$name_trunc" "$instance_state" "$ocid_trunc" "$desc_trunc"
+                    first_row=false
+                else
+                    # Continuation row - empty announcement columns
+                    printf "%-4s %-10s %-10s %-24s %-16s %-16s %-30s ${inst_state_color}%-14s${NC} %-42s %-80s\n" \
+                        "" "" "" "" "" "" "$name_trunc" "$instance_state" "$ocid_trunc" ""
+                fi
+            done
+        fi
+    done
+    
+    echo ""
+    print_separator 260
+    echo ""
+    echo -e "${WHITE}Processed ${CYAN}${ann_idx}${WHITE} announcement(s)${NC}"
+    echo ""
+    
+    # Show legend
+    echo -e "${BOLD}${WHITE}Legend:${NC}"
+    echo -e "  ${WHITE}States:${NC} ${YELLOW}ACTIVE${NC} (current) | ${GRAY}INACTIVE${NC} (past)"
+    echo -e "  ${WHITE}Types:${NC}  ${RED}ACTION_REQUIRED${NC} / ${RED}EMERGENCY_MAINTENANCE${NC} (urgent) | ${YELLOW}SCHEDULED_MAINTENANCE${NC} (planned) | ${CYAN}PRODUCTION_EVENT_NOTIFICATION${NC} (info)"
+    echo -e "  ${WHITE}Instance:${NC} ${GREEN}RUNNING${NC} | ${RED}STOPPED${NC} | ${RED}DELETED${NC} (no longer exists)"
+    echo ""
+    
+    # Interactive menu
+    while true; do
+        echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
+        echo -e "  Enter ${YELLOW}a#${NC} (e.g., a1) to view full announcement details and affected resources"
+        echo -e "  Enter ${YELLOW}q${NC} to quit"
+        echo ""
+        echo -n -e "${CYAN}Selection: ${NC}"
+        read -r selection
+        
+        [[ -z "$selection" || "$selection" == "q" || "$selection" == "Q" ]] && break
+        
+        if [[ "$selection" =~ ^a[0-9]+$ ]]; then
+            local detail_file="${ANN_INDEX_MAP[$selection]:-}"
+            if [[ -z "$detail_file" || ! -f "$detail_file" ]]; then
+                echo -e "${RED}Invalid selection: $selection${NC}"
+                continue
+            fi
+            
+            # Extract full announcement details
+            local ref_ticket lifecycle_state ann_type summary description
+            local time_created time_updated time_one time_two
+            local affected_services platform_type resource_count
+            
+            ref_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$detail_file")
+            lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
+            ann_type=$(jq -r '.data."announcement-type" // "N/A"' "$detail_file")
+            summary=$(jq -r '.data.summary // "N/A"' "$detail_file")
+            description=$(jq -r '.data.description // "N/A"' "$detail_file")
+            time_created=$(jq -r '.data."time-created" // "N/A"' "$detail_file")
+            time_updated=$(jq -r '.data."time-updated" // "N/A"' "$detail_file")
+            time_one=$(jq -r '.data."time-one-value" // "N/A"' "$detail_file")
+            time_two=$(jq -r '.data."time-two-value" // "N/A"' "$detail_file")
+            affected_services=$(jq -r '.data."affected-services" // [] | join(", ")' "$detail_file")
+            platform_type=$(jq -r '.data."platform-type" // "N/A"' "$detail_file")
+            resource_count=$(jq '.data."affected-resources" | length' "$detail_file" 2>/dev/null) || resource_count=0
+            
+            echo ""
+            echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+            echo -e "${BOLD}${YELLOW}  Announcement: ${WHITE}${ref_ticket}${NC}"
+            echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo -e "  ${WHITE}Type:${NC}         $ann_type"
+            echo -e "  ${WHITE}State:${NC}        $lifecycle_state"
+            echo -e "  ${WHITE}Platform:${NC}     $platform_type"
+            echo -e "  ${WHITE}Services:${NC}     $affected_services"
+            echo -e "  ${WHITE}Created:${NC}      ${time_created:0:19}"
+            [[ "$time_updated" != "N/A" && "$time_updated" != "null" ]] && echo -e "  ${WHITE}Updated:${NC}      ${time_updated:0:19}"
+            [[ "$time_one" != "N/A" && "$time_one" != "null" ]] && echo -e "  ${WHITE}Start Time:${NC}   ${time_one:0:19}"
+            [[ "$time_two" != "N/A" && "$time_two" != "null" ]] && echo -e "  ${WHITE}End Time:${NC}     ${time_two:0:19}"
+            echo ""
+            echo -e "  ${WHITE}Summary:${NC}"
+            echo -e "    ${CYAN}$summary${NC}"
+            echo ""
+            if [[ "$description" != "N/A" && "$description" != "null" && -n "$description" ]]; then
+                echo -e "  ${WHITE}Description:${NC}"
+                echo "$description" | fold -s -w 100 | while IFS= read -r line; do
+                    echo -e "    ${GRAY}${line}${NC}"
+                done
+            fi
+            
+            # Show affected resources
+            if [[ $resource_count -gt 0 ]]; then
+                echo ""
+                echo -e "  ${WHITE}Affected Resources (${resource_count}):${NC}"
+                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+                printf "  ${BOLD}%-40s %-30s %-16s %-22s${NC}\n" "Instance OCID" "Display Name" "OCI State" "GPU Memory Cluster"
+                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+                
+                local i
+                for ((i=0; i<resource_count; i++)); do
+                    local resource_id resource_name gpu_mem_cluster
+                    
+                    resource_id=$(jq -r ".data.\"affected-resources\"[$i] | 
+                        if .properties then
+                            (.properties[] | select(.name == \"resourceId\" or .name == \"instanceId\") | .value) // \"N/A\"
+                        else
+                            (.\"resource-id\" // .\"instance-id\" // \"N/A\")
+                        end" "$detail_file" 2>/dev/null)
+                    
+                    resource_name=$(jq -r ".data.\"affected-resources\"[$i] |
+                        if .properties then
+                            (.properties[] | select(.name == \"resourceName\" or .name == \"instanceName\") | .value) // \"N/A\"
+                        else
+                            (.\"resource-name\" // .\"instance-name\" // \"N/A\")
+                        end" "$detail_file" 2>/dev/null)
+                    
+                    gpu_mem_cluster=$(jq -r ".data.\"affected-resources\"[$i] |
+                        if .properties then
+                            (.properties[] | select(.name == \"gpuMemoryCluster\") | .value) // \"N/A\"
+                        else
+                            \"N/A\"
+                        end" "$detail_file" 2>/dev/null)
+                    
+                    # Check if instance still exists
+                    local instance_state="UNKNOWN"
+                    local instance_display_name="$resource_name"
+                    local state_color="$GRAY"
+                    
+                    if [[ "$resource_id" != "N/A" && -n "$resource_id" ]]; then
+                        if [[ -n "${INSTANCE_LOOKUP[$resource_id]:-}" ]]; then
+                            local lookup_info="${INSTANCE_LOOKUP[$resource_id]}"
+                            instance_display_name=$(echo "$lookup_info" | cut -d'|' -f1)
+                            instance_state=$(echo "$lookup_info" | cut -d'|' -f2)
+                            
+                            case "$instance_state" in
+                                RUNNING) state_color="$GREEN" ;;
+                                STOPPED) state_color="$RED" ;;
+                                TERMINATED) state_color="$RED" ;;
+                                *) state_color="$YELLOW" ;;
+                            esac
+                        else
+                            instance_state="NO LONGER EXISTS"
+                            state_color="$RED"
+                            [[ "$instance_display_name" == "N/A" ]] && instance_display_name="(deleted)"
+                        fi
+                    fi
+                    
+                    # Truncate OCID for display
+                    local ocid_display="N/A"
+                    if [[ "$resource_id" != "N/A" && -n "$resource_id" ]]; then
+                        ocid_display="...${resource_id: -37}"
+                    fi
+                    
+                    # Truncate GPU memory cluster
+                    local gpu_display="N/A"
+                    if [[ "$gpu_mem_cluster" != "N/A" && -n "$gpu_mem_cluster" ]]; then
+                        gpu_display="...${gpu_mem_cluster: -19}"
+                    fi
+                    
+                    printf "  %-40s %-30s ${state_color}%-16s${NC} %-22s\n" \
+                        "$ocid_display" "${instance_display_name:0:30}" "$instance_state" "$gpu_display"
+                done
+            else
+                echo ""
+                echo -e "  ${GRAY}No specific resources listed for this announcement${NC}"
+            fi
+            echo ""
+        else
+            echo -e "${RED}Invalid selection. Use a# (e.g., a1) for announcement details.${NC}"
+        fi
+    done
+}
+
 # Display summary by clique
 display_clique_summary() {
     local oci_temp="$1"
@@ -2720,10 +3696,11 @@ display_clique_summary() {
         [[ -z "$instance_ocid" ]] && continue
         
         local k8s_info
-        k8s_info=$(grep "^${instance_ocid}|" "$k8s_temp" 2>/dev/null)
+        # k8s_temp format: providerID|nodeName|clique|gpuPresent
+        k8s_info=$(grep "$instance_ocid" "$k8s_temp" 2>/dev/null)
         if [[ -n "$k8s_info" ]]; then
             local node_name clique_id
-            IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+            IFS='|' read -r _ node_name clique_id _ <<< "$k8s_info"
             # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
             echo "${display_name}|${node_name}|${status}|${instance_ocid}|${gpu_mem}|${clique_id}" >> "$joined_temp"
         elif [[ "$gpu_mem" != "N/A" && -n "$gpu_mem" ]]; then
@@ -3182,7 +4159,8 @@ get_node_info() {
     node_json=$(kubectl get nodes -o json 2>/dev/null)
     
     if [[ -n "$node_json" ]]; then
-        node_name=$(echo "$node_json" | jq -r --arg id "$instance_id" '.items[] | select(.spec.providerID==$id) | .metadata.name')
+        # Use contains() because providerID format is "oci://ocid1.instance..." not just the OCID
+        node_name=$(echo "$node_json" | jq -r --arg id "$instance_id" '.items[] | select(.spec.providerID | contains($id)) | .metadata.name')
         if [[ -n "$node_name" ]]; then
             in_kubernetes="true"
             node_data=$(echo "$node_json" | jq --arg name "$node_name" '.items[] | select(.metadata.name==$name)')
@@ -3581,7 +4559,8 @@ list_instances_by_gpu_cluster() {
         --output json 2>/dev/null | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"' > "$oci_data"
     
     log_info "Fetching Kubernetes node data..."
-    kubectl get nodes -l nvidia.com/gpu.present=true -o json 2>/dev/null | jq -r '
+    # Fetch ALL nodes to avoid missing nodes without GPU labels yet
+    kubectl get nodes -o json 2>/dev/null | jq -r '
         .items[] | 
         "\(.spec.providerID)|\(.metadata.name)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")"
     ' > "$k8s_data"
@@ -3601,7 +4580,8 @@ list_instances_by_gpu_cluster() {
     local instance_id display_name oci_state gpu_mem
     grep "|${gpu_cluster}\$" "$oci_data" 2>/dev/null | while IFS='|' read -r instance_id display_name oci_state gpu_mem; do
         local k8s_info
-        k8s_info=$(grep "^${instance_id}|" "$k8s_data" 2>/dev/null)
+        # k8s_data format: providerID|nodeName|clique
+        k8s_info=$(grep "$instance_id" "$k8s_data" 2>/dev/null)
         [[ -z "$k8s_info" ]] && continue
         
         local node_name clique_id
@@ -3628,8 +4608,9 @@ list_instances_by_gpu_cluster() {
     # Count total instances
     local total_count k8s_count
     total_count=$(grep -c "|${gpu_cluster}\$" "$oci_data" 2>/dev/null) || total_count=0
+    # Use grep without ^ anchor because providerID has oci:// prefix
     k8s_count=$(grep "|${gpu_cluster}\$" "$oci_data" 2>/dev/null | while IFS='|' read -r id _ _ _; do
-        grep -q "^${id}|" "$k8s_data" 2>/dev/null && echo "1"
+        grep -q "$id" "$k8s_data" 2>/dev/null && echo "1"
     done | wc -l)
     
     echo -e "${CYAN}Total Instances:${NC} $total_count (${k8s_count} in Kubernetes)"
@@ -3903,11 +4884,12 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}5${NC}) ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
         echo -e "  ${GREEN}6${NC}) ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
         echo -e "  ${GREEN}7${NC}) ${WHITE}GPU Instance Tagging${NC}          - Manage ComputeInstanceHostActions namespace and tags"
+        echo -e "  ${GREEN}8${NC}) ${WHITE}NVIDIA GPU Stack Health${NC}       - Check GPU Operator & DRA components per node"
         echo ""
         echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-7, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-8, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -3940,6 +4922,9 @@ interactive_management_main_menu() {
             7)
                 manage_gpu_instance_tagging
                 ;;
+            8)
+                manage_nvidia_gpu_stack_health
+                ;;
             c|C|cache|CACHE)
                 display_cache_stats
                 ;;
@@ -3949,7 +4934,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-7, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-8, c, or q.${NC}"
                 ;;
         esac
     done
@@ -4473,6 +5458,78 @@ manage_oke_cluster() {
         fi
     else
         echo -e "${WHITE}No node pools found or unable to fetch${NC}"
+    fi
+    
+    # Helm Deployments
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Helm Deployments (GPU) ═══${NC}"
+    echo ""
+    
+    local helm_available=false
+    if command -v helm &>/dev/null && command -v kubectl &>/dev/null; then
+        helm_available=true
+    fi
+    
+    if [[ "$helm_available" == "true" ]]; then
+        printf "${BOLD}%-25s %-25s %-10s %-40s %-12s %-15s${NC}\n" \
+            "Release Name" "Namespace" "Revision" "Updated" "Status" "Chart"
+        printf "${WHITE}%-25s %-25s %-10s %-40s %-12s %-15s${NC}\n" \
+            "-------------------------" "-------------------------" "----------" "----------------------------------------" "------------" "---------------"
+        
+        local found_helm_releases=false
+        
+        # Check gpu-operator namespace
+        local gpu_op_json
+        gpu_op_json=$(helm list -n gpu-operator -o json 2>/dev/null)
+        if [[ -n "$gpu_op_json" && "$gpu_op_json" != "[]" ]]; then
+            echo "$gpu_op_json" | jq -r '.[] | [.name, .namespace, (.revision | tostring), .updated, .status, .chart] | @tsv' 2>/dev/null | while IFS=$'\t' read -r name ns rev updated status chart; do
+                local status_color="$GREEN"
+                [[ "$status" != "deployed" ]] && status_color="$YELLOW"
+                [[ "$status" == "failed" ]] && status_color="$RED"
+                # Truncate updated timestamp
+                local updated_trunc="${updated:0:40}"
+                printf "%-25s %-25s %-10s %-40s ${status_color}%-12s${NC} %-15s\n" \
+                    "${name:0:25}" "${ns:0:25}" "$rev" "$updated_trunc" "$status" "${chart:0:15}"
+            done
+            found_helm_releases=true
+        fi
+        
+        # Check nvidia-dra-driver-gpu namespace
+        local dra_json
+        dra_json=$(helm list -n nvidia-dra-driver-gpu -o json 2>/dev/null)
+        if [[ -n "$dra_json" && "$dra_json" != "[]" ]]; then
+            echo "$dra_json" | jq -r '.[] | [.name, .namespace, (.revision | tostring), .updated, .status, .chart] | @tsv' 2>/dev/null | while IFS=$'\t' read -r name ns rev updated status chart; do
+                local status_color="$GREEN"
+                [[ "$status" != "deployed" ]] && status_color="$YELLOW"
+                [[ "$status" == "failed" ]] && status_color="$RED"
+                # Truncate updated timestamp
+                local updated_trunc="${updated:0:40}"
+                printf "%-25s %-25s %-10s %-40s ${status_color}%-12s${NC} %-15s\n" \
+                    "${name:0:25}" "${ns:0:25}" "$rev" "$updated_trunc" "$status" "${chart:0:15}"
+            done
+            found_helm_releases=true
+        fi
+        
+        # Check network-operator namespace (common for RDMA/networking)
+        local netop_json
+        netop_json=$(helm list -n network-operator -o json 2>/dev/null)
+        if [[ -n "$netop_json" && "$netop_json" != "[]" ]]; then
+            echo "$netop_json" | jq -r '.[] | [.name, .namespace, (.revision | tostring), .updated, .status, .chart] | @tsv' 2>/dev/null | while IFS=$'\t' read -r name ns rev updated status chart; do
+                local status_color="$GREEN"
+                [[ "$status" != "deployed" ]] && status_color="$YELLOW"
+                [[ "$status" == "failed" ]] && status_color="$RED"
+                local updated_trunc="${updated:0:40}"
+                printf "%-25s %-25s %-10s %-40s ${status_color}%-12s${NC} %-15s\n" \
+                    "${name:0:25}" "${ns:0:25}" "$rev" "$updated_trunc" "$status" "${chart:0:15}"
+            done
+            found_helm_releases=true
+        fi
+        
+        if [[ "$found_helm_releases" == "false" ]]; then
+            echo -e "${GRAY}No GPU-related helm releases found in gpu-operator, nvidia-dra-driver-gpu, or network-operator namespaces${NC}"
+        fi
+    else
+        echo -e "${YELLOW}helm and/or kubectl not available - cannot check helm deployments${NC}"
     fi
     
     # Timestamps
@@ -5705,8 +6762,8 @@ manage_compute_instances() {
         # Display instances table
         echo -e "${BOLD}${WHITE}═══ Instances ═══${NC}"
         echo ""
-        printf "${BOLD}%-5s %-32s %-12s %-8s %-8s %-5s %-26s %-15s %-16s %s${NC}\n" \
-            "ID" "Display Name" "State" "K8s" "Cordon" "Pods" "Shape" "Avail Domain" "Created" "Instance OCID"
+        printf "${BOLD}%-5s %-32s %-10s %-8s %-8s %-10s %-5s %-24s %-12s %-16s %s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "Cordon" "Taint" "Pods" "Shape" "Avail Domain" "Created" "Instance OCID"
         print_separator 240
         
         # Sort by time-created (ascending - oldest first, newest last)
@@ -5736,6 +6793,8 @@ manage_compute_instances() {
             local k8s_color="$YELLOW"
             local cordon_status="-"
             local cordon_color="$GRAY"
+            local taint_status="-"
+            local taint_color="$GRAY"
             local pod_count="-"
             local pod_color="$GRAY"
             local k8s_node_name=""
@@ -5744,9 +6803,10 @@ manage_compute_instances() {
             k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
             
             if [[ -n "$k8s_match" ]]; then
-                local k8s_ready unschedulable
+                local k8s_ready unschedulable new_node_taint
                 k8s_node_name=$(echo "$k8s_match" | cut -d'|' -f2)
                 k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
+                new_node_taint=$(echo "$k8s_match" | cut -d'|' -f4)
                 unschedulable=$(echo "$k8s_match" | cut -d'|' -f5)
                 
                 if [[ "$k8s_ready" == "True" ]]; then
@@ -5759,11 +6819,17 @@ manage_compute_instances() {
                 
                 # Check cordon status
                 if [[ "$unschedulable" == "true" ]]; then
-                    cordon_status="Cordon"
+                    cordon_status="Yes"
                     cordon_color="$YELLOW"
                 else
                     cordon_status="-"
                     cordon_color="$GRAY"
+                fi
+                
+                # Check newNode taint
+                if [[ "$new_node_taint" != "N/A" && -n "$new_node_taint" ]]; then
+                    taint_status="newNode"
+                    taint_color="$CYAN"
                 fi
                 
                 # Get pod count for this node
@@ -5780,7 +6846,7 @@ manage_compute_instances() {
             
             # Truncate long fields (but show full OCID)
             local name_trunc="${name:0:32}"
-            local shape_trunc="${shape:0:26}"
+            local shape_trunc="${shape:0:24}"
             local ad_short="${ad##*:}"
             
             # Format time_created - show date and time portion
@@ -5791,8 +6857,8 @@ manage_compute_instances() {
                 time_display="${time_display/T/ }"
             fi
             
-            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-12s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-8s${NC} ${pod_color}%-5s${NC} %-26s %-15s ${GRAY}%-16s${NC} ${GRAY}%s${NC}\n" \
-                "$iid" "$name_trunc" "$state" "$k8s_status" "$cordon_status" "$pod_count" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-8s${NC} ${taint_color}%-10s${NC} ${pod_color}%-5s${NC} %-24s %-12s ${GRAY}%-16s${NC} ${GRAY}%s${NC}\n" \
+                "$iid" "$name_trunc" "$state" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
         done
         
         # Read map from temp file
@@ -6776,12 +7842,12 @@ display_instance_details() {
     local k8s_node_info
     k8s_node_info=$(kubectl get nodes -o json 2>/dev/null | jq -r --arg ocid "$instance_ocid" '
         .items[] | select(.spec.providerID | contains($ocid)) | 
-        "\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")|\(.spec.unschedulable // false)"
+        "\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\(.metadata.labels["nvidia.com/gpu.clique"] // "N/A")|\(.metadata.labels["nvidia.com/gpu.present"] // "false")|\(.spec.unschedulable // false)|\((.spec.taints // []) | map(select(.key == "newNode")) | if length > 0 then .[0].effect else "N/A" end)"
     ' 2>/dev/null)
     
     if [[ -n "$k8s_node_info" ]]; then
-        local k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable
-        IFS='|' read -r k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable <<< "$k8s_node_info"
+        local k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable k8s_new_node_taint
+        IFS='|' read -r k8s_node_name k8s_ready k8s_clique k8s_gpu_present k8s_unschedulable k8s_new_node_taint <<< "$k8s_node_info"
         
         local ready_color="$GREEN"
         [[ "$k8s_ready" != "True" ]] && ready_color="$RED"
@@ -6808,13 +7874,28 @@ display_instance_details() {
             fi
         fi
         
+        # Check for newNode taint
+        local taint_info=""
+        local taint_color="$GRAY"
+        if [[ "$k8s_new_node_taint" != "N/A" && -n "$k8s_new_node_taint" ]]; then
+            taint_info="newNode:${k8s_new_node_taint}"
+            taint_color="$YELLOW"
+        fi
+        
         printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${GREEN}%-22s${NC}  ${WHITE}%-8s${NC}${ready_color}%-8s${NC}  ${WHITE}%-10s${NC}${sched_color}%-12s${NC}  ${WHITE}%-6s${NC}${CYAN}%-5s${NC}\n" \
             "Status:" "In Cluster" "Node:" "$k8s_node_name" "Ready:" "$k8s_ready" "Schedule:" "$sched_status" "Pods:" "$k8s_pod_count"
         
+        # Second line with GPU and taint info
         if [[ "$k8s_gpu_present" == "true" ]]; then
             local clique_info="N/A"
             [[ "$k8s_clique" != "N/A" ]] && clique_info="$k8s_clique"
-            printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${CYAN}%-22s${NC}\n" "GPU:" "Present" "Clique:" "$clique_info"
+            if [[ -n "$taint_info" ]]; then
+                printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${CYAN}%-22s${NC}  ${WHITE}%-8s${NC}${taint_color}%-20s${NC}\n" "GPU:" "Present" "Clique:" "$clique_info" "Taint:" "$taint_info"
+            else
+                printf "${WHITE}%-10s${NC}${GREEN}%-14s${NC}  ${WHITE}%-8s${NC}${CYAN}%-22s${NC}\n" "GPU:" "Present" "Clique:" "$clique_info"
+            fi
+        elif [[ -n "$taint_info" ]]; then
+            printf "${WHITE}%-10s${NC}${taint_color}%-30s${NC}\n" "Taint:" "$taint_info"
         fi
     else
         printf "${WHITE}%-10s${NC}${YELLOW}%-50s${NC}\n" "Status:" "Not in cluster (not joined or not found)"
@@ -11006,6 +12087,463 @@ manage_gpu_instance_tagging() {
 }
 
 #--------------------------------------------------------------------------------
+# Manage NVIDIA GPU Stack Health - Check GPU Operator & DRA per node
+#--------------------------------------------------------------------------------
+manage_nvidia_gpu_stack_health() {
+    echo ""
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                                    NVIDIA GPU STACK HEALTH CHECK                                                                      ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Check if kubectl is available
+    if ! command -v kubectl &>/dev/null; then
+        echo -e "${RED}kubectl not available - cannot check GPU stack health${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Test cluster connectivity
+    if ! kubectl cluster-info &>/dev/null; then
+        echo -e "${RED}Cannot connect to Kubernetes cluster${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    echo -e "${GRAY}Fetching node and pod information...${NC}"
+    echo ""
+    
+    # Show validation commands used
+    echo -e "${BOLD}${WHITE}═══ Validation Commands ═══${NC}"
+    echo ""
+    echo -e "${GRAY}Node & GPU info:${NC}"
+    echo -e "  ${CYAN}kubectl get nodes -o json | jq '.items[] | {name, gpu: .status.capacity[\"nvidia.com/gpu\"], taints: .spec.taints}'${NC}"
+    echo ""
+    echo -e "${GRAY}GPU Operator pods per node:${NC}"
+    echo -e "  ${CYAN}kubectl get pods -n gpu-operator -o json | jq '.items[] | {node: .spec.nodeName, name: .metadata.name, phase: .status.phase}'${NC}"
+    echo ""
+    echo -e "${GRAY}DRA Driver pods per node:${NC}"
+    echo -e "  ${CYAN}kubectl get pods -n nvidia-dra-driver-gpu -o json | jq '.items[] | {node: .spec.nodeName, name: .metadata.name, phase: .status.phase}'${NC}"
+    echo ""
+    echo -e "${GRAY}DRA Controller (deployment - runs on any node):${NC}"
+    echo -e "  ${CYAN}kubectl get pods -n nvidia-dra-driver-gpu -l app=nvidia-dra-controller -o wide${NC}"
+    echo ""
+    
+    # Get all nodes with GPU info including taints
+    local nodes_json
+    nodes_json=$(kubectl get nodes -o json 2>/dev/null)
+    
+    if [[ -z "$nodes_json" ]]; then
+        echo -e "${RED}Failed to get nodes${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Build node list with GPU detection and taints
+    local node_data
+    node_data=$(echo "$nodes_json" | jq -r '
+        .items[] | 
+        {
+            name: .metadata.name,
+            gpu_count: (.status.capacity["nvidia.com/gpu"] // "0"),
+            gpu_product: (.metadata.labels["nvidia.com/gpu.product"] // "-"),
+            ready: (.status.conditions[] | select(.type=="Ready") | .status),
+            unschedulable: (.spec.unschedulable // false),
+            taints: ((.spec.taints // []) | map(.key + "=" + (.value // "") + ":" + .effect) | join(","))
+        } | "\(.name)|\(.gpu_count)|\(.gpu_product)|\(.ready)|\(.unschedulable)|\(.taints)"
+    ' 2>/dev/null)
+    
+    # Get all pods from gpu-operator namespace
+    local gpu_op_pods
+    gpu_op_pods=$(kubectl get pods -n gpu-operator -o json 2>/dev/null | jq -r '
+        .items[] | "\(.spec.nodeName // "N/A")|\(.metadata.name)|\(.status.phase)"
+    ' 2>/dev/null)
+    
+    # Get all pods from nvidia-dra-driver-gpu namespace with ready status
+    # Format: nodeName|podName|phase|readyContainers/totalContainers
+    local dra_pods
+    dra_pods=$(kubectl get pods -n nvidia-dra-driver-gpu -o json 2>/dev/null | jq -r '
+        .items[] | 
+        ((.status.containerStatuses // []) | map(select(.ready == true)) | length) as $ready |
+        ((.status.containerStatuses // []) | length) as $total |
+        "\(.spec.nodeName // "N/A")|\(.metadata.name)|\(.status.phase)|\($ready)/\($total)"
+    ' 2>/dev/null)
+    
+    # Check if namespaces exist
+    local gpu_op_ns_exists=false
+    local dra_ns_exists=false
+    kubectl get ns gpu-operator &>/dev/null && gpu_op_ns_exists=true
+    kubectl get ns nvidia-dra-driver-gpu &>/dev/null && dra_ns_exists=true
+    
+    # Check DRA kubelet plugin status globally
+    # Look for *-k8s-dra-driver-kubelet-plugin-* pods
+    local dra_kubelet_plugin_count=0
+    local dra_kubelet_plugin_ready=0
+    local dra_kubelet_plugin_status="${GRAY}-"
+    if [[ "$dra_ns_exists" == "true" ]]; then
+        # Count kubelet-plugin pods and their ready status
+        while IFS='|' read -r node_name pod_name phase ready_status; do
+            if [[ "$pod_name" == *"k8s-dra-driver-kubelet-plugin"* ]]; then
+                ((dra_kubelet_plugin_count++))
+                if [[ "$phase" == "Running" ]]; then
+                    # Check if all containers are ready (e.g., "2/2" means ready)
+                    local ready_num total_num
+                    ready_num=$(echo "$ready_status" | cut -d'/' -f1)
+                    total_num=$(echo "$ready_status" | cut -d'/' -f2)
+                    if [[ "$ready_num" == "$total_num" && "$total_num" != "0" ]]; then
+                        ((dra_kubelet_plugin_ready++))
+                    fi
+                fi
+            fi
+        done <<< "$dra_pods"
+        
+        if [[ $dra_kubelet_plugin_count -gt 0 ]]; then
+            if [[ $dra_kubelet_plugin_ready -eq $dra_kubelet_plugin_count ]]; then
+                dra_kubelet_plugin_status="${GREEN}✓ ${dra_kubelet_plugin_ready}/${dra_kubelet_plugin_count} Ready"
+            else
+                dra_kubelet_plugin_status="${YELLOW}◐ ${dra_kubelet_plugin_ready}/${dra_kubelet_plugin_count} Ready"
+            fi
+        else
+            dra_kubelet_plugin_status="${RED}✗ No kubelet-plugin pods found"
+        fi
+    fi
+    
+    # Summary section
+    echo -e "${BOLD}${WHITE}═══ Namespace Status ═══${NC}"
+    echo ""
+    if [[ "$gpu_op_ns_exists" == "true" ]]; then
+        local gpu_op_pod_count
+        gpu_op_pod_count=$(kubectl get pods -n gpu-operator --no-headers 2>/dev/null | wc -l)
+        echo -e "  ${CYAN}gpu-operator:${NC}          ${GREEN}EXISTS${NC} (${gpu_op_pod_count} pods)"
+    else
+        echo -e "  ${CYAN}gpu-operator:${NC}          ${RED}NOT FOUND${NC}"
+    fi
+    
+    if [[ "$dra_ns_exists" == "true" ]]; then
+        local dra_pod_count
+        dra_pod_count=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | wc -l)
+        echo -e "  ${CYAN}nvidia-dra-driver-gpu:${NC} ${GREEN}EXISTS${NC} (${dra_pod_count} pods)"
+        echo -e "  ${CYAN}DRA Kubelet Plugin:${NC}    ${dra_kubelet_plugin_status}${NC}"
+    else
+        echo -e "  ${CYAN}nvidia-dra-driver-gpu:${NC} ${RED}NOT FOUND${NC}"
+    fi
+    echo ""
+    
+    # Build header for component matrix
+    echo -e "${BOLD}${WHITE}═══ Per-Node Component Status (GPU Nodes Only) ═══${NC}"
+    echo ""
+    echo -e "${GRAY}Components: driver=NVIDIA Driver | toolkit=Container Toolkit | plugin=Device Plugin | gfd=GPU Feature Discovery${NC}"
+    echo -e "${GRAY}            dcgm=DCGM Exporter | validator=Operator Validator | mig-mgr=MIG Manager | dra-drv=DRA Kubelet Plugin (*-k8s-dra-driver-kubelet-plugin-*)${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-28s %-5s %-6s %-20s %-7s %-7s %-7s %-5s %-5s %-9s %-8s %-8s %-80s${NC}\n" \
+        "#" "Node Name" "GPUs" "Ready" "GPU Product" "driver" "toolkit" "plugin" "gfd" "dcgm" "validator" "mig-mgr" "dra-drv" "Taints"
+    print_separator 245
+    
+    # Process each node - only GPU nodes
+    local node_idx=0
+    declare -A NODE_INDEX_MAP
+    local total_nodes=0
+    local gpu_nodes=0
+    local healthy_nodes=0
+    
+    while IFS='|' read -r node_name gpu_count gpu_product ready unschedulable taints; do
+        [[ -z "$node_name" ]] && continue
+        ((total_nodes++))
+        
+        # Skip non-GPU nodes
+        [[ "$gpu_count" == "0" || -z "$gpu_count" ]] && continue
+        
+        ((gpu_nodes++))
+        ((node_idx++))
+        NODE_INDEX_MAP[$node_idx]="$node_name"
+        
+        # Truncate fields
+        local node_trunc="${node_name:0:28}"
+        local product_trunc="${gpu_product:0:20}"
+        
+        # Process taints for display
+        local taints_display="-"
+        local taints_color="$GRAY"
+        if [[ -n "$taints" && "$taints" != "null" ]]; then
+            # Shorten common taint patterns
+            taints_display=$(echo "$taints" | sed 's/nvidia.com\/gpu=:NoSchedule/gpu:NoSched/g' \
+                | sed 's/node.kubernetes.io\/unschedulable:NoSchedule/unschedulable/g' \
+                | sed 's/oci.oraclecloud.com\/oke-new-node:NoSchedule/newNode/g' \
+                | sed 's/:NoSchedule/:NoSch/g' \
+                | sed 's/:NoExecute/:NoEx/g' \
+                | sed 's/:PreferNoSchedule/:PrefNo/g')
+            taints_display="${taints_display:0:80}"
+            taints_color="$YELLOW"
+        fi
+        
+        # Ready status color
+        local ready_color="$GREEN"
+        [[ "$ready" != "True" ]] && ready_color="$RED"
+        
+        # GPU count color
+        local gpu_color="$CYAN"
+        
+        # Check each GPU Operator component
+        local driver_status="$GRAY-"
+        local toolkit_status="$GRAY-"
+        local plugin_status="$GRAY-"
+        local gfd_status="$GRAY-"
+        local dcgm_status="$GRAY-"
+        local validator_status="$GRAY-"
+        local mig_status="$GRAY-"
+        
+        if [[ "$gpu_op_ns_exists" == "true" ]]; then
+            # Check driver
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*nvidia-driver.*|Running"; then
+                driver_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*nvidia-driver"; then
+                driver_status="${YELLOW}◐"
+            else
+                driver_status="${RED}✗"
+            fi
+            
+            # Check toolkit
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*container-toolkit.*|Running"; then
+                toolkit_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*container-toolkit"; then
+                toolkit_status="${YELLOW}◐"
+            else
+                toolkit_status="${RED}✗"
+            fi
+            
+            # Check device plugin
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*device-plugin.*|Running"; then
+                plugin_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*device-plugin"; then
+                plugin_status="${YELLOW}◐"
+            else
+                plugin_status="${RED}✗"
+            fi
+            
+            # Check GPU feature discovery
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*feature-discovery.*|Running"; then
+                gfd_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*feature-discovery"; then
+                gfd_status="${YELLOW}◐"
+            else
+                gfd_status="${RED}✗"
+            fi
+            
+            # Check DCGM exporter
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*dcgm.*|Running"; then
+                dcgm_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*dcgm"; then
+                dcgm_status="${YELLOW}◐"
+            else
+                dcgm_status="${RED}✗"
+            fi
+            
+            # Check validator
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator.*|Running"; then
+                validator_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator.*|Succeeded"; then
+                validator_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator"; then
+                validator_status="${YELLOW}◐"
+            else
+                validator_status="${RED}✗"
+            fi
+            
+            # Check MIG manager (optional)
+            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*mig-manager.*|Running"; then
+                mig_status="${GREEN}✓"
+            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*mig-manager"; then
+                mig_status="${YELLOW}◐"
+            else
+                mig_status="${GRAY}-"  # MIG manager is optional
+            fi
+        fi
+        
+        # Check DRA kubelet-plugin (per-node daemonset)
+        # Look for *-k8s-dra-driver-kubelet-plugin-* pods and verify they're Ready
+        local dra_drv_status="$GRAY-"
+        
+        if [[ "$dra_ns_exists" == "true" ]]; then
+            # Find kubelet-plugin pod for this node
+            local node_dra_pod
+            node_dra_pod=$(echo "$dra_pods" | grep "^${node_name}|.*k8s-dra-driver-kubelet-plugin")
+            
+            if [[ -n "$node_dra_pod" ]]; then
+                local dra_phase dra_ready_status dra_ready_num dra_total_num
+                dra_phase=$(echo "$node_dra_pod" | cut -d'|' -f3)
+                dra_ready_status=$(echo "$node_dra_pod" | cut -d'|' -f4)
+                dra_ready_num=$(echo "$dra_ready_status" | cut -d'/' -f1)
+                dra_total_num=$(echo "$dra_ready_status" | cut -d'/' -f2)
+                
+                if [[ "$dra_phase" == "Running" && "$dra_ready_num" == "$dra_total_num" && "$dra_total_num" != "0" ]]; then
+                    dra_drv_status="${GREEN}✓"
+                elif [[ "$dra_phase" == "Running" ]]; then
+                    dra_drv_status="${YELLOW}◐"  # Running but not all containers ready
+                else
+                    dra_drv_status="${YELLOW}◐"  # Not running (Pending, etc.)
+                fi
+            else
+                dra_drv_status="${RED}✗"  # No kubelet-plugin pod found on this node
+            fi
+        fi
+        
+        # Check if node is healthy (all required components running for GPU node)
+        local node_healthy=true
+        if [[ "$gpu_op_ns_exists" == "true" ]]; then
+            [[ "$driver_status" != "${GREEN}✓" ]] && node_healthy=false
+            [[ "$toolkit_status" != "${GREEN}✓" ]] && node_healthy=false
+            [[ "$plugin_status" != "${GREEN}✓" ]] && node_healthy=false
+        fi
+        [[ "$node_healthy" == "true" ]] && ((healthy_nodes++))
+        
+        # Print row
+        printf "${YELLOW}%-3s${NC} %-28s ${gpu_color}%-5s${NC} ${ready_color}%-6s${NC} %-20s ${driver_status}%-6s${NC} ${toolkit_status}%-6s${NC} ${plugin_status}%-6s${NC} ${gfd_status}%-4s${NC} ${dcgm_status}%-4s${NC} ${validator_status}%-8s${NC} ${mig_status}%-7s${NC} ${dra_drv_status}%-7s${NC} ${taints_color}%-80s${NC}\n" \
+            "$node_idx" "$node_trunc" "$gpu_count" "$ready" "$product_trunc" "" "" "" "" "" "" "" "" "$taints_display"
+            
+    done <<< "$node_data"
+    
+    if [[ $gpu_nodes -eq 0 ]]; then
+        echo -e "  ${YELLOW}No GPU nodes found in the cluster${NC}"
+    fi
+    
+    echo ""
+    print_separator 245
+    
+    # Summary
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Summary ═══${NC}"
+    echo ""
+    echo -e "  ${WHITE}Total Nodes:${NC}   $total_nodes"
+    echo -e "  ${WHITE}GPU Nodes:${NC}     $gpu_nodes"
+    if [[ $gpu_nodes -gt 0 ]]; then
+        if [[ $healthy_nodes -eq $gpu_nodes ]]; then
+            echo -e "  ${WHITE}Healthy:${NC}       ${GREEN}$healthy_nodes / $gpu_nodes${NC} ${GREEN}✓ All GPU nodes healthy${NC}"
+        else
+            echo -e "  ${WHITE}Healthy:${NC}       ${YELLOW}$healthy_nodes / $gpu_nodes${NC} ${RED}⚠ Some nodes have issues${NC}"
+        fi
+    fi
+    echo ""
+    
+    # Legend
+    echo -e "${BOLD}${WHITE}Legend:${NC}"
+    echo -e "  ${GREEN}✓${NC} = Running & Ready    ${YELLOW}◐${NC} = Running but Not Ready / Pending    ${RED}✗${NC} = Missing/Failed    ${GRAY}-${NC} = N/A or Optional"
+    echo ""
+    echo -e "${BOLD}${WHITE}DRA Check:${NC}"
+    echo -e "  dra-drv checks for ${WHITE}*-k8s-dra-driver-kubelet-plugin-*${NC} pod on each node"
+    echo -e "  ${GREEN}✓${NC} = Pod Running AND all containers Ready (e.g., 2/2)"
+    echo -e "  ${YELLOW}◐${NC} = Pod exists but not all containers Ready"
+    echo -e "  ${RED}✗${NC} = No kubelet-plugin pod found on this node"
+    echo ""
+    echo -e "${BOLD}${WHITE}Common Taints:${NC}"
+    echo -e "  ${YELLOW}newNode${NC} = oci.oraclecloud.com/oke-new-node:NoSchedule (node initializing)"
+    echo -e "  ${YELLOW}gpu:NoSch${NC} = nvidia.com/gpu:NoSchedule (GPU dedicated)"
+    echo -e "  ${YELLOW}unschedulable${NC} = node.kubernetes.io/unschedulable:NoSchedule (cordoned)"
+    echo ""
+    
+    # Interactive menu
+    while true; do
+        echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
+        echo -e "  Enter ${YELLOW}#${NC} (e.g., 1) to view detailed pod status for a node"
+        echo -e "  Enter ${YELLOW}pods${NC} to list all GPU-related pods"
+        echo -e "  Enter ${YELLOW}dra${NC} to list DRA kubelet-plugin pods with READY status"
+        echo -e "  Enter ${YELLOW}events${NC} to show recent events from GPU namespaces"
+        echo -e "  Enter ${YELLOW}refresh${NC} to refresh the status"
+        echo -e "  Enter ${YELLOW}b${NC} to go back"
+        echo ""
+        echo -n -e "${CYAN}Selection: ${NC}"
+        read -r selection
+        
+        case "$selection" in
+            [0-9]*)
+                local selected_node="${NODE_INDEX_MAP[$selection]:-}"
+                if [[ -z "$selected_node" ]]; then
+                    echo -e "${RED}Invalid node number: $selection${NC}"
+                    continue
+                fi
+                
+                echo ""
+                echo -e "${BOLD}${CYAN}═══ Pod Details for Node: ${WHITE}${selected_node}${NC} ${BOLD}${CYAN}═══${NC}"
+                echo ""
+                
+                # Show node taints
+                echo -e "${BOLD}${WHITE}Node Taints:${NC}"
+                kubectl get node "$selected_node" -o json 2>/dev/null | jq -r '
+                    .spec.taints // [] | if length == 0 then "  (none)" else .[] | "  \(.key)=\(.value // ""):\(.effect)" end
+                ' 2>/dev/null || echo -e "${GRAY}  Unable to fetch taints${NC}"
+                echo ""
+                
+                echo -e "${BOLD}${WHITE}GPU Operator Pods (gpu-operator namespace):${NC}"
+                kubectl get pods -n gpu-operator -o wide --field-selector spec.nodeName="$selected_node" 2>/dev/null || echo -e "${GRAY}  No pods found${NC}"
+                echo ""
+                
+                echo -e "${BOLD}${WHITE}DRA Pods (nvidia-dra-driver-gpu namespace):${NC}"
+                kubectl get pods -n nvidia-dra-driver-gpu -o wide --field-selector spec.nodeName="$selected_node" 2>/dev/null || echo -e "${GRAY}  No pods found${NC}"
+                echo ""
+                
+                # Show node labels related to NVIDIA
+                echo -e "${BOLD}${WHITE}NVIDIA Node Labels:${NC}"
+                kubectl get node "$selected_node" -o json 2>/dev/null | jq -r '
+                    .metadata.labels | to_entries[] | 
+                    select(.key | startswith("nvidia.com") or startswith("feature.node.kubernetes.io/pci-10de")) |
+                    "  \(.key) = \(.value)"
+                ' 2>/dev/null || echo -e "${GRAY}  No NVIDIA labels found${NC}"
+                echo ""
+                ;;
+            pods|PODS)
+                echo ""
+                echo -e "${BOLD}${WHITE}═══ All GPU Operator Pods ═══${NC}"
+                kubectl get pods -n gpu-operator -o wide 2>/dev/null || echo -e "${GRAY}Namespace not found${NC}"
+                echo ""
+                echo -e "${BOLD}${WHITE}═══ All DRA Pods ═══${NC}"
+                kubectl get pods -n nvidia-dra-driver-gpu -o wide 2>/dev/null || echo -e "${GRAY}Namespace not found${NC}"
+                echo ""
+                ;;
+            dra|DRA)
+                echo ""
+                echo -e "${BOLD}${WHITE}═══ DRA Kubelet Plugin Pods (*-k8s-dra-driver-kubelet-plugin-*) ═══${NC}"
+                echo ""
+                # Show kubelet-plugin pods with their ready status
+                kubectl get pods -n nvidia-dra-driver-gpu -o wide 2>/dev/null | grep -E "NAME|k8s-dra-driver-kubelet-plugin" || echo -e "${GRAY}No kubelet-plugin pods found${NC}"
+                echo ""
+                # Also show summary
+                local total_plugin_pods ready_plugin_pods
+                total_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep -c "k8s-dra-driver-kubelet-plugin" || echo "0")
+                ready_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep "k8s-dra-driver-kubelet-plugin" | grep -c "Running" || echo "0")
+                echo -e "${WHITE}Summary: ${CYAN}${ready_plugin_pods}${NC}/${CYAN}${total_plugin_pods}${NC} kubelet-plugin pods running${NC}"
+                echo ""
+                ;;
+            events|EVENTS)
+                echo ""
+                echo -e "${BOLD}${WHITE}═══ Recent Events (gpu-operator) ═══${NC}"
+                kubectl get events -n gpu-operator --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo -e "${GRAY}No events${NC}"
+                echo ""
+                echo -e "${BOLD}${WHITE}═══ Recent Events (nvidia-dra-driver-gpu) ═══${NC}"
+                kubectl get events -n nvidia-dra-driver-gpu --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo -e "${GRAY}No events${NC}"
+                echo ""
+                ;;
+            refresh|REFRESH)
+                manage_nvidia_gpu_stack_health
+                return
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Unknown command${NC}"
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
 # Create GPU Tagging Namespace and Tag
 #--------------------------------------------------------------------------------
 create_gpu_tagging_namespace() {
@@ -12326,7 +13864,8 @@ delete_instance_configuration_interactive() {
 show_help() {
     echo -e "${BOLD}Usage:${NC} $0 [OPTIONS] [instance-ocid] [OPTIONS]"
     echo ""
-    echo "If no instance-ocid is provided, lists all GPU instances in the compartment with fabric details"
+    echo "If no instance-ocid is provided, lists all instances in the compartment with fabric details"
+    echo "(Use INSTANCE_FILTER in variables.sh to filter: all, gpu, or non-gpu)"
     echo ""
     echo -e "${BOLD}Global Options:${NC}"
     echo "  --compartment-id <ocid>   Override compartment ID from variables.sh"
@@ -12341,6 +13880,8 @@ show_help() {
     echo "  --details          Show full instance details including network, boot volume, block volumes"
     echo "  --console-history  Capture and display console history for the instance"
     echo "                     Useful for debugging instances that fail to join Kubernetes"
+    echo "  --get-user-data    Extract and display the decoded cloud-init user-data from the instance"
+    echo "                     Useful for reviewing or backing up cloud-init configurations"
     echo ""
     echo -e "${BOLD}Clique Analysis:${NC}"
     echo "  --list-cliques      List all unique cliques with nodes grouped by GPU memory cluster and fabric"
@@ -12353,9 +13894,9 @@ show_help() {
     echo "    List all instances in a specific GPU memory cluster with fabric details"
     echo ""
     echo -e "${BOLD}Instance Configuration:${NC}"
-    echo "  --get-user-data <instance-config-ocid>"
+    echo "  --get-user-data-config <instance-config-ocid>"
     echo "    Extract and display the decoded cloud-init user-data from an instance configuration"
-    echo "    Useful for reviewing or backing up cloud-init configurations"
+    echo "    Useful for reviewing instance configuration cloud-init templates"
     echo ""
     echo -e "${BOLD}Resource Management:${NC}"
     echo "  --manage            Interactive resource management mode"
@@ -12364,12 +13905,19 @@ show_help() {
     echo "                      - GPU Memory Fabrics & Clusters (create, update, view)"
     echo "                      - Compute Instances (view details, IPs, volumes)"
     echo "                      - Instance Configurations (create, view, compare, delete)"
+    echo "                      - Compute Clusters (create, view, delete)"
+    echo "                      - GPU Instance Tagging (namespace and tags)"
+    echo "                      - NVIDIA GPU Stack Health (GPU Operator & DRA per node)"
     echo ""
     echo -e "${BOLD}Setup & Maintenance:${NC}"
     echo "  --setup             Run initial setup to create/update variables.sh"
     echo "                      Auto-detects environment from IMDS and allows resource selection"
     echo "  --refresh           Clear all cached data to force fresh fetch from OCI"
     echo "                      Useful after infrastructure changes or stale data"
+    echo "  --maintenance       Show instances requiring maintenance attention"
+    echo "                      Lists instances with DEGRADED capacity topology or active announcements"
+    echo "  --announcements     Show all announcements with affected resource details"
+    echo "                      Validates if affected instances still exist in OCI"
     echo ""
     echo -e "${BOLD}Interactive Features:${NC}"
     echo "  When listing GPU instances, if instances not in kubernetes (running in OCI but not in K8s)"
@@ -12377,8 +13925,10 @@ show_help() {
     echo "  This helps diagnose why an instance failed to join the Kubernetes cluster."
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  $0                                                    # List all GPU instances with fabric info"
+    echo "  $0                                                    # List all instances with fabric info"
     echo "  $0 --refresh                                          # Clear cache and force fresh data"
+    echo "  $0 --maintenance                                      # Show instances needing maintenance"
+    echo "  $0 --announcements                                    # Show all announcements with resources"
     echo "  $0 --compartment-id ocid1.compartment.oc1..xxx        # Use different compartment"
     echo "  $0 --region us-ashburn-1                              # Use different region"
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
@@ -12393,9 +13943,9 @@ show_help() {
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --all           # Show everything"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --details       # Full details (network, volumes)"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --console-history  # View console history"
+    echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx --get-user-data    # Extract cloud-init from instance"
     echo "  $0 --list-cluster ocid1.xxx                           # List cluster instances + fabric"
-    echo "  $0 --get-user-data ocid1.instanceconfig.oc1.xxx       # Extract cloud-init from config"
-    echo "  $0 --get-user-data ocid1.instanceconfig.oc1.xxx > cloud-init.yml  # Save to file"
+    echo "  $0 --get-user-data-config ocid1.instanceconfig.xxx    # Extract cloud-init from instance config"
 }
 
 #===============================================================================
@@ -12839,7 +14389,7 @@ GPU_MEMORY_CLUSTER_SIZE=18
 # gpu     = Only show GPU instances (BM.GPU.*)
 # non-gpu = Only show non-GPU instances
 # all     = Show all instances
-INSTANCE_FILTER="gpu"
+INSTANCE_FILTER="all"
 EOF
 
     chmod +x "$output_file"
@@ -12986,16 +14536,22 @@ main() {
             fi
             list_instances_by_gpu_cluster "$2" "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
             ;;
-        --get-user-data)
+        --get-user-data-config)
             if [[ -z "${2:-}" ]]; then
                 log_error "Instance configuration OCID required"
-                echo "Usage: $0 --get-user-data <instance-config-ocid>"
+                echo "Usage: $0 --get-user-data-config <instance-config-ocid>"
                 exit 1
             fi
             get_instance_config_user_data "$2"
             ;;
         --manage)
             interactive_management_main_menu
+            ;;
+        --maintenance)
+            list_maintenance_instances "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
+            ;;
+        --announcements)
+            list_all_announcements "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
             ;;
         --refresh)
             refresh_all_caches
@@ -13011,6 +14567,7 @@ main() {
             local count_clique="false"
             local show_console_history="false"
             local show_instance_details="false"
+            local show_user_data="false"
             
             shift
             while [[ $# -gt 0 ]]; do
@@ -13042,6 +14599,10 @@ main() {
                         show_instance_details="true"
                         shift
                         ;;
+                    --get-user-data)
+                        show_user_data="true"
+                        shift
+                        ;;
                     *)
                         log_error "Unknown option: $1"
                         exit 1
@@ -13049,7 +14610,9 @@ main() {
                 esac
             done
             
-            if [[ "$show_console_history" == "true" ]]; then
+            if [[ "$show_user_data" == "true" ]]; then
+                get_instance_user_data "$instance_id"
+            elif [[ "$show_console_history" == "true" ]]; then
                 get_console_history "$instance_id"
             elif [[ "$show_instance_details" == "true" ]]; then
                 # Loop to handle refresh requests
