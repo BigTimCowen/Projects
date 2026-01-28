@@ -12159,10 +12159,14 @@ manage_nvidia_gpu_stack_health() {
         } | "\(.name)|\(.gpu_count)|\(.gpu_product)|\(.ready)|\(.unschedulable)|\(.taints)"
     ' 2>/dev/null)
     
-    # Get all pods from gpu-operator namespace
+    # Get all pods from gpu-operator namespace with ready status
+    # Format: nodeName|podName|phase|readyContainers/totalContainers
     local gpu_op_pods
     gpu_op_pods=$(kubectl get pods -n gpu-operator -o json 2>/dev/null | jq -r '
-        .items[] | "\(.spec.nodeName // "N/A")|\(.metadata.name)|\(.status.phase)"
+        .items[] | 
+        ((.status.containerStatuses // []) | map(select(.ready == true)) | length) as $ready |
+        ((.status.containerStatuses // []) | length) as $total |
+        "\(.spec.nodeName // "N/A")|\(.metadata.name)|\(.status.phase)|\($ready)/\($total)"
     ' 2>/dev/null)
     
     # Get all pods from nvidia-dra-driver-gpu namespace with ready status
@@ -12182,14 +12186,14 @@ manage_nvidia_gpu_stack_health() {
     kubectl get ns nvidia-dra-driver-gpu &>/dev/null && dra_ns_exists=true
     
     # Check DRA kubelet plugin status globally
-    # Look for *-k8s-dra-driver-kubelet-plugin-* pods
+    # Pattern matches: nvidia-dra-driver-gpu-kubelet-plugin-* or *-k8s-dra-driver-kubelet-plugin-*
     local dra_kubelet_plugin_count=0
     local dra_kubelet_plugin_ready=0
     local dra_kubelet_plugin_status="${GRAY}-"
     if [[ "$dra_ns_exists" == "true" ]]; then
-        # Count kubelet-plugin pods and their ready status
+        # Count kubelet-plugin pods and their ready status (flexible pattern)
         while IFS='|' read -r node_name pod_name phase ready_status; do
-            if [[ "$pod_name" == *"k8s-dra-driver-kubelet-plugin"* ]]; then
+            if [[ "$pod_name" == *"kubelet-plugin"* ]]; then
                 ((dra_kubelet_plugin_count++))
                 if [[ "$phase" == "Running" ]]; then
                     # Check if all containers are ready (e.g., "2/2" means ready)
@@ -12219,15 +12223,26 @@ manage_nvidia_gpu_stack_health() {
     echo ""
     if [[ "$gpu_op_ns_exists" == "true" ]]; then
         local gpu_op_pod_count
-        gpu_op_pod_count=$(kubectl get pods -n gpu-operator --no-headers 2>/dev/null | wc -l)
+        gpu_op_pod_count=$(kubectl get pods -n gpu-operator --no-headers 2>/dev/null | wc -l | tr -d ' ')
         echo -e "  ${CYAN}gpu-operator:${NC}          ${GREEN}EXISTS${NC} (${gpu_op_pod_count} pods)"
+        
+        # Check if using host drivers (no nvidia-driver pods)
+        local driver_pod_count
+        driver_pod_count=$(kubectl get pods -n gpu-operator --no-headers 2>/dev/null | grep -c "nvidia-driver" 2>/dev/null || true)
+        driver_pod_count=${driver_pod_count:-0}
+        driver_pod_count=$(echo "$driver_pod_count" | tr -d '[:space:]')
+        if [[ -z "$driver_pod_count" || "$driver_pod_count" == "0" ]]; then
+            echo -e "  ${CYAN}Driver Mode:${NC}           ${GRAY}HOST${NC} (driver.enabled: false - using pre-installed drivers)"
+        else
+            echo -e "  ${CYAN}Driver Mode:${NC}           ${GREEN}OPERATOR${NC} (${driver_pod_count} nvidia-driver pods)"
+        fi
     else
         echo -e "  ${CYAN}gpu-operator:${NC}          ${RED}NOT FOUND${NC}"
     fi
     
     if [[ "$dra_ns_exists" == "true" ]]; then
         local dra_pod_count
-        dra_pod_count=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | wc -l)
+        dra_pod_count=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | wc -l | tr -d ' ')
         echo -e "  ${CYAN}nvidia-dra-driver-gpu:${NC} ${GREEN}EXISTS${NC} (${dra_pod_count} pods)"
         echo -e "  ${CYAN}DRA Kubelet Plugin:${NC}    ${dra_kubelet_plugin_status}${NC}"
     else
@@ -12238,8 +12253,9 @@ manage_nvidia_gpu_stack_health() {
     # Build header for component matrix
     echo -e "${BOLD}${WHITE}═══ Per-Node Component Status (GPU Nodes Only) ═══${NC}"
     echo ""
-    echo -e "${GRAY}Components: driver=NVIDIA Driver | toolkit=Container Toolkit | plugin=Device Plugin | gfd=GPU Feature Discovery${NC}"
-    echo -e "${GRAY}            dcgm=DCGM Exporter | validator=Operator Validator | mig-mgr=MIG Manager | dra-drv=DRA Kubelet Plugin (*-k8s-dra-driver-kubelet-plugin-*)${NC}"
+    echo -e "${GRAY}Components: driver=NVIDIA Driver (or 'host' if using pre-installed drivers) | toolkit=Container Toolkit | plugin=Device Plugin${NC}"
+    echo -e "${GRAY}            gfd=GPU Feature Discovery | dcgm=DCGM Exporter | validator=Operator Validator | mig-mgr=MIG Manager${NC}"
+    echo -e "${GRAY}            dra-drv=DRA Kubelet Plugin (*kubelet-plugin* pods in nvidia-dra-driver-gpu namespace)${NC}"
     echo ""
     
     # Print header
@@ -12291,90 +12307,104 @@ manage_nvidia_gpu_stack_health() {
         # GPU count color
         local gpu_color="$CYAN"
         
-        # Check each GPU Operator component
-        local driver_status="$GRAY-"
-        local toolkit_status="$GRAY-"
-        local plugin_status="$GRAY-"
-        local gfd_status="$GRAY-"
-        local dcgm_status="$GRAY-"
-        local validator_status="$GRAY-"
-        local mig_status="$GRAY-"
+        # Helper function to get component status from pod list
+        # Returns: "color|value" (e.g., "GREEN|1/1" or "RED|-")
+        _get_pod_status() {
+            local pods="$1"
+            local node="$2"
+            local pattern="$3"
+            local optional="$4"  # "optional" if component is optional
+            
+            local pod_line
+            pod_line=$(echo "$pods" | grep "^${node}|.*${pattern}" | head -1)
+            
+            if [[ -n "$pod_line" ]]; then
+                local phase ready_status ready_num total_num
+                phase=$(echo "$pod_line" | cut -d'|' -f3)
+                ready_status=$(echo "$pod_line" | cut -d'|' -f4)
+                ready_num=$(echo "$ready_status" | cut -d'/' -f1)
+                total_num=$(echo "$ready_status" | cut -d'/' -f2)
+                
+                if [[ "$phase" == "Running" && "$ready_num" == "$total_num" && "$total_num" != "0" ]]; then
+                    echo "GREEN|${ready_status}"
+                elif [[ "$phase" == "Running" ]]; then
+                    echo "YELLOW|${ready_status}"
+                elif [[ "$phase" == "Succeeded" ]]; then
+                    echo "GREEN|done"
+                else
+                    echo "YELLOW|${phase:0:4}"
+                fi
+            else
+                if [[ "$optional" == "optional" ]]; then
+                    echo "GRAY|-"
+                else
+                    echo "RED|-"
+                fi
+            fi
+        }
+        
+        # Check each GPU Operator component - store color and value separately
+        local driver_color="GRAY" driver_val="-"
+        local toolkit_color="GRAY" toolkit_val="-"
+        local plugin_color="GRAY" plugin_val="-"
+        local gfd_color="GRAY" gfd_val="-"
+        local dcgm_color="GRAY" dcgm_val="-"
+        local validator_color="GRAY" validator_val="-"
+        local mig_color="GRAY" mig_val="-"
         
         if [[ "$gpu_op_ns_exists" == "true" ]]; then
-            # Check driver
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*nvidia-driver.*|Running"; then
-                driver_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*nvidia-driver"; then
-                driver_status="${YELLOW}◐"
+            # Check driver - handle host driver mode
+            local driver_pod
+            driver_pod=$(echo "$gpu_op_pods" | grep "^${node_name}|.*nvidia-driver" | head -1)
+            if [[ -n "$driver_pod" ]]; then
+                local d_phase d_ready d_rnum d_tnum
+                d_phase=$(echo "$driver_pod" | cut -d'|' -f3)
+                d_ready=$(echo "$driver_pod" | cut -d'|' -f4)
+                d_rnum=$(echo "$d_ready" | cut -d'/' -f1)
+                d_tnum=$(echo "$d_ready" | cut -d'/' -f2)
+                if [[ "$d_phase" == "Running" && "$d_rnum" == "$d_tnum" && "$d_tnum" != "0" ]]; then
+                    driver_color="GREEN"; driver_val="$d_ready"
+                elif [[ "$d_phase" == "Running" ]]; then
+                    driver_color="YELLOW"; driver_val="$d_ready"
+                else
+                    driver_color="YELLOW"; driver_val="${d_phase:0:4}"
+                fi
             else
-                driver_status="${RED}✗"
+                # Check if any driver pods exist cluster-wide
+                if echo "$gpu_op_pods" | grep -q "nvidia-driver"; then
+                    driver_color="RED"; driver_val="-"
+                else
+                    driver_color="GRAY"; driver_val="host"
+                fi
             fi
             
-            # Check toolkit
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*container-toolkit.*|Running"; then
-                toolkit_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*container-toolkit"; then
-                toolkit_status="${YELLOW}◐"
-            else
-                toolkit_status="${RED}✗"
-            fi
+            # Check other components using helper
+            local result
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "container-toolkit")
+            toolkit_color="${result%%|*}"; toolkit_val="${result#*|}"
             
-            # Check device plugin
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*device-plugin.*|Running"; then
-                plugin_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*device-plugin"; then
-                plugin_status="${YELLOW}◐"
-            else
-                plugin_status="${RED}✗"
-            fi
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "device-plugin")
+            plugin_color="${result%%|*}"; plugin_val="${result#*|}"
             
-            # Check GPU feature discovery
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*feature-discovery.*|Running"; then
-                gfd_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*feature-discovery"; then
-                gfd_status="${YELLOW}◐"
-            else
-                gfd_status="${RED}✗"
-            fi
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "feature-discovery")
+            gfd_color="${result%%|*}"; gfd_val="${result#*|}"
             
-            # Check DCGM exporter
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*dcgm.*|Running"; then
-                dcgm_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*dcgm"; then
-                dcgm_status="${YELLOW}◐"
-            else
-                dcgm_status="${RED}✗"
-            fi
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "dcgm")
+            dcgm_color="${result%%|*}"; dcgm_val="${result#*|}"
             
-            # Check validator
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator.*|Running"; then
-                validator_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator.*|Succeeded"; then
-                validator_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*validator"; then
-                validator_status="${YELLOW}◐"
-            else
-                validator_status="${RED}✗"
-            fi
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "validator")
+            validator_color="${result%%|*}"; validator_val="${result#*|}"
             
-            # Check MIG manager (optional)
-            if echo "$gpu_op_pods" | grep -q "^${node_name}|.*mig-manager.*|Running"; then
-                mig_status="${GREEN}✓"
-            elif echo "$gpu_op_pods" | grep -q "^${node_name}|.*mig-manager"; then
-                mig_status="${YELLOW}◐"
-            else
-                mig_status="${GRAY}-"  # MIG manager is optional
-            fi
+            result=$(_get_pod_status "$gpu_op_pods" "$node_name" "mig-manager" "optional")
+            mig_color="${result%%|*}"; mig_val="${result#*|}"
         fi
         
         # Check DRA kubelet-plugin (per-node daemonset)
-        # Look for *-k8s-dra-driver-kubelet-plugin-* pods and verify they're Ready
-        local dra_drv_status="$GRAY-"
+        local dra_color="GRAY" dra_val="-"
         
         if [[ "$dra_ns_exists" == "true" ]]; then
-            # Find kubelet-plugin pod for this node
             local node_dra_pod
-            node_dra_pod=$(echo "$dra_pods" | grep "^${node_name}|.*k8s-dra-driver-kubelet-plugin")
+            node_dra_pod=$(echo "$dra_pods" | grep "^${node_name}|.*kubelet-plugin" | head -1)
             
             if [[ -n "$node_dra_pod" ]]; then
                 local dra_phase dra_ready_status dra_ready_num dra_total_num
@@ -12384,29 +12414,41 @@ manage_nvidia_gpu_stack_health() {
                 dra_total_num=$(echo "$dra_ready_status" | cut -d'/' -f2)
                 
                 if [[ "$dra_phase" == "Running" && "$dra_ready_num" == "$dra_total_num" && "$dra_total_num" != "0" ]]; then
-                    dra_drv_status="${GREEN}✓"
+                    dra_color="GREEN"; dra_val="$dra_ready_status"
                 elif [[ "$dra_phase" == "Running" ]]; then
-                    dra_drv_status="${YELLOW}◐"  # Running but not all containers ready
+                    dra_color="YELLOW"; dra_val="$dra_ready_status"
                 else
-                    dra_drv_status="${YELLOW}◐"  # Not running (Pending, etc.)
+                    dra_color="YELLOW"; dra_val="${dra_phase:0:4}"
                 fi
             else
-                dra_drv_status="${RED}✗"  # No kubelet-plugin pod found on this node
+                dra_color="RED"; dra_val="-"
             fi
         fi
         
         # Check if node is healthy (all required components running for GPU node)
         local node_healthy=true
         if [[ "$gpu_op_ns_exists" == "true" ]]; then
-            [[ "$driver_status" != "${GREEN}✓" ]] && node_healthy=false
-            [[ "$toolkit_status" != "${GREEN}✓" ]] && node_healthy=false
-            [[ "$plugin_status" != "${GREEN}✓" ]] && node_healthy=false
+            # Driver: either has green status or using host drivers is acceptable
+            [[ "$driver_color" != "GREEN" && "$driver_val" != "host" ]] && node_healthy=false
+            [[ "$toolkit_color" != "GREEN" ]] && node_healthy=false
+            [[ "$plugin_color" != "GREEN" ]] && node_healthy=false
         fi
         [[ "$node_healthy" == "true" ]] && ((healthy_nodes++))
         
-        # Print row
-        printf "${YELLOW}%-3s${NC} %-28s ${gpu_color}%-5s${NC} ${ready_color}%-6s${NC} %-20s ${driver_status}%-6s${NC} ${toolkit_status}%-6s${NC} ${plugin_status}%-6s${NC} ${gfd_status}%-4s${NC} ${dcgm_status}%-4s${NC} ${validator_status}%-8s${NC} ${mig_status}%-7s${NC} ${dra_drv_status}%-7s${NC} ${taints_color}%-80s${NC}\n" \
-            "$node_idx" "$node_trunc" "$gpu_count" "$ready" "$product_trunc" "" "" "" "" "" "" "" "" "$taints_display"
+        # Convert color names to actual codes
+        local dc tc pc gc dcc vc mc drac
+        case "$driver_color" in GREEN) dc="$GREEN";; YELLOW) dc="$YELLOW";; RED) dc="$RED";; *) dc="$GRAY";; esac
+        case "$toolkit_color" in GREEN) tc="$GREEN";; YELLOW) tc="$YELLOW";; RED) tc="$RED";; *) tc="$GRAY";; esac
+        case "$plugin_color" in GREEN) pc="$GREEN";; YELLOW) pc="$YELLOW";; RED) pc="$RED";; *) pc="$GRAY";; esac
+        case "$gfd_color" in GREEN) gc="$GREEN";; YELLOW) gc="$YELLOW";; RED) gc="$RED";; *) gc="$GRAY";; esac
+        case "$dcgm_color" in GREEN) dcc="$GREEN";; YELLOW) dcc="$YELLOW";; RED) dcc="$RED";; *) dcc="$GRAY";; esac
+        case "$validator_color" in GREEN) vc="$GREEN";; YELLOW) vc="$YELLOW";; RED) vc="$RED";; *) vc="$GRAY";; esac
+        case "$mig_color" in GREEN) mc="$GREEN";; YELLOW) mc="$YELLOW";; RED) mc="$RED";; *) mc="$GRAY";; esac
+        case "$dra_color" in GREEN) drac="$GREEN";; YELLOW) drac="$YELLOW";; RED) drac="$RED";; *) drac="$GRAY";; esac
+        
+        # Print row with proper alignment
+        printf "${YELLOW}%-3s${NC} %-28s ${gpu_color}%-5s${NC} ${ready_color}%-6s${NC} %-20s ${dc}%-7s${NC} ${tc}%-7s${NC} ${pc}%-7s${NC} ${gc}%-5s${NC} ${dcc}%-5s${NC} ${vc}%-9s${NC} ${mc}%-8s${NC} ${drac}%-8s${NC} ${taints_color}%-80s${NC}\n" \
+            "$node_idx" "$node_trunc" "$gpu_count" "$ready" "$product_trunc" "$driver_val" "$toolkit_val" "$plugin_val" "$gfd_val" "$dcgm_val" "$validator_val" "$mig_val" "$dra_val" "$taints_display"
             
     done <<< "$node_data"
     
@@ -12434,13 +12476,16 @@ manage_nvidia_gpu_stack_health() {
     
     # Legend
     echo -e "${BOLD}${WHITE}Legend:${NC}"
-    echo -e "  ${GREEN}✓${NC} = Running & Ready    ${YELLOW}◐${NC} = Running but Not Ready / Pending    ${RED}✗${NC} = Missing/Failed    ${GRAY}-${NC} = N/A or Optional"
+    echo -e "  ${GREEN}1/1${NC}, ${GREEN}2/2${NC} = All containers Ready    ${YELLOW}0/1${NC}, ${YELLOW}1/2${NC} = Not all containers Ready    ${RED}-${NC} = Missing    ${GRAY}-${NC} = N/A or Optional"
     echo ""
-    echo -e "${BOLD}${WHITE}DRA Check:${NC}"
-    echo -e "  dra-drv checks for ${WHITE}*-k8s-dra-driver-kubelet-plugin-*${NC} pod on each node"
-    echo -e "  ${GREEN}✓${NC} = Pod Running AND all containers Ready (e.g., 2/2)"
-    echo -e "  ${YELLOW}◐${NC} = Pod exists but not all containers Ready"
-    echo -e "  ${RED}✗${NC} = No kubelet-plugin pod found on this node"
+    echo -e "${BOLD}${WHITE}Status Values:${NC}"
+    echo -e "  ${GREEN}N/N${NC}  = Pod Running with all containers Ready (e.g., 1/1, 2/2)"
+    echo -e "  ${YELLOW}N/N${NC}  = Pod Running but not all containers Ready (e.g., 0/1, 1/2)"
+    echo -e "  ${YELLOW}Pend${NC} = Pod in Pending state"
+    echo -e "  ${GREEN}done${NC} = Pod Succeeded (completed successfully, e.g., validator)"
+    echo -e "  ${GRAY}host${NC} = Using pre-installed host drivers (driver.enabled: false)"
+    echo -e "  ${RED}-${NC}    = Required component missing"
+    echo -e "  ${GRAY}-${NC}    = Optional component not deployed (e.g., mig-mgr)"
     echo ""
     echo -e "${BOLD}${WHITE}Common Taints:${NC}"
     echo -e "  ${YELLOW}newNode${NC} = oci.oraclecloud.com/oke-new-node:NoSchedule (node initializing)"
@@ -12508,16 +12553,19 @@ manage_nvidia_gpu_stack_health() {
                 ;;
             dra|DRA)
                 echo ""
-                echo -e "${BOLD}${WHITE}═══ DRA Kubelet Plugin Pods (*-k8s-dra-driver-kubelet-plugin-*) ═══${NC}"
+                echo -e "${BOLD}${WHITE}═══ DRA Kubelet Plugin Pods (*kubelet-plugin*) ═══${NC}"
                 echo ""
                 # Show kubelet-plugin pods with their ready status
-                kubectl get pods -n nvidia-dra-driver-gpu -o wide 2>/dev/null | grep -E "NAME|k8s-dra-driver-kubelet-plugin" || echo -e "${GRAY}No kubelet-plugin pods found${NC}"
+                kubectl get pods -n nvidia-dra-driver-gpu -o wide 2>/dev/null | grep -E "NAME|kubelet-plugin" || echo -e "${GRAY}No kubelet-plugin pods found${NC}"
                 echo ""
                 # Also show summary
                 local total_plugin_pods ready_plugin_pods
-                total_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep -c "k8s-dra-driver-kubelet-plugin" || echo "0")
-                ready_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep "k8s-dra-driver-kubelet-plugin" | grep -c "Running" || echo "0")
-                echo -e "${WHITE}Summary: ${CYAN}${ready_plugin_pods}${NC}/${CYAN}${total_plugin_pods}${NC} kubelet-plugin pods running${NC}"
+                total_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep -c "kubelet-plugin" 2>/dev/null || true)
+                total_plugin_pods=${total_plugin_pods:-0}
+                total_plugin_pods=$(echo "$total_plugin_pods" | tr -d '[:space:]')
+                [[ -z "$total_plugin_pods" ]] && total_plugin_pods=0
+                ready_plugin_pods=$(kubectl get pods -n nvidia-dra-driver-gpu --no-headers 2>/dev/null | grep "kubelet-plugin" | awk '$2 ~ /^[0-9]+\/[0-9]+$/ {split($2,a,"/"); if(a[1]==a[2] && $3=="Running") count++} END {print count+0}')
+                echo -e "${WHITE}Summary: ${CYAN}${ready_plugin_pods}${NC}/${CYAN}${total_plugin_pods}${NC} kubelet-plugin pods fully ready${NC}"
                 echo ""
                 ;;
             events|EVENTS)
@@ -12826,20 +12874,25 @@ validate_gpu_tagging_namespace() {
             echo -e "${RED}✗ Tag '${GPU_TAG_NAME}' does NOT exist in namespace${NC}"
             all_valid=false
         else
-            local tag_ocid tag_state tag_description validator_type validator_values
+            local tag_ocid tag_state tag_description validator_type
             tag_ocid=$(echo "$tag_info" | jq -r '.id // empty')
             tag_state=$(echo "$tag_info" | jq -r '.["lifecycle-state"] // "UNKNOWN"')
             tag_description=$(echo "$tag_info" | jq -r '.description // "N/A"')
             validator_type=$(echo "$tag_info" | jq -r '.validator["validator-type"] // "NONE"')
-            validator_values=$(echo "$tag_info" | jq -r '.validator.values // [] | join(", ")')
+            
+            # Get validator values as array
+            local validator_values_array
+            validator_values_array=$(echo "$tag_info" | jq -r '.validator.values // []')
+            local validator_values_display
+            validator_values_display=$(echo "$tag_info" | jq -r '.validator.values // [] | join(", ")')
             
             echo -e "${GREEN}✓ Tag '${GPU_TAG_NAME}' exists${NC}"
             echo -e "  ${CYAN}OCID:${NC}        ${YELLOW}${tag_ocid}${NC}"
             echo -e "  ${CYAN}State:${NC}       ${WHITE}${tag_state}${NC}"
             echo -e "  ${CYAN}Description:${NC} ${WHITE}${tag_description}${NC}"
             echo -e "  ${CYAN}Validator:${NC}   ${WHITE}${validator_type}${NC}"
-            if [[ -n "$validator_values" ]]; then
-                echo -e "  ${CYAN}Values:${NC}      ${WHITE}${validator_values}${NC}"
+            if [[ -n "$validator_values_display" ]]; then
+                echo -e "  ${CYAN}Values:${NC}      ${WHITE}${validator_values_display}${NC}"
             fi
             
             if [[ "$tag_state" != "ACTIVE" ]]; then
@@ -12847,14 +12900,43 @@ validate_gpu_tagging_namespace() {
                 all_valid=false
             fi
             
-            # Check if expected values are present
+            # Step 3: Validate that expected values exist in validator.values array
+            echo ""
+            echo -e "${YELLOW}Step 3: Checking validator values for required entries...${NC}"
+            echo ""
+            
+            # Check if validator type is ENUM (required for value checking)
+            if [[ "$validator_type" != "ENUM" ]]; then
+                echo -e "${RED}  ✗ Validator type is '${validator_type}', expected 'ENUM'${NC}"
+                all_valid=false
+            else
+                echo -e "${GREEN}  ✓ Validator type is 'ENUM'${NC}"
+            fi
+            
+            # Check each expected value exists in the validator.values array
             local expected_values
             IFS=',' read -ra expected_values <<< "${GPU_TAG_VALUES}"
             for val in "${expected_values[@]}"; do
-                if ! echo "$validator_values" | grep -q "$val"; then
-                    echo -e "${YELLOW}  ⚠ Expected value '${val}' not found in validator${NC}"
+                # Trim whitespace
+                val=$(echo "$val" | xargs)
+                
+                # Check if value exists in JSON array using jq
+                local value_exists
+                value_exists=$(echo "$tag_info" | jq -r --arg v "$val" '.validator.values // [] | map(select(. == $v)) | length')
+                
+                if [[ "$value_exists" -gt 0 ]]; then
+                    echo -e "${GREEN}  ✓ Required value '${val}' found in validator.values${NC}"
+                else
+                    echo -e "${RED}  ✗ Required value '${val}' NOT found in validator.values${NC}"
+                    echo -e "${GRAY}    Current values: [${validator_values_display}]${NC}"
+                    all_valid=false
                 fi
             done
+            
+            # Show raw JSON for debugging
+            echo ""
+            echo -e "${GRAY}Raw validator JSON:${NC}"
+            echo "$tag_info" | jq '.validator' 2>/dev/null | sed 's/^/  /'
         fi
         
         echo ""
