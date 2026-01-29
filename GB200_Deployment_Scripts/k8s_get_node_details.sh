@@ -12857,34 +12857,36 @@ validate_gpu_tagging_namespace() {
         echo -e "${YELLOW}Step 2: Checking for tag '${GPU_TAG_NAME}' in namespace...${NC}"
         echo ""
         
-        local tag_list_cmd="oci iam tag list --tag-namespace-id \"$namespace_ocid\" --all --output json"
-        echo -e "${GRAY}$tag_list_cmd${NC}"
+        # Use 'oci iam tag get' to get full tag details including validator
+        local tag_get_cmd="oci iam tag get --tag-namespace-id \"$namespace_ocid\" --tag-name \"${GPU_TAG_NAME}\" --output json"
+        echo -e "${GRAY}$tag_get_cmd${NC}"
         echo ""
         
-        local existing_tags
-        existing_tags=$(oci iam tag list \
+        local tag_info
+        tag_info=$(oci iam tag get \
             --tag-namespace-id "$namespace_ocid" \
-            --all \
+            --tag-name "${GPU_TAG_NAME}" \
             --output json 2>/dev/null)
         
-        local tag_info
-        tag_info=$(echo "$existing_tags" | jq -r ".data[] | select(.name==\"${GPU_TAG_NAME}\")" 2>/dev/null)
+        # Extract from .data since tag get wraps in data
+        local tag_data
+        tag_data=$(echo "$tag_info" | jq '.data' 2>/dev/null)
         
-        if [[ -z "$tag_info" ]]; then
+        if [[ -z "$tag_data" || "$tag_data" == "null" ]]; then
             echo -e "${RED}✗ Tag '${GPU_TAG_NAME}' does NOT exist in namespace${NC}"
             all_valid=false
         else
             local tag_ocid tag_state tag_description validator_type
-            tag_ocid=$(echo "$tag_info" | jq -r '.id // empty')
-            tag_state=$(echo "$tag_info" | jq -r '.["lifecycle-state"] // "UNKNOWN"')
-            tag_description=$(echo "$tag_info" | jq -r '.description // "N/A"')
-            validator_type=$(echo "$tag_info" | jq -r '.validator["validator-type"] // "NONE"')
+            tag_ocid=$(echo "$tag_data" | jq -r '.id // empty')
+            tag_state=$(echo "$tag_data" | jq -r '.["lifecycle-state"] // "UNKNOWN"')
+            tag_description=$(echo "$tag_data" | jq -r '.description // "N/A"')
+            validator_type=$(echo "$tag_data" | jq -r '.validator["validator-type"] // "NONE"')
             
             # Get validator values as array
             local validator_values_array
-            validator_values_array=$(echo "$tag_info" | jq -r '.validator.values // []')
+            validator_values_array=$(echo "$tag_data" | jq -r '.validator.values // []')
             local validator_values_display
-            validator_values_display=$(echo "$tag_info" | jq -r '.validator.values // [] | join(", ")')
+            validator_values_display=$(echo "$tag_data" | jq -r '.validator.values // [] | join(", ")')
             
             echo -e "${GREEN}✓ Tag '${GPU_TAG_NAME}' exists${NC}"
             echo -e "  ${CYAN}OCID:${NC}        ${YELLOW}${tag_ocid}${NC}"
@@ -12922,7 +12924,7 @@ validate_gpu_tagging_namespace() {
                 
                 # Check if value exists in JSON array using jq
                 local value_exists
-                value_exists=$(echo "$tag_info" | jq -r --arg v "$val" '.validator.values // [] | map(select(. == $v)) | length')
+                value_exists=$(echo "$tag_data" | jq -r --arg v "$val" '.validator.values // [] | map(select(. == $v)) | length')
                 
                 if [[ "$value_exists" -gt 0 ]]; then
                     echo -e "${GREEN}  ✓ Required value '${val}' found in validator.values${NC}"
@@ -12936,20 +12938,27 @@ validate_gpu_tagging_namespace() {
             # Show raw JSON for debugging
             echo ""
             echo -e "${GRAY}Raw validator JSON:${NC}"
-            echo "$tag_info" | jq '.validator' 2>/dev/null | sed 's/^/  /'
+            echo "$tag_data" | jq '.validator' 2>/dev/null | sed 's/^/  /'
         fi
         
         echo ""
         
-        # List all tags in namespace
+        # List all tags in namespace (using tag list for overview)
         echo -e "${YELLOW}All tags in namespace:${NC}"
         echo ""
-        printf "  ${GRAY}%-30s %-12s %-15s %s${NC}\n" "Name" "State" "Validator" "OCID"
-        echo "$existing_tags" | jq -r '.data[] | "\(.name)|\(.["lifecycle-state"])|\(.validator["validator-type"] // "NONE")|\(.id)"' 2>/dev/null | \
-        while IFS='|' read -r t_name t_state t_validator t_ocid; do
+        
+        local existing_tags
+        existing_tags=$(oci iam tag list \
+            --tag-namespace-id "$namespace_ocid" \
+            --all \
+            --output json 2>/dev/null)
+        
+        printf "  ${GRAY}%-30s %-12s %s${NC}\n" "Name" "State" "OCID"
+        echo "$existing_tags" | jq -r '.data[] | "\(.name)|\(.["lifecycle-state"])|\(.id)"' 2>/dev/null | \
+        while IFS='|' read -r t_name t_state t_ocid; do
             local state_color="$GREEN"
             [[ "$t_state" != "ACTIVE" ]] && state_color="$YELLOW"
-            printf "  ${WHITE}%-30s${NC} ${state_color}%-12s${NC} %-15s ${YELLOW}%s${NC}\n" "$t_name" "$t_state" "$t_validator" "$t_ocid"
+            printf "  ${WHITE}%-30s${NC} ${state_color}%-12s${NC} ${YELLOW}%s${NC}\n" "$t_name" "$t_state" "$t_ocid"
         done
     else
         echo -e "${YELLOW}Step 2: Skipping tag check (namespace not available)${NC}"
