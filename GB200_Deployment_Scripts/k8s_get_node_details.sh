@@ -4885,11 +4885,13 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}6${NC}) ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
         echo -e "  ${GREEN}7${NC}) ${WHITE}GPU Instance Tagging${NC}          - Manage ComputeInstanceHostActions namespace and tags"
         echo -e "  ${GREEN}8${NC}) ${WHITE}NVIDIA GPU Stack Health${NC}       - Check GPU Operator & DRA components per node"
+        echo -e "  ${GREEN}9${NC}) ${WHITE}Resource Manager Stacks${NC}       - View stacks, jobs, logs, outputs, and state"
+        echo -e "  ${GREEN}10${NC}) ${WHITE}Work Requests${NC}                - View work requests, status, errors, and logs"
         echo ""
         echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-8, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-10, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -4925,6 +4927,12 @@ interactive_management_main_menu() {
             8)
                 manage_nvidia_gpu_stack_health
                 ;;
+            9)
+                manage_resource_manager_stacks
+                ;;
+            10)
+                manage_work_requests
+                ;;
             c|C|cache|CACHE)
                 display_cache_stats
                 ;;
@@ -4934,7 +4942,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-8, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-10, c, or q.${NC}"
                 ;;
         esac
     done
@@ -12014,6 +12022,1469 @@ get_home_region() {
     echo "$home_region"
 }
 
+#================================================================================
+# RESOURCE MANAGER STACKS MANAGEMENT
+#================================================================================
+
+#--------------------------------------------------------------------------------
+# Manage Resource Manager Stacks - Main menu
+#--------------------------------------------------------------------------------
+manage_resource_manager_stacks() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                      RESOURCE MANAGER STACKS                                                    ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Options ═══${NC}"
+        echo ""
+        echo -e "  ${GREEN}1${NC}) ${WHITE}List Stacks${NC}              - List all Resource Manager stacks"
+        echo -e "  ${GREEN}2${NC}) ${WHITE}View Stack Details${NC}       - Get detailed info about a stack"
+        echo -e "  ${GREEN}3${NC}) ${WHITE}List Jobs for Stack${NC}      - View jobs (plan, apply, destroy) for a stack"
+        echo -e "  ${GREEN}4${NC}) ${WHITE}View Job Details${NC}         - Get detailed info about a job"
+        echo -e "  ${GREEN}5${NC}) ${WHITE}View Job Logs${NC}            - View Terraform logs for a job"
+        echo -e "  ${GREEN}6${NC}) ${WHITE}View Stack Outputs${NC}       - View Terraform outputs for a stack"
+        echo -e "  ${GREEN}7${NC}) ${WHITE}View Stack State${NC}         - View Terraform state file for a stack"
+        echo -e "  ${GREEN}8${NC}) ${WHITE}List Stack Resources${NC}     - List resources managed by a stack"
+        echo ""
+        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        read -r selection
+        
+        case "$selection" in
+            1)
+                rm_list_stacks "$compartment_id"
+                ;;
+            2)
+                rm_view_stack_details "$compartment_id"
+                ;;
+            3)
+                rm_list_jobs "$compartment_id"
+                ;;
+            4)
+                rm_view_job_details "$compartment_id"
+                ;;
+            5)
+                rm_view_job_logs "$compartment_id"
+                ;;
+            6)
+                rm_view_stack_outputs "$compartment_id"
+                ;;
+            7)
+                rm_view_stack_state "$compartment_id"
+                ;;
+            8)
+                rm_list_stack_resources "$compartment_id"
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# List Resource Manager Stacks
+#--------------------------------------------------------------------------------
+rm_list_stacks() {
+    local compartment_id="$1"
+    local interactive="${2:-true}"  # Whether to prompt for selection
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Resource Manager Stacks ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci resource-manager stack list --compartment-id \"$compartment_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local stacks_json
+    stacks_json=$(oci resource-manager stack list \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$stacks_json" || "$stacks_json" == "null" ]]; then
+        echo -e "${YELLOW}No stacks found or unable to list stacks${NC}"
+        return 1
+    fi
+    
+    local stack_count
+    stack_count=$(echo "$stacks_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$stack_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No stacks found in this compartment${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $stack_count stack(s)${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-35s %-10s %-8s %s${NC}\n" "#" "Stack Name" "State" "TF Ver" "Stack OCID"
+    print_separator 160
+    
+    local idx=0
+    # Clear and populate global stack map
+    declare -gA RM_STACK_MAP
+    declare -gA RM_STACK_NAMES
+    RM_STACK_MAP=()
+    RM_STACK_NAMES=()
+    
+    while IFS='|' read -r stack_name state tf_version stack_id time_created; do
+        [[ -z "$stack_name" ]] && continue
+        ((idx++))
+        
+        RM_STACK_MAP[$idx]="$stack_id"
+        RM_STACK_NAMES[$idx]="$stack_name"
+        
+        # Color based on state
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        # Truncate name if too long
+        local name_trunc="${stack_name:0:33}"
+        [[ ${#stack_name} -gt 33 ]] && name_trunc="${name_trunc}.."
+        
+        printf "${YELLOW}%-3s${NC} %-35s ${state_color}%-10s${NC} %-8s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "${tf_version:-N/A}" "$stack_id"
+            
+    done < <(echo "$stacks_json" | jq -r '.data[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["terraform-version"] // "N/A")|\(.id)|\(.["time-created"])"' 2>/dev/null | sort)
+    
+    echo ""
+    
+    # Store count for other functions
+    RM_STACK_COUNT=$idx
+    
+    if [[ "$interactive" == "true" ]]; then
+        echo -e "${GRAY}Enter stack # to view details, or press Enter to continue${NC}"
+        echo -n -e "${CYAN}Selection: ${NC}"
+        read -r stack_selection
+        
+        if [[ -n "$stack_selection" && -n "${RM_STACK_MAP[$stack_selection]}" ]]; then
+            rm_show_stack_detail "${RM_STACK_MAP[$stack_selection]}"
+        fi
+    fi
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# Show detailed stack information
+#--------------------------------------------------------------------------------
+rm_show_stack_detail() {
+    local stack_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Stack Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci resource-manager stack get --stack-id \"$stack_id\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local stack_json
+    stack_json=$(oci resource-manager stack get \
+        --stack-id "$stack_id" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$stack_json" || "$stack_json" == "null" ]]; then
+        echo -e "${RED}Failed to get stack details${NC}"
+        return
+    fi
+    
+    # Extract fields
+    local name state tf_version description time_created source_type working_dir
+    name=$(echo "$stack_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$stack_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    tf_version=$(echo "$stack_json" | jq -r '.data["terraform-version"] // "N/A"')
+    description=$(echo "$stack_json" | jq -r '.data.description // "N/A"')
+    time_created=$(echo "$stack_json" | jq -r '.data["time-created"] // "N/A"')
+    source_type=$(echo "$stack_json" | jq -r '.data["config-source"].["config-source-type"] // "N/A"')
+    working_dir=$(echo "$stack_json" | jq -r '.data["config-source"]["working-directory"] // "N/A"')
+    
+    # State color
+    local state_color="$GREEN"
+    case "$state" in
+        ACTIVE) state_color="$GREEN" ;;
+        CREATING|UPDATING) state_color="$YELLOW" ;;
+        DELETING|DELETED|FAILED) state_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Name:${NC}              ${WHITE}$name${NC}"
+    echo -e "  ${CYAN}State:${NC}             ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Terraform Version:${NC} ${WHITE}$tf_version${NC}"
+    echo -e "  ${CYAN}Description:${NC}       ${WHITE}$description${NC}"
+    echo -e "  ${CYAN}Created:${NC}           ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}Source Type:${NC}       ${WHITE}$source_type${NC}"
+    echo -e "  ${CYAN}Working Directory:${NC} ${WHITE}$working_dir${NC}"
+    echo -e "  ${CYAN}Stack OCID:${NC}        ${YELLOW}$stack_id${NC}"
+    echo ""
+    
+    # Show variables if any
+    local variables
+    variables=$(echo "$stack_json" | jq -r '.data.variables // {}')
+    if [[ "$variables" != "{}" && "$variables" != "null" ]]; then
+        echo -e "${BOLD}${WHITE}Variables:${NC}"
+        echo "$variables" | jq -r 'to_entries[] | "  \(.key) = \(.value)"' 2>/dev/null | head -20
+        local var_count
+        var_count=$(echo "$variables" | jq 'keys | length' 2>/dev/null)
+        [[ "$var_count" -gt 20 ]] && echo -e "  ${GRAY}... and $((var_count - 20)) more${NC}"
+        echo ""
+    fi
+    
+    # Show freeform tags
+    local freeform_tags
+    freeform_tags=$(echo "$stack_json" | jq -r '.data["freeform-tags"] // {}')
+    if [[ "$freeform_tags" != "{}" && "$freeform_tags" != "null" ]]; then
+        echo -e "${BOLD}${WHITE}Freeform Tags:${NC}"
+        echo "$freeform_tags" | jq -r 'to_entries[] | "  \(.key) = \(.value)"' 2>/dev/null
+        echo ""
+    fi
+    
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# View Stack Details (with selection from list)
+#--------------------------------------------------------------------------------
+rm_view_stack_details() {
+    local compartment_id="$1"
+    
+    # List stacks without interactive prompt
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view details (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -n "$stack_selection" && -n "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        rm_show_stack_detail "${RM_STACK_MAP[$stack_selection]}"
+    elif [[ -n "$stack_selection" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# List Jobs for a Stack
+#--------------------------------------------------------------------------------
+rm_list_jobs() {
+    local compartment_id="$1"
+    
+    # List stacks without interactive prompt
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view jobs (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Jobs for Stack: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local list_cmd="oci resource-manager job list --stack-id \"$stack_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local jobs_json
+    jobs_json=$(oci resource-manager job list \
+        --stack-id "$stack_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$jobs_json" || "$jobs_json" == "null" ]]; then
+        echo -e "${YELLOW}No jobs found or unable to list jobs${NC}"
+        return
+    fi
+    
+    local job_count
+    job_count=$(echo "$jobs_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$job_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No jobs found for this stack${NC}"
+        return
+    fi
+    
+    echo -e "${GREEN}Found $job_count job(s)${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-12s %-12s %-20s %s${NC}\n" "#" "Operation" "State" "Time Created" "Job OCID"
+    print_separator 160
+    
+    local idx=0
+    declare -gA RM_JOB_MAP
+    RM_JOB_MAP=()
+    
+    while IFS='|' read -r operation state time_created job_id; do
+        [[ -z "$operation" ]] && continue
+        ((idx++))
+        
+        RM_JOB_MAP[$idx]="$job_id"
+        
+        # Color based on state
+        local state_color="$GREEN"
+        case "$state" in
+            SUCCEEDED) state_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) state_color="$YELLOW" ;;
+            FAILED|CANCELED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        # Operation color
+        local op_color="$WHITE"
+        case "$operation" in
+            APPLY) op_color="$GREEN" ;;
+            PLAN) op_color="$CYAN" ;;
+            DESTROY) op_color="$RED" ;;
+            IMPORT_TF_STATE) op_color="$YELLOW" ;;
+        esac
+        
+        # Format time
+        local time_short="${time_created:0:19}"
+        
+        printf "${YELLOW}%-3s${NC} ${op_color}%-12s${NC} ${state_color}%-12s${NC} %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$operation" "$state" "$time_short" "$job_id"
+            
+    done < <(echo "$jobs_json" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[] | "\(.operation)|\(.["lifecycle-state"])|\(.["time-created"])|\(.id)"' 2>/dev/null)
+    
+    # Store count
+    RM_JOB_COUNT=$idx
+    
+    echo ""
+    echo -e "${GRAY}Enter job # to view details, or press Enter to continue${NC}"
+    echo -n -e "${CYAN}Selection: ${NC}"
+    read -r job_selection
+    
+    if [[ -n "$job_selection" && -n "${RM_JOB_MAP[$job_selection]}" ]]; then
+        rm_show_job_detail "${RM_JOB_MAP[$job_selection]}"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# Show Job Details
+#--------------------------------------------------------------------------------
+rm_show_job_detail() {
+    local job_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Job Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci resource-manager job get --job-id \"$job_id\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local job_json
+    job_json=$(oci resource-manager job get \
+        --job-id "$job_id" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$job_json" || "$job_json" == "null" ]]; then
+        echo -e "${RED}Failed to get job details${NC}"
+        return
+    fi
+    
+    # Extract fields
+    local operation state time_created time_finished stack_id
+    local apply_job_plan_resolution failure_details
+    operation=$(echo "$job_json" | jq -r '.data.operation // "N/A"')
+    state=$(echo "$job_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    time_created=$(echo "$job_json" | jq -r '.data["time-created"] // "N/A"')
+    time_finished=$(echo "$job_json" | jq -r '.data["time-finished"] // "N/A"')
+    stack_id=$(echo "$job_json" | jq -r '.data["stack-id"] // "N/A"')
+    apply_job_plan_resolution=$(echo "$job_json" | jq -r '.data["apply-job-plan-resolution"] // "N/A"')
+    failure_details=$(echo "$job_json" | jq -r '.data["failure-details"] // empty')
+    
+    # State color
+    local state_color="$GREEN"
+    case "$state" in
+        SUCCEEDED) state_color="$GREEN" ;;
+        IN_PROGRESS|ACCEPTED) state_color="$YELLOW" ;;
+        FAILED|CANCELED) state_color="$RED" ;;
+    esac
+    
+    # Operation color
+    local op_color="$WHITE"
+    case "$operation" in
+        APPLY) op_color="$GREEN" ;;
+        PLAN) op_color="$CYAN" ;;
+        DESTROY) op_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Operation:${NC}         ${op_color}$operation${NC}"
+    echo -e "  ${CYAN}State:${NC}             ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Created:${NC}           ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}Finished:${NC}          ${WHITE}$time_finished${NC}"
+    echo -e "  ${CYAN}Plan Resolution:${NC}   ${WHITE}$apply_job_plan_resolution${NC}"
+    echo -e "  ${CYAN}Stack OCID:${NC}        ${YELLOW}$stack_id${NC}"
+    echo -e "  ${CYAN}Job OCID:${NC}          ${YELLOW}$job_id${NC}"
+    
+    # Show failure details if present
+    if [[ -n "$failure_details" && "$failure_details" != "null" ]]; then
+        echo ""
+        echo -e "${RED}Failure Details:${NC}"
+        echo "$failure_details" | jq '.' 2>/dev/null || echo "$failure_details"
+    fi
+    
+    echo ""
+    echo -e "${GRAY}Options: ${WHITE}logs${NC} = view logs, ${WHITE}Enter${NC} = continue${NC}"
+    echo -n -e "${CYAN}Selection: ${NC}"
+    read -r action
+    
+    if [[ "$action" == "logs" ]]; then
+        rm_show_job_logs "$job_id"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# View Job Details (with selection from list)
+#--------------------------------------------------------------------------------
+rm_view_job_details() {
+    local compartment_id="$1"
+    
+    # First select a stack
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view its jobs (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    # Now list jobs for that stack
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Jobs for Stack: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local jobs_json
+    jobs_json=$(oci resource-manager job list \
+        --stack-id "$stack_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$jobs_json" || "$jobs_json" == "null" ]]; then
+        echo -e "${YELLOW}No jobs found${NC}"
+        return
+    fi
+    
+    local job_count
+    job_count=$(echo "$jobs_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$job_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No jobs found for this stack${NC}"
+        return
+    fi
+    
+    echo -e "${GREEN}Found $job_count job(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-12s %-12s %-20s %s${NC}\n" "#" "Operation" "State" "Time Created" "Job OCID"
+    print_separator 160
+    
+    local idx=0
+    declare -gA RM_JOB_MAP
+    RM_JOB_MAP=()
+    
+    while IFS='|' read -r operation state time_created job_id; do
+        [[ -z "$operation" ]] && continue
+        ((idx++))
+        
+        RM_JOB_MAP[$idx]="$job_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            SUCCEEDED) state_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) state_color="$YELLOW" ;;
+            FAILED|CANCELED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local op_color="$WHITE"
+        case "$operation" in
+            APPLY) op_color="$GREEN" ;;
+            PLAN) op_color="$CYAN" ;;
+            DESTROY) op_color="$RED" ;;
+            IMPORT_TF_STATE) op_color="$YELLOW" ;;
+        esac
+        
+        local time_short="${time_created:0:19}"
+        
+        printf "${YELLOW}%-3s${NC} ${op_color}%-12s${NC} ${state_color}%-12s${NC} %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$operation" "$state" "$time_short" "$job_id"
+            
+    done < <(echo "$jobs_json" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[] | "\(.operation)|\(.["lifecycle-state"])|\(.["time-created"])|\(.id)"' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Enter job # to view details (or Enter to cancel): ${NC}"
+    read -r job_selection
+    
+    if [[ -n "$job_selection" && -n "${RM_JOB_MAP[$job_selection]}" ]]; then
+        rm_show_job_detail "${RM_JOB_MAP[$job_selection]}"
+    elif [[ -n "$job_selection" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# View Job Logs (with selection)
+#--------------------------------------------------------------------------------
+rm_view_job_logs() {
+    local compartment_id="$1"
+    
+    # First select a stack
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view its jobs (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    # List jobs
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Jobs for Stack: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local jobs_json
+    jobs_json=$(oci resource-manager job list \
+        --stack-id "$stack_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$jobs_json" || "$jobs_json" == "null" ]]; then
+        echo -e "${YELLOW}No jobs found${NC}"
+        return
+    fi
+    
+    local job_count
+    job_count=$(echo "$jobs_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$job_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No jobs found for this stack${NC}"
+        return
+    fi
+    
+    echo -e "${GREEN}Found $job_count job(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-12s %-12s %-20s %s${NC}\n" "#" "Operation" "State" "Time Created" "Job OCID"
+    print_separator 160
+    
+    local idx=0
+    declare -gA RM_JOB_MAP
+    RM_JOB_MAP=()
+    
+    while IFS='|' read -r operation state time_created job_id; do
+        [[ -z "$operation" ]] && continue
+        ((idx++))
+        
+        RM_JOB_MAP[$idx]="$job_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            SUCCEEDED) state_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) state_color="$YELLOW" ;;
+            FAILED|CANCELED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local op_color="$WHITE"
+        case "$operation" in
+            APPLY) op_color="$GREEN" ;;
+            PLAN) op_color="$CYAN" ;;
+            DESTROY) op_color="$RED" ;;
+            IMPORT_TF_STATE) op_color="$YELLOW" ;;
+        esac
+        
+        local time_short="${time_created:0:19}"
+        
+        printf "${YELLOW}%-3s${NC} ${op_color}%-12s${NC} ${state_color}%-12s${NC} %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$operation" "$state" "$time_short" "$job_id"
+            
+    done < <(echo "$jobs_json" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[] | "\(.operation)|\(.["lifecycle-state"])|\(.["time-created"])|\(.id)"' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Enter job # to view logs (or Enter to cancel): ${NC}"
+    read -r job_selection
+    
+    if [[ -n "$job_selection" && -n "${RM_JOB_MAP[$job_selection]}" ]]; then
+        rm_show_job_logs "${RM_JOB_MAP[$job_selection]}"
+    elif [[ -n "$job_selection" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+    fi
+}
+
+rm_show_job_logs() {
+    local job_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Job Logs ═══${NC}"
+    echo ""
+    
+    local logs_cmd="oci resource-manager job get-job-logs --job-id \"$job_id\" --all"
+    echo -e "${GRAY}$logs_cmd${NC}"
+    echo ""
+    
+    # Get logs
+    local logs_json
+    logs_json=$(oci resource-manager job get-job-logs \
+        --job-id "$job_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$logs_json" || "$logs_json" == "null" ]]; then
+        echo -e "${YELLOW}No logs found or unable to retrieve logs${NC}"
+        return
+    fi
+    
+    local log_count
+    log_count=$(echo "$logs_json" | jq '.data | length' 2>/dev/null)
+    
+    echo -e "${GREEN}Retrieved $log_count log entries${NC}"
+    echo ""
+    
+    # Display logs with timestamp and level
+    echo "$logs_json" | jq -r '.data[] | "\(.timestamp) [\(.level)] \(.message)"' 2>/dev/null | while read -r line; do
+        # Color based on level in the line
+        if [[ "$line" == *"[ERROR]"* ]]; then
+            echo -e "${RED}$line${NC}"
+        elif [[ "$line" == *"[WARN]"* ]]; then
+            echo -e "${YELLOW}$line${NC}"
+        elif [[ "$line" == *"[INFO]"* ]]; then
+            echo -e "${WHITE}$line${NC}"
+        else
+            echo "$line"
+        fi
+    done | less -R
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# View Stack Outputs
+#--------------------------------------------------------------------------------
+rm_view_stack_outputs() {
+    local compartment_id="$1"
+    
+    # List stacks first
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view outputs (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Stack Outputs: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local outputs_cmd="oci resource-manager stack list-terraform-outputs --stack-id \"$stack_id\" --all --output json"
+    echo -e "${GRAY}$outputs_cmd${NC}"
+    echo ""
+    
+    # Try the outputs endpoint
+    local tf_outputs
+    tf_outputs=$(oci resource-manager stack list-terraform-outputs \
+        --stack-id "$stack_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -n "$tf_outputs" && "$tf_outputs" != "null" ]]; then
+        local output_count
+        output_count=$(echo "$tf_outputs" | jq '.data | length' 2>/dev/null)
+        
+        if [[ "$output_count" -gt 0 ]]; then
+            echo -e "${GREEN}Found $output_count output(s)${NC}"
+            echo ""
+            
+            printf "${BOLD}%-40s %-12s %s${NC}\n" "Output Name" "Sensitive" "Value"
+            print_separator 100
+            
+            echo "$tf_outputs" | jq -r '.data[] | "\(.["output-name"])|\(.["is-sensitive"])|\(.["output-value"])"' 2>/dev/null | while IFS='|' read -r name sensitive value; do
+                local name_trunc="${name:0:38}"
+                local sens_color="$WHITE"
+                local value_display
+                if [[ "$sensitive" == "true" ]]; then
+                    sens_color="$RED"
+                    value_display="${RED}[SENSITIVE - hidden]${NC}"
+                else
+                    value_display="${value:0:80}"
+                    [[ ${#value} -gt 80 ]] && value_display="${value_display}..."
+                fi
+                printf "%-40s ${sens_color}%-12s${NC} %s\n" "$name_trunc" "$sensitive" "$value_display"
+            done
+        else
+            echo -e "${YELLOW}No outputs defined for this stack${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Unable to retrieve outputs. The stack may not have been applied yet.${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# View Stack State
+#--------------------------------------------------------------------------------
+rm_view_stack_state() {
+    local compartment_id="$1"
+    
+    # List stacks first
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to view state (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Terraform State: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local state_cmd="oci resource-manager stack get-stack-tf-state --stack-id \"$stack_id\" --file -"
+    echo -e "${GRAY}$state_cmd${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}Note: This retrieves the Terraform state file. It may contain sensitive information.${NC}"
+    echo -n -e "${CYAN}Continue? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        return
+    fi
+    
+    echo ""
+    
+    # Get state and pipe through jq for pretty printing, then to less
+    oci resource-manager stack get-stack-tf-state \
+        --stack-id "$stack_id" \
+        --file - 2>/dev/null | jq '.' 2>/dev/null | less -R
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# List Stack Resources
+#--------------------------------------------------------------------------------
+rm_list_stack_resources() {
+    local compartment_id="$1"
+    
+    # List stacks first
+    rm_list_stacks "$compartment_id" "false"
+    
+    if [[ ${RM_STACK_COUNT:-0} -eq 0 ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter stack # to list resources (or Enter to cancel): ${NC}"
+    read -r stack_selection
+    
+    if [[ -z "$stack_selection" ]]; then
+        return
+    fi
+    
+    if [[ -z "${RM_STACK_MAP[$stack_selection]}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    local stack_id="${RM_STACK_MAP[$stack_selection]}"
+    local stack_name="${RM_STACK_NAMES[$stack_selection]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Resources Managed by: ${CYAN}${stack_name}${NC} ${BOLD}${WHITE}═══${NC}"
+    echo ""
+    
+    local resources_cmd="oci resource-manager associated-resource-summary list-stack-associated-resources --stack-id \"$stack_id\" --all --output json"
+    echo -e "${GRAY}$resources_cmd${NC}"
+    echo ""
+    
+    local resources_json
+    resources_json=$(oci resource-manager associated-resource-summary list-stack-associated-resources \
+        --stack-id "$stack_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$resources_json" || "$resources_json" == "null" ]]; then
+        echo -e "${YELLOW}No resources found or unable to list resources${NC}"
+        echo -e "${GRAY}Note: Resources are only tracked after a successful apply.${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    local resource_count
+    resource_count=$(echo "$resources_json" | jq '.data.items | length' 2>/dev/null)
+    
+    if [[ "$resource_count" -eq 0 || -z "$resource_count" ]]; then
+        echo -e "${YELLOW}No resources found for this stack${NC}"
+        echo -e "${GRAY}Note: Resources are only tracked after a successful apply.${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${GREEN}Found $resource_count resource(s)${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-30s %-40s %s${NC}\n" "#" "Resource Type" "Resource Name" "Resource OCID"
+    print_separator 180
+    
+    local idx=0
+    echo "$resources_json" | jq -r '.data.items[] | "\(.["resource-type"])|\(.["resource-name"] // "N/A")|\(.["resource-id"])"' 2>/dev/null | while IFS='|' read -r res_type res_name res_id; do
+        ((idx++))
+        
+        # Truncate for display
+        local type_trunc="${res_type:0:28}"
+        local name_trunc="${res_name:0:38}"
+        [[ ${#res_name} -gt 38 ]] && name_trunc="${name_trunc}.."
+        
+        printf "${YELLOW}%-3s${NC} %-30s %-40s ${GRAY}%s${NC}\n" "$idx" "$type_trunc" "$name_trunc" "$res_id"
+    done
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#================================================================================
+# WORK REQUESTS MANAGEMENT
+#================================================================================
+
+#--------------------------------------------------------------------------------
+# Manage Work Requests - Main menu
+#--------------------------------------------------------------------------------
+manage_work_requests() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                          WORK REQUESTS                                                          ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Options ═══${NC}"
+        echo ""
+        echo -e "  ${GREEN}1${NC}) ${WHITE}List Work Requests${NC}           - List recent work requests in compartment"
+        echo -e "  ${GREEN}2${NC}) ${WHITE}View Work Request Details${NC}    - Get detailed info about a work request"
+        echo -e "  ${GREEN}3${NC}) ${WHITE}View Work Request Errors${NC}     - View errors for a failed work request"
+        echo -e "  ${GREEN}4${NC}) ${WHITE}View Work Request Logs${NC}       - View log entries for a work request"
+        echo -e "  ${GREEN}5${NC}) ${WHITE}Filter by Status${NC}             - List work requests by status (IN_PROGRESS, FAILED, etc.)"
+        echo -e "  ${GREEN}6${NC}) ${WHITE}Search by Resource${NC}           - Find work requests for a specific resource OCID"
+        echo ""
+        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        read -r selection
+        
+        case "$selection" in
+            1)
+                wr_list_work_requests "$compartment_id" "" "none"
+                ;;
+            2)
+                wr_list_work_requests "$compartment_id" "" "details"
+                ;;
+            3)
+                wr_list_work_requests "$compartment_id" "" "errors"
+                ;;
+            4)
+                wr_list_work_requests "$compartment_id" "" "logs"
+                ;;
+            5)
+                wr_filter_by_status "$compartment_id"
+                ;;
+            6)
+                wr_search_by_resource "$compartment_id"
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# List Work Requests
+#--------------------------------------------------------------------------------
+wr_list_work_requests() {
+    local compartment_id="$1"
+    local status_filter="${2:-}"
+    local action_on_select="${3:-none}"  # none, details, errors, logs
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Requests ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci work-requests work-request list --compartment-id \"$compartment_id\" --all --output json"
+    [[ -n "$status_filter" ]] && list_cmd="oci work-requests work-request list --compartment-id \"$compartment_id\" --status \"$status_filter\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local wr_json
+    if [[ -n "$status_filter" ]]; then
+        wr_json=$(oci work-requests work-request list \
+            --compartment-id "$compartment_id" \
+            --status "$status_filter" \
+            --all \
+            --output json 2>/dev/null)
+    else
+        wr_json=$(oci work-requests work-request list \
+            --compartment-id "$compartment_id" \
+            --all \
+            --output json 2>/dev/null)
+    fi
+    
+    if [[ -z "$wr_json" || "$wr_json" == "null" ]]; then
+        echo -e "${YELLOW}No work requests found or unable to list work requests${NC}"
+        return 1
+    fi
+    
+    local wr_count
+    wr_count=$(echo "$wr_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$wr_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No work requests found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $wr_count work request(s)${NC}"
+    [[ -n "$status_filter" ]] && echo -e "${CYAN}Filtered by status: ${WHITE}$status_filter${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Started" "Work Request OCID"
+    print_separator 180
+    
+    local idx=0
+    # Clear and populate global work request map
+    declare -gA WR_MAP
+    WR_MAP=()
+    
+    while IFS='|' read -r operation_type status percent_complete time_started wr_id; do
+        [[ -z "$operation_type" ]] && continue
+        ((idx++))
+        
+        WR_MAP[$idx]="$wr_id"
+        
+        # Color based on status
+        local status_color="$GREEN"
+        case "$status" in
+            SUCCEEDED|COMPLETED) status_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) status_color="$YELLOW" ;;
+            FAILED|CANCELED|CANCELING) status_color="$RED" ;;
+            *) status_color="$GRAY" ;;
+        esac
+        
+        # Truncate operation type if needed
+        local op_trunc="${operation_type:0:38}"
+        [[ ${#operation_type} -gt 38 ]] && op_trunc="${op_trunc}.."
+        
+        # Format time
+        local time_short="${time_started:0:19}"
+        
+        # Format percentage
+        local pct_display="${percent_complete:-0}"
+        
+        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_trunc" "$status" "${pct_display}%" "$time_short" "$wr_id"
+            
+    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-started"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.id)"' 2>/dev/null)
+    
+    echo ""
+    
+    # Store count
+    WR_COUNT=$idx
+    
+    # Handle selection based on action type
+    case "$action_on_select" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        details)
+            echo -n -e "${CYAN}Enter work request # to view details (or Enter to cancel): ${NC}"
+            read -r wr_selection
+            if [[ -n "$wr_selection" && -n "${WR_MAP[$wr_selection]}" ]]; then
+                wr_show_work_request_detail "${WR_MAP[$wr_selection]}"
+            elif [[ -n "$wr_selection" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+            fi
+            ;;
+        errors)
+            echo -n -e "${CYAN}Enter work request # to view errors (or Enter to cancel): ${NC}"
+            read -r wr_selection
+            if [[ -n "$wr_selection" && -n "${WR_MAP[$wr_selection]}" ]]; then
+                wr_show_work_request_errors "${WR_MAP[$wr_selection]}"
+            elif [[ -n "$wr_selection" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+            fi
+            ;;
+        logs)
+            echo -n -e "${CYAN}Enter work request # to view logs (or Enter to cancel): ${NC}"
+            read -r wr_selection
+            if [[ -n "$wr_selection" && -n "${WR_MAP[$wr_selection]}" ]]; then
+                wr_show_work_request_logs "${WR_MAP[$wr_selection]}"
+            elif [[ -n "$wr_selection" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# Show Work Request Details
+#--------------------------------------------------------------------------------
+wr_show_work_request_detail() {
+    local wr_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Request Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci work-requests work-request get --work-request-id \"$wr_id\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local wr_json
+    wr_json=$(oci work-requests work-request get \
+        --work-request-id "$wr_id" \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$wr_json" || "$wr_json" == "null" ]]; then
+        echo -e "${RED}Failed to get work request details${NC}"
+        return
+    fi
+    
+    # Extract fields
+    local operation_type status percent_complete time_accepted time_started time_finished
+    operation_type=$(echo "$wr_json" | jq -r '.data["operation-type"] // "N/A"')
+    status=$(echo "$wr_json" | jq -r '.data.status // "N/A"')
+    percent_complete=$(echo "$wr_json" | jq -r '.data["percent-complete"] // "0"')
+    time_accepted=$(echo "$wr_json" | jq -r '.data["time-accepted"] // "N/A"')
+    time_started=$(echo "$wr_json" | jq -r '.data["time-started"] // "N/A"')
+    time_finished=$(echo "$wr_json" | jq -r '.data["time-finished"] // "N/A"')
+    
+    # Status color
+    local status_color="$GREEN"
+    case "$status" in
+        SUCCEEDED|COMPLETED) status_color="$GREEN" ;;
+        IN_PROGRESS|ACCEPTED) status_color="$YELLOW" ;;
+        FAILED|CANCELED|CANCELING) status_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Operation Type:${NC}    ${WHITE}$operation_type${NC}"
+    echo -e "  ${CYAN}Status:${NC}            ${status_color}$status${NC}"
+    echo -e "  ${CYAN}Progress:${NC}          ${WHITE}${percent_complete}%${NC}"
+    echo -e "  ${CYAN}Time Accepted:${NC}     ${WHITE}$time_accepted${NC}"
+    echo -e "  ${CYAN}Time Started:${NC}      ${WHITE}$time_started${NC}"
+    echo -e "  ${CYAN}Time Finished:${NC}     ${WHITE}$time_finished${NC}"
+    echo -e "  ${CYAN}Work Request OCID:${NC} ${YELLOW}$wr_id${NC}"
+    echo ""
+    
+    # Show resources affected
+    local resources
+    resources=$(echo "$wr_json" | jq -r '.data.resources // []')
+    if [[ "$resources" != "[]" && "$resources" != "null" ]]; then
+        echo -e "${BOLD}${WHITE}Resources Affected:${NC}"
+        echo ""
+        printf "  ${BOLD}%-20s %-15s %s${NC}\n" "Entity Type" "Action" "Resource OCID"
+        print_separator 140
+        echo "$wr_json" | jq -r '.data.resources[] | "\(.["entity-type"])|\(.["action-type"])|\(.identifier)"' 2>/dev/null | while IFS='|' read -r entity_type action_type identifier; do
+            local action_color="$WHITE"
+            case "$action_type" in
+                CREATED) action_color="$GREEN" ;;
+                UPDATED|IN_PROGRESS) action_color="$YELLOW" ;;
+                DELETED) action_color="$RED" ;;
+            esac
+            printf "  %-20s ${action_color}%-15s${NC} ${GRAY}%s${NC}\n" "$entity_type" "$action_type" "$identifier"
+        done
+        echo ""
+    fi
+    
+    echo -e "${GRAY}Options: ${WHITE}errors${NC} = view errors, ${WHITE}logs${NC} = view logs, ${WHITE}Enter${NC} = continue${NC}"
+    echo -n -e "${CYAN}Selection: ${NC}"
+    read -r action
+    
+    case "$action" in
+        errors|ERRORS|e|E)
+            wr_show_work_request_errors "$wr_id"
+            ;;
+        logs|LOGS|l|L)
+            wr_show_work_request_logs "$wr_id"
+            ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# View Work Request Errors (called directly from show_detail)
+#--------------------------------------------------------------------------------
+
+wr_show_work_request_errors() {
+    local wr_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Request Errors ═══${NC}"
+    echo ""
+    
+    local errors_cmd="oci work-requests work-request-error list --work-request-id \"$wr_id\" --all --output json"
+    echo -e "${GRAY}$errors_cmd${NC}"
+    echo ""
+    
+    local errors_json
+    errors_json=$(oci work-requests work-request-error list \
+        --work-request-id "$wr_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$errors_json" || "$errors_json" == "null" ]]; then
+        echo -e "${YELLOW}No errors found or unable to retrieve errors${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    local error_count
+    error_count=$(echo "$errors_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$error_count" -eq 0 ]]; then
+        echo -e "${GREEN}No errors found for this work request${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${RED}Found $error_count error(s)${NC}"
+    echo ""
+    
+    # Display errors
+    echo "$errors_json" | jq -r '.data[] | "\(.timestamp) [\(.code)] \(.message)"' 2>/dev/null | while read -r line; do
+        echo -e "${RED}$line${NC}"
+    done
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Show Work Request Logs (called directly from show_detail or menu)
+#--------------------------------------------------------------------------------
+wr_show_work_request_logs() {
+    local wr_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Request Logs ═══${NC}"
+    echo ""
+    
+    local logs_cmd="oci work-requests work-request-log-entry list --work-request-id \"$wr_id\" --all --output json"
+    echo -e "${GRAY}$logs_cmd${NC}"
+    echo ""
+    
+    local logs_json
+    logs_json=$(oci work-requests work-request-log-entry list \
+        --work-request-id "$wr_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$logs_json" || "$logs_json" == "null" ]]; then
+        echo -e "${YELLOW}No logs found or unable to retrieve logs${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    local log_count
+    log_count=$(echo "$logs_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$log_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No log entries found for this work request${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${GREEN}Found $log_count log entries${NC}"
+    echo ""
+    
+    # Display logs with timestamp
+    echo "$logs_json" | jq -r '.data | sort_by(.timestamp) | .[] | "\(.timestamp) | \(.message)"' 2>/dev/null | while read -r line; do
+        # Color based on content
+        if [[ "$line" == *"error"* || "$line" == *"Error"* || "$line" == *"ERROR"* || "$line" == *"failed"* || "$line" == *"Failed"* ]]; then
+            echo -e "${RED}$line${NC}"
+        elif [[ "$line" == *"warn"* || "$line" == *"Warn"* || "$line" == *"WARN"* ]]; then
+            echo -e "${YELLOW}$line${NC}"
+        elif [[ "$line" == *"success"* || "$line" == *"Success"* || "$line" == *"completed"* || "$line" == *"Completed"* ]]; then
+            echo -e "${GREEN}$line${NC}"
+        else
+            echo "$line"
+        fi
+    done | less -R
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Filter Work Requests by Status
+#--------------------------------------------------------------------------------
+wr_filter_by_status() {
+    local compartment_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Filter Work Requests by Status ═══${NC}"
+    echo ""
+    echo -e "  ${GREEN}1${NC}) ${WHITE}ACCEPTED${NC}      - Work request accepted but not started"
+    echo -e "  ${GREEN}2${NC}) ${WHITE}IN_PROGRESS${NC}   - Work request currently running"
+    echo -e "  ${GREEN}3${NC}) ${WHITE}SUCCEEDED${NC}     - Work request completed successfully"
+    echo -e "  ${GREEN}4${NC}) ${WHITE}FAILED${NC}        - Work request failed"
+    echo -e "  ${GREEN}5${NC}) ${WHITE}CANCELING${NC}     - Work request being canceled"
+    echo -e "  ${GREEN}6${NC}) ${WHITE}CANCELED${NC}      - Work request was canceled"
+    echo ""
+    echo -n -e "${CYAN}Enter status # (or Enter to cancel): ${NC}"
+    read -r status_selection
+    
+    local status_filter=""
+    case "$status_selection" in
+        1) status_filter="ACCEPTED" ;;
+        2) status_filter="IN_PROGRESS" ;;
+        3) status_filter="SUCCEEDED" ;;
+        4) status_filter="FAILED" ;;
+        5) status_filter="CANCELING" ;;
+        6) status_filter="CANCELED" ;;
+        "") return ;;
+        *)
+            echo -e "${RED}Invalid selection${NC}"
+            return
+            ;;
+    esac
+    
+    wr_list_work_requests "$compartment_id" "$status_filter" "details"
+}
+
+#--------------------------------------------------------------------------------
+# Search Work Requests by Resource OCID
+#--------------------------------------------------------------------------------
+wr_search_by_resource() {
+    local compartment_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Search Work Requests by Resource OCID ═══${NC}"
+    echo ""
+    echo -n -e "${CYAN}Enter Resource OCID to search: ${NC}"
+    read -r resource_ocid
+    
+    if [[ -z "$resource_ocid" ]]; then
+        echo -e "${YELLOW}No resource OCID provided${NC}"
+        return
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Requests for Resource ═══${NC}"
+    echo ""
+    
+    local search_cmd="oci work-requests work-request list --compartment-id \"$compartment_id\" --resource-id \"$resource_ocid\" --all --output json"
+    echo -e "${GRAY}$search_cmd${NC}"
+    echo ""
+    
+    local wr_json
+    wr_json=$(oci work-requests work-request list \
+        --compartment-id "$compartment_id" \
+        --resource-id "$resource_ocid" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$wr_json" || "$wr_json" == "null" ]]; then
+        echo -e "${YELLOW}No work requests found for this resource${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    local wr_count
+    wr_count=$(echo "$wr_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$wr_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No work requests found for this resource${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${GREEN}Found $wr_count work request(s) for resource${NC}"
+    echo ""
+    
+    # Print header
+    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Started" "Work Request OCID"
+    print_separator 180
+    
+    local idx=0
+    declare -gA WR_MAP
+    WR_MAP=()
+    
+    while IFS='|' read -r operation_type status percent_complete time_started wr_id; do
+        [[ -z "$operation_type" ]] && continue
+        ((idx++))
+        
+        WR_MAP[$idx]="$wr_id"
+        
+        local status_color="$GREEN"
+        case "$status" in
+            SUCCEEDED|COMPLETED) status_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) status_color="$YELLOW" ;;
+            FAILED|CANCELED|CANCELING) status_color="$RED" ;;
+            *) status_color="$GRAY" ;;
+        esac
+        
+        local op_trunc="${operation_type:0:38}"
+        [[ ${#operation_type} -gt 38 ]] && op_trunc="${op_trunc}.."
+        
+        local time_short="${time_started:0:19}"
+        local pct_display="${percent_complete:-0}"
+        
+        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_trunc" "$status" "${pct_display}%" "$time_short" "$wr_id"
+            
+    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-started"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.id)"' 2>/dev/null)
+    
+    WR_COUNT=$idx
+    
+    echo ""
+    echo -e "${GRAY}Enter work request # to view details, or press Enter to continue${NC}"
+    echo -n -e "${CYAN}Selection: ${NC}"
+    read -r wr_selection
+    
+    if [[ -n "$wr_selection" && -n "${WR_MAP[$wr_selection]}" ]]; then
+        wr_show_work_request_detail "${WR_MAP[$wr_selection]}"
+    fi
+}
+
 #--------------------------------------------------------------------------------
 # Manage GPU Instance Tagging - Main menu
 #--------------------------------------------------------------------------------
@@ -13999,6 +15470,8 @@ show_help() {
     echo "                      - Compute Clusters (create, view, delete)"
     echo "                      - GPU Instance Tagging (namespace and tags)"
     echo "                      - NVIDIA GPU Stack Health (GPU Operator & DRA per node)"
+    echo "                      - Resource Manager Stacks (view stacks, jobs, logs, state)"
+    echo "                      - Work Requests (view status, errors, logs)"
     echo ""
     echo -e "${BOLD}Setup & Maintenance:${NC}"
     echo "  --setup             Run initial setup to create/update variables.sh"
