@@ -51,7 +51,8 @@ readonly CACHE_MAX_AGE=3600  # 1 hour in seconds
 
 # Script directory and cache paths
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly CACHE_DIR="${HOME}/cache"
+readonly CACHE_DIR="${SCRIPT_DIR}/cache"
+readonly TEMP_DIR="${CACHE_DIR}/tmp"
 
 # Cache file paths (derived from CACHE_DIR)
 readonly FABRIC_CACHE="${CACHE_DIR}/gpu_fabrics.txt"
@@ -65,6 +66,7 @@ readonly COMPUTE_CLUSTER_CACHE="${CACHE_DIR}/compute_clusters.txt"
 readonly NETWORK_RESOURCES_CACHE="${CACHE_DIR}/network_resources.txt"
 readonly BOOT_VOLUME_CACHE="${CACHE_DIR}/boot_volumes.txt"
 readonly IMAGE_CACHE="${CACHE_DIR}/images.txt"
+readonly INSTANCE_CLUSTER_MAP_CACHE="${CACHE_DIR}/instance_cluster_map.txt"
 
 # Network gateway cache files
 readonly IGW_CACHE="${CACHE_DIR}/internet_gateways.txt"
@@ -187,7 +189,9 @@ is_cache_fresh() {
 # Uses trap to ensure cleanup on script exit
 create_temp_file() {
     local tmp
-    tmp=$(mktemp) || { log_error "Failed to create temp file"; return 1; }
+    # Ensure temp directory exists
+    [[ ! -d "$TEMP_DIR" ]] && mkdir -p "$TEMP_DIR"
+    tmp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
     echo "$tmp"
 }
 
@@ -222,6 +226,7 @@ refresh_all_caches() {
     local cache_files=(
         "$FABRIC_CACHE"
         "$CLUSTER_CACHE"
+        "$INSTANCE_CLUSTER_MAP_CACHE"
         "$INSTANCE_CONFIG_CACHE"
         "$NODE_STATE_CACHE"
         "$CAPACITY_TOPOLOGY_CACHE"
@@ -310,7 +315,7 @@ fetch_gpu_clusters() {
     local compartment="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     [[ -z "$compartment" ]] && { log_warn "COMPARTMENT_ID not set. GPU cluster details unavailable."; return 1; }
     
-    is_cache_fresh "$CLUSTER_CACHE" && return 0
+    is_cache_fresh "$CLUSTER_CACHE" && is_cache_fresh "$INSTANCE_CLUSTER_MAP_CACHE" && return 0
     
     log_info "Fetching GPU memory clusters from OCI..."
     
@@ -326,11 +331,16 @@ fetch_gpu_clusters() {
         return 1
     fi
     
-    # Write cache header
+    # Write cache headers
     {
         echo "# GPU Memory Clusters"
         echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId|Size"
     } > "$CLUSTER_CACHE"
+    
+    {
+        echo "# Instance to GPU Memory Cluster Mapping"
+        echo "# Format: InstanceOCID|ClusterOCID|ClusterDisplayName"
+    } > "$INSTANCE_CLUSTER_MAP_CACHE"
     
     # Get cluster IDs and fetch details for each to get instance-configuration-id and compute-cluster-id
     local cluster_ids
@@ -343,12 +353,17 @@ fetch_gpu_clusters() {
         local cluster_detail_file
         cluster_detail_file=$(create_temp_file) || continue
         
+        local cluster_display_name=""
+        
         if oci compute compute-gpu-memory-cluster get \
                 --compute-gpu-memory-cluster-id "$cluster_id" \
                 --output json > "$cluster_detail_file" 2>/dev/null; then
             
             # Validate JSON before processing
             if jq -e '.data' "$cluster_detail_file" > /dev/null 2>&1; then
+                # Extract display name for mapping
+                cluster_display_name=$(jq -r '.data["display-name"] // "N/A"' "$cluster_detail_file")
+                
                 # Try gpu-memory-fabric-id first, then fallback to extracting from display name
                 jq -r '
                     .data["display-name"] as $name |
@@ -364,10 +379,43 @@ fetch_gpu_clusters() {
         fi
         
         rm -f "$cluster_detail_file"
+        
+        # Fetch instances belonging to this cluster
+        local instances_json
+        instances_json=$(create_temp_file) || continue
+        
+        if oci compute compute-gpu-memory-cluster-instance-summary list-compute-gpu-memory-cluster-instances \
+                --compute-gpu-memory-cluster-id "$cluster_id" \
+                --all \
+                --output json > "$instances_json" 2>/dev/null; then
+            
+            # Extract instance OCIDs and map them to this cluster
+            jq -r --arg cluster_id "$cluster_id" --arg cluster_name "$cluster_display_name" '
+                (.data.items // .data // [])[] | 
+                "\(.["instance-id"] // .id)|\($cluster_id)|\($cluster_name)"
+            ' "$instances_json" >> "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null
+        fi
+        
+        rm -f "$instances_json"
     done
     
     rm -f "$raw_json"
     return 0
+}
+
+# Lookup GPU memory cluster OCID for an instance
+get_instance_gpu_cluster() {
+    local instance_ocid="$1"
+    [[ -z "$instance_ocid" || ! -f "$INSTANCE_CLUSTER_MAP_CACHE" ]] && { echo "N/A"; return 1; }
+    
+    local result
+    result=$(grep "^${instance_ocid}|" "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null | head -1 | cut -d'|' -f2)
+    
+    if [[ -n "$result" ]]; then
+        echo "$result"
+    else
+        echo "N/A"
+    fi
 }
 
 # Fetch and cache all instance configurations from OCI
@@ -482,7 +530,7 @@ decode_user_data() {
     
     # Decode to temp file
     local tmp_decoded
-    tmp_decoded=$(mktemp)
+    tmp_decoded=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
     
     # Check if gzip compressed (magic bytes: 1f 8b)
@@ -514,7 +562,7 @@ decode_user_data_to_file() {
     
     # Decode to temp file
     local tmp_decoded
-    tmp_decoded=$(mktemp)
+    tmp_decoded=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
     
     # Check if gzip compressed (magic bytes: 1f 8b)
@@ -554,7 +602,7 @@ is_user_data_gzip() {
     
     # Decode to temp file and check magic bytes
     local tmp_decoded
-    tmp_decoded=$(mktemp)
+    tmp_decoded=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     echo "$user_data_b64" | base64 -d > "$tmp_decoded" 2>/dev/null
     
     local magic_bytes
@@ -2313,8 +2361,8 @@ fetch_and_display_console_history() {
     
     # Use temp file for reliability
     local temp_output temp_error
-    temp_output=$(mktemp)
-    temp_error=$(mktemp)
+    temp_output=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    temp_error=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     # Capture the raw command output for display if empty
     local raw_output
@@ -2462,9 +2510,9 @@ list_instances_not_in_k8s() {
     local orphan_temp
     orphan_temp=$(create_temp_file) || return 1
     
-    # oci_temp format: display_name|status|instance_ocid|gpu_mem|shape|time_created
-    local display_name status instance_ocid gpu_mem shape time_created
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
+    # oci_temp format: display_name|status|instance_ocid|gpu_mem_tag|shape|time_created
+    local display_name status instance_ocid gpu_mem_tag shape time_created
+    while IFS='|' read -r display_name status instance_ocid gpu_mem_tag shape time_created; do
         [[ -z "$instance_ocid" ]] && continue
         
         # Skip bastion and operator instances - they're not supposed to be in K8s
@@ -2472,6 +2520,11 @@ list_instances_not_in_k8s() {
         if [[ "$display_name_lower" == *bastion* || "$display_name_lower" == *operator* ]]; then
             continue
         fi
+        
+        # Look up GPU memory cluster from API-based cache (preferred) or fall back to tag
+        local gpu_mem
+        gpu_mem=$(get_instance_gpu_cluster "$instance_ocid")
+        [[ "$gpu_mem" == "N/A" && "$gpu_mem_tag" != "N/A" ]] && gpu_mem="$gpu_mem_tag"
         
         # Use grep without ^ anchor because providerID has oci:// prefix
         if ! grep -q "$instance_ocid" "$k8s_temp" 2>/dev/null; then
@@ -2690,21 +2743,26 @@ list_all_instances() {
     
     # Print table header with spanning headers
     # Column positions: DisplayName(28) Node(15) State(7) CliqueID(43) State(11) OCID(95) Name(12) State(10) State(10) Announce(18)
-    printf "${BOLD}%-28s%-66s%-107s%-23s%-11s%-11s${NC}\n" \
+    printf "${BOLD}%-28s%-73s%-107s%-23s%-11s%-11s${NC}\n" \
     "" \
-    "┌──────────────────────────── K8s ────────────────────────────┐" \
-    "┌──────────────────────────────────── OCI Instance ──────────────────────────────────────┐" \
-    "┌─ GPU Mem Cluster ─┐" \
-    "CapTopo" \
-    "Maintenance"
+    "┌──────────────────────────── K8s ─────────────────────────────────┐" \
+    "┌──────────────────────────────────── OCI Instance ─────────────────────────────────────────────────────┐" \
+    "┌─── GPU Mem Cluster ───┐" \
+    "  CapTopo" \
+    "  Maintenance"
     printf "${BOLD}%-28s %-15s %-7s %-43s %-11s %-95s %-12s %-10s %-10s %-18s${NC}\n" \
         "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "Name" "State" "State" "Announce"
     print_separator 280
     
     # Process and collect data for sorting
-    local display_name status instance_ocid gpu_mem shape time_created
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
+    local display_name status instance_ocid gpu_mem_tag shape time_created
+    while IFS='|' read -r display_name status instance_ocid gpu_mem_tag shape time_created; do
         [[ -z "$instance_ocid" ]] && continue
+        
+        # Look up GPU memory cluster from API-based cache (preferred) or fall back to tag
+        local gpu_mem
+        gpu_mem=$(get_instance_gpu_cluster "$instance_ocid")
+        [[ "$gpu_mem" == "N/A" && "$gpu_mem_tag" != "N/A" ]] && gpu_mem="$gpu_mem_tag"
         
         local k8s_info node_name clique_id node_state
         # k8s_temp format: providerID|nodeName|clique|gpuPresent
@@ -2777,7 +2835,20 @@ list_all_instances() {
             has_gpu_mem_instances=true
         fi
         
-        if [[ "$has_gpu_memory_infra" == "true" || "$has_gpu_mem_instances" == "true" ]]; then
+        # Also check if any K8s nodes have clique labels (field 3 != N/A)
+        # k8s_temp format: providerID|nodeName|clique|gpuPresent
+        local has_k8s_cliques=false
+        if awk -F'|' '$3 != "N/A" && $3 != "" {found=1; exit} END {exit !found}' "$k8s_temp" 2>/dev/null; then
+            has_k8s_cliques=true
+        fi
+        
+        # Also check if the instance-cluster map has entries (from GPU Memory Cluster API)
+        local has_instance_cluster_map=false
+        if [[ -f "$INSTANCE_CLUSTER_MAP_CACHE" ]] && grep -qv '^#' "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null; then
+            has_instance_cluster_map=true
+        fi
+        
+        if [[ "$has_gpu_memory_infra" == "true" || "$has_gpu_mem_instances" == "true" || "$has_k8s_cliques" == "true" || "$has_instance_cluster_map" == "true" ]]; then
             display_clique_summary "$oci_temp" "$k8s_temp"
             
             echo ""
@@ -3690,169 +3761,173 @@ display_clique_summary() {
     local joined_temp
     joined_temp=$(create_temp_file) || return 1
     
-    # Join OCI and K8s data (oci_temp format: display_name|status|instance_ocid|gpu_mem|shape|time_created)
-    local display_name status instance_ocid gpu_mem shape time_created
-    while IFS='|' read -r display_name status instance_ocid gpu_mem shape time_created; do
-        [[ -z "$instance_ocid" ]] && continue
-        
-        local k8s_info
-        # k8s_temp format: providerID|nodeName|clique|gpuPresent
-        k8s_info=$(grep "$instance_ocid" "$k8s_temp" 2>/dev/null)
-        if [[ -n "$k8s_info" ]]; then
-            local node_name clique_id
-            IFS='|' read -r _ node_name clique_id _ <<< "$k8s_info"
-            # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
-            echo "${display_name}|${node_name}|${status}|${instance_ocid}|${gpu_mem}|${clique_id}" >> "$joined_temp"
-        elif [[ "$gpu_mem" != "N/A" && -n "$gpu_mem" ]]; then
-            # Instance has GPU memory cluster tag but not in K8s yet
-            # Use "NOT_IN_K8S" as clique_id placeholder
-            echo "${display_name}|-|${status}|${instance_ocid}|${gpu_mem}|NOT_IN_K8S" >> "$joined_temp"
+    # Debug: Check file contents
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        echo -e "${GRAY}[DEBUG] oci_temp has $(wc -l < "$oci_temp") lines${NC}" >&2
+        echo -e "${GRAY}[DEBUG] k8s_temp has $(wc -l < "$k8s_temp") lines${NC}" >&2
+        if [[ -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+            local map_count
+            map_count=$(grep -v '^#' "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null | wc -l)
+            echo -e "${GRAY}[DEBUG] Instance-to-cluster map has $map_count entries${NC}" >&2
+        else
+            echo -e "${GRAY}[DEBUG] Instance-to-cluster map cache NOT FOUND at $INSTANCE_CLUSTER_MAP_CACHE${NC}" >&2
         fi
-    done < "$oci_temp"
+    fi
     
-    local unique_cliques
-    unique_cliques=$(awk -F'|' '{print $6}' "$joined_temp" | sort -u)
+    # APPROACH:
+    # 1. Start from Instance-Cluster Map (instances in GPU memory clusters via API)
+    # 2. For each instance, check if it's in K8s (k8s_temp)
+    # 3. If in K8s, get the clique label
+    # 4. Group by GPU Memory Cluster (not clique)
     
-    echo -e "${BOLD}${BLUE}=== Summary by GPU Clique ===${NC}"
+    local k8s_found=0 k8s_not_found=0
+    
+    # Process instances from the instance-cluster map cache
+    # Format: InstanceOCID|ClusterOCID|ClusterDisplayName
+    if [[ -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+        while IFS='|' read -r instance_ocid gpu_cluster_ocid cluster_name; do
+            # Skip header lines
+            [[ "$instance_ocid" == \#* ]] && continue
+            [[ -z "$instance_ocid" ]] && continue
+            
+            # Get instance display name from oci_temp
+            # oci_temp format: display_name|status|instance_ocid|gpu_mem_tag|shape|time_created
+            local oci_line display_name status
+            oci_line=$(grep "|${instance_ocid}|" "$oci_temp" 2>/dev/null | head -1)
+            if [[ -n "$oci_line" ]]; then
+                IFS='|' read -r display_name status _ _ _ _ <<< "$oci_line"
+            else
+                # Instance not in oci_temp (maybe filtered out or different compartment)
+                display_name="(unknown)"
+                status="UNKNOWN"
+            fi
+            
+            # Check if instance is in K8s
+            # k8s_temp format: providerID|nodeName|clique|gpuPresent
+            local k8s_info
+            k8s_info=$(grep "$instance_ocid" "$k8s_temp" 2>/dev/null)
+            
+            if [[ -n "$k8s_info" ]]; then
+                ((k8s_found++))
+                local node_name clique_id
+                IFS='|' read -r _ node_name clique_id _ <<< "$k8s_info"
+                
+                # Use K8s clique if available, otherwise mark as no clique
+                if [[ -n "$clique_id" && "$clique_id" != "N/A" ]]; then
+                    # joined format: display_name|node_name|status|instance_ocid|gpu_cluster_ocid|clique_id|in_k8s
+                    echo "${display_name}|${node_name}|${status}|${instance_ocid}|${gpu_cluster_ocid}|${clique_id}|YES" >> "$joined_temp"
+                else
+                    # In K8s but no clique label
+                    echo "${display_name}|${node_name}|${status}|${instance_ocid}|${gpu_cluster_ocid}|N/A|YES" >> "$joined_temp"
+                fi
+            else
+                ((k8s_not_found++))
+                # Instance is in GPU memory cluster but NOT in K8s
+                echo "${display_name}|-|${status}|${instance_ocid}|${gpu_cluster_ocid}|N/A|NO" >> "$joined_temp"
+            fi
+        done < "$INSTANCE_CLUSTER_MAP_CACHE"
+    else
+        log_warn "Instance-cluster map cache not found. Run with --refresh to build cache."
+    fi
+    
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        echo -e "${GRAY}[DEBUG] Total from GPU clusters: K8s found=$k8s_found, NOT_IN_K8S=$k8s_not_found${NC}" >&2
+        echo -e "${GRAY}[DEBUG] joined_temp has $(wc -l < "$joined_temp") lines${NC}" >&2
+    fi
+    
+    echo -e "${BOLD}${BLUE}=== Summary by GPU Memory Cluster ===${NC}"
     echo ""
     
     local summary_temp
     summary_temp=$(create_temp_file) || { rm -f "$joined_temp"; return 1; }
     
-    local clique
-    while read -r clique; do
-        [[ -z "$clique" ]] && continue
-        
-        local clique_display="$clique"
-        [[ "$clique" == "N/A" ]] && clique_display="N/A (No GPU or not in cluster)"
-        [[ "$clique" == "NOT_IN_K8S" ]] && clique_display="NOT_IN_K8S (Instances not joined to cluster)"
-        
-        local clique_size
-        clique_size=$(grep -c "|${clique}\$" "$joined_temp" 2>/dev/null) || clique_size=0
-        
-        local clique_entries
-        clique_entries=$(grep "|${clique}\$" "$joined_temp")
-        
-        # Get unique GPU memory clusters for this clique
-        declare -A gpu_clusters_count
-        declare -A gpu_clusters_fabrics
-        declare -A gpu_clusters_states
-        declare -A gpu_clusters_instance_configs
-        declare -A gpu_clusters_compute_clusters
-        declare -A gpu_clusters_sizes
-        
-        # joined format: display_name|node_name|status|instance_ocid|gpu_mem|clique_id
-        while IFS='|' read -r _ _ _ inst_ocid gm _; do
-            # Track GPU memory clusters
-            if [[ -n "$gm" && -z "${gpu_clusters_count[$gm]:-}" ]]; then
-                gpu_clusters_count[$gm]=1
-                if [[ "$gm" != "N/A" ]]; then
-                    gpu_clusters_fabrics[$gm]=$(get_fabric_from_cluster "$gm")
-                    gpu_clusters_states[$gm]=$(get_cluster_state "$gm")
-                    gpu_clusters_instance_configs[$gm]=$(get_instance_config_from_cluster "$gm")
-                    gpu_clusters_compute_clusters[$gm]=$(get_compute_cluster_from_gpu_cluster "$gm")
-                    gpu_clusters_sizes[$gm]=$(get_cluster_size "$gm")
-                fi
-            elif [[ -n "$gm" ]]; then
-                ((gpu_clusters_count[$gm]++))
-            fi
-        done <<< "$clique_entries"
-        
-        # Get first cluster info for summary
-        local first_gpu_mem
-        first_gpu_mem=$(echo "${!gpu_clusters_count[@]}" | tr ' ' '\n' | sort | head -n1)
-        
-        local fabric_name="N/A"
-        local fabric_ocid="N/A"
-        local cluster_state="N/A"
-        local instance_config_id="N/A"
-        local compute_cluster_id="N/A"
-        local healthy_hosts="N/A"
-        local available_hosts="N/A"
-        local total_hosts="N/A"
-        local current_firmware="N/A"
-        local target_firmware="N/A"
-        local firmware_update_state="N/A"
-        local gpu_cluster_size="N/A"
-        
-        if [[ -n "$first_gpu_mem" && "$first_gpu_mem" != "N/A" ]]; then
-            # Fabric format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState
-            local fabric_line="${gpu_clusters_fabrics[$first_gpu_mem]}"
-            IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_line"
-            cluster_state="${gpu_clusters_states[$first_gpu_mem]}"
-            instance_config_id="${gpu_clusters_instance_configs[$first_gpu_mem]}"
-            compute_cluster_id="${gpu_clusters_compute_clusters[$first_gpu_mem]}"
-            gpu_cluster_size="${gpu_clusters_sizes[$first_gpu_mem]}"
-        fi
-        
-        # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts|current_firmware|target_firmware|firmware_update_state|gpu_cluster_size
-        echo "${clique_display}|${clique_size}|${#gpu_clusters_count[@]}|${first_gpu_mem}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}|${current_firmware}|${target_firmware}|${firmware_update_state}|${gpu_cluster_size}" >> "$summary_temp"
-        
-        unset gpu_clusters_count gpu_clusters_fabrics gpu_clusters_states gpu_clusters_instance_configs gpu_clusters_compute_clusters gpu_clusters_sizes
-    done <<< "$unique_cliques"
+    # Get unique GPU Memory Clusters (field 5)
+    local unique_clusters
+    unique_clusters=$(awk -F'|' '{print $5}' "$joined_temp" 2>/dev/null | sort -u)
     
-    # Track which GPU memory clusters have been displayed
-    local displayed_clusters=""
-    while IFS='|' read -r _ _ _ inst_ocid gm _; do
-        [[ -n "$gm" && "$gm" != "N/A" ]] && displayed_clusters="${displayed_clusters}${gm}|"
-    done < "$joined_temp"
-    
-    # Find GPU memory clusters that exist but have no instances
+    # Also add clusters from cache that have no instances yet
     if [[ -f "$CLUSTER_CACHE" ]]; then
-        while IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size; do
+        while IFS='|' read -r cluster_ocid cluster_name cluster_state _; do
             [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
             [[ -z "$cluster_ocid" ]] && continue
             # Only include active-ish states
             [[ "$cluster_state" != "ACTIVE" && "$cluster_state" != "UPDATING" && "$cluster_state" != "SCALING" && "$cluster_state" != "CREATING" ]] && continue
-            # Skip if already displayed
-            [[ "$displayed_clusters" == *"${cluster_ocid}|"* ]] && continue
-            
-            # This cluster has no instances - add to summary
-            local fabric_info
-            fabric_info=$(get_fabric_from_cluster "$cluster_ocid")
-            local fabric_name fabric_ocid healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state
-            IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_info"
-            
-            # Format: clique_display|clique_size|num_clusters|first_gpu_mem|cluster_state|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts|current_firmware|target_firmware|firmware_update_state|gpu_cluster_size
-            echo "NO_INSTANCES (${cluster_name})|0|1|${cluster_ocid}|${cluster_state}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}|${current_firmware}|${target_firmware}|${firmware_update_state}|${cluster_size}" >> "$summary_temp"
+            # Add if not already in list
+            if ! echo "$unique_clusters" | grep -q "^${cluster_ocid}$"; then
+                unique_clusters="${unique_clusters}"$'\n'"${cluster_ocid}"
+            fi
         done < <(grep -v '^#' "$CLUSTER_CACHE" 2>/dev/null)
     fi
     
-    # Print summary table
-    # Clique ID, then counts, then State - GPU Memory Cluster moved to tree below
-    # Add spanning headers for K8s, GPU Memory Fabric, and GPU Mem Cluster columns
-    printf "${BOLD}%-48s   K8s  ┌─ GPU Memory Fabric ─┐  GPU Mem Cluster${NC}\n" ""
-    printf "${BOLD}%-48s %6s %8s %6s %6s       %6s       %-12s${NC}\n" \
-        "Clique ID" "Nodes" "Healthy" "Avail" "Total" "Size" "State"
-    print_separator 106
+    # Process each GPU Memory Cluster
+    local gpu_cluster_ocid
+    while read -r gpu_cluster_ocid; do
+        [[ -z "$gpu_cluster_ocid" ]] && continue
+        
+        # Get cluster info from cache
+        local cluster_name cluster_state cluster_size instance_config_id compute_cluster_id
+        local cluster_line
+        cluster_line=$(grep "^${gpu_cluster_ocid}|" "$CLUSTER_CACHE" 2>/dev/null | head -1)
+        
+        if [[ -n "$cluster_line" ]]; then
+            # CLUSTER_CACHE format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigID|ComputeClusterID|Size
+            IFS='|' read -r _ cluster_name cluster_state _ instance_config_id compute_cluster_id cluster_size <<< "$cluster_line"
+        else
+            cluster_name="(unknown)"
+            cluster_state="UNKNOWN"
+            cluster_size="0"
+            instance_config_id="N/A"
+            compute_cluster_id="N/A"
+        fi
+        
+        # Get fabric info
+        local fabric_info fabric_name fabric_ocid healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state
+        fabric_info=$(get_fabric_from_cluster "$gpu_cluster_ocid")
+        IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_info"
+        
+        # Count instances in this cluster
+        local cluster_entries total_instances in_k8s_count not_in_k8s_count
+        cluster_entries=$(grep "|${gpu_cluster_ocid}|" "$joined_temp" 2>/dev/null)
+        total_instances=$(echo "$cluster_entries" | grep -c . 2>/dev/null) || total_instances=0
+        in_k8s_count=$(echo "$cluster_entries" | grep -c "|YES$" 2>/dev/null) || in_k8s_count=0
+        not_in_k8s_count=$(echo "$cluster_entries" | grep -c "|NO$" 2>/dev/null) || not_in_k8s_count=0
+        
+        # Get unique cliques in this cluster
+        local cliques_list
+        cliques_list=$(echo "$cluster_entries" | awk -F'|' '$7=="YES" && $6!="N/A" {print $6}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        [[ -z "$cliques_list" ]] && cliques_list="-"
+        
+        # Format: cluster_name|gpu_cluster_ocid|cluster_state|cluster_size|in_k8s_count|not_in_k8s_count|cliques_list|fabric_name|fabric_ocid|instance_config_id|compute_cluster_id|healthy_hosts|available_hosts|total_hosts|current_firmware|target_firmware|firmware_update_state
+        echo "${cluster_name}|${gpu_cluster_ocid}|${cluster_state}|${cluster_size}|${in_k8s_count}|${not_in_k8s_count}|${cliques_list}|${fabric_name}|${fabric_ocid}|${instance_config_id}|${compute_cluster_id}|${healthy_hosts}|${available_hosts}|${total_hosts}|${current_firmware}|${target_firmware}|${firmware_update_state}" >> "$summary_temp"
+    done <<< "$unique_clusters"
     
-    # Sort summary: N/A first, NOT_IN_K8S second, NO_INSTANCES third, then by clique ID
+    # Check if we have any data
+    if [[ ! -s "$summary_temp" ]]; then
+        echo -e "${YELLOW}No GPU Memory Clusters found.${NC}"
+        rm -f "$joined_temp" "$summary_temp"
+        return 0
+    fi
+    
+    # Print summary table header - matching old format
+    printf "${BOLD}%44s K8s  ┌─GPU Memory Fabric─┐ GPU Mem Cluster${NC}\n" ""
+    printf "${BOLD}%-30s %-12s %5s  %7s %5s %5s       %4s       %-12s${NC}\n" \
+        "GPU Memory Cluster" "State" "Nodes" "Healthy" "Avail" "Total" "Size" ""
+    print_separator 110
+    
+    # Sort summary by cluster name
     local sorted_summary
-    sorted_summary=$(sort -t'|' -k1,1 "$summary_temp" | awk -F'|' '
-        /^N\/A / { na[NR] = $0; next }
-        /^NOT_IN_K8S/ { notink8s[NR] = $0; next }
-        /^NO_INSTANCES/ { noinst[NR] = $0; next }
-        { other[NR] = $0 }
-        END {
-            for (i in na) print na[i]
-            for (i in notink8s) print notink8s[i]
-            for (i in other) print other[i]
-            for (i in noinst) print noinst[i]
-        }
-    ')
+    sorted_summary=$(sort -t'|' -k1,1 "$summary_temp")
     
     # Calculate totals
-    local total_k8s_nodes=0
-    local total_gpu_cluster_size=0
+    local total_size=0 total_in_k8s=0 total_not_in_k8s=0
     
-    local clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size
-    while IFS='|' read -r clique_id nodes clusters gpu_mem_cluster cluster_state fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state gpu_cluster_size; do
-        # Add to totals (skip N/A, NOT_IN_K8S, NO_INSTANCES for K8s nodes count)
-        if [[ "$clique_id" != "N/A"* && "$clique_id" != "NOT_IN_K8S"* && "$clique_id" != "NO_INSTANCES"* ]]; then
-            [[ "$nodes" =~ ^[0-9]+$ ]] && total_k8s_nodes=$((total_k8s_nodes + nodes))
-        fi
-        # Add to GPU cluster size totals
-        [[ "$gpu_cluster_size" =~ ^[0-9]+$ ]] && total_gpu_cluster_size=$((total_gpu_cluster_size + gpu_cluster_size))
+    while IFS='|' read -r cluster_name gpu_cluster_ocid cluster_state cluster_size in_k8s_count not_in_k8s_count cliques_list fabric_name fabric_ocid instance_config_id compute_cluster_id healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state; do
+        [[ -z "$cluster_name" ]] && continue
+        
+        # Add to totals
+        [[ "$cluster_size" =~ ^[0-9]+$ ]] && total_size=$((total_size + cluster_size))
+        [[ "$in_k8s_count" =~ ^[0-9]+$ ]] && total_in_k8s=$((total_in_k8s + in_k8s_count))
+        [[ "$not_in_k8s_count" =~ ^[0-9]+$ ]] && total_not_in_k8s=$((total_not_in_k8s + not_in_k8s_count))
         
         # Color state based on value
         local state_color
@@ -3862,72 +3937,102 @@ display_clique_summary() {
         local avail_color="$WHITE"
         [[ "$available_hosts" != "0" && "$available_hosts" != "N/A" ]] && avail_color="$LIGHT_GREEN"
         
-        # Color clique ID - yellow for NO_INSTANCES entries
-        local clique_color="$CYAN"
-        [[ "$clique_id" == NO_INSTANCES* ]] && clique_color="$YELLOW"
+        # Color not_in_k8s - yellow if > 0 (nodes not in k8s)
+        local in_k8s_color="$GREEN"
+        [[ "$not_in_k8s_count" -gt 0 ]] && in_k8s_color="$YELLOW"
         
-        printf "${clique_color}%-48s${NC} ${WHITE}%6s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC} ${WHITE}%6s${NC}       ${WHITE}%6s${NC}       ${state_color}%-12s${NC}\n" \
-            "$clique_id" "$nodes" "$healthy_hosts" "$available_hosts" "$total_hosts" "$gpu_cluster_size" "$cluster_state"
+        # Truncate cluster name if needed
+        local cluster_name_display="${cluster_name:0:28}"
         
-        # Fabric (first)
-        if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            printf "          ${WHITE}├─${NC} ${BOLD}${ORANGE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "Fabric:" "$fabric_name" "$fabric_ocid"
+        # Main summary line - K8s Nodes shows "in_k8s/total" format if there are nodes not in k8s
+        local k8s_display="$in_k8s_count"
+        if [[ "$not_in_k8s_count" -gt 0 ]]; then
+            k8s_display="${in_k8s_count}/${cluster_size}"
         fi
         
-        # GPU Memory Cluster
-        if is_valid_ocid "$gpu_mem_cluster"; then
-            local gpu_cluster_name
-            gpu_cluster_name=$(lookup_cache "$CLUSTER_CACHE" "$gpu_mem_cluster" 2 2>/dev/null || echo "N/A")
-            printf "          ${WHITE}├─${NC} ${BOLD}${MAGENTA}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "GPU Mem Cluster:" "$gpu_cluster_name" "$gpu_mem_cluster"
+        printf "${MAGENTA}%-30s${NC} ${state_color}%-12s${NC} ${in_k8s_color}%5s${NC}  ${WHITE}%7s${NC} ${avail_color}%5s${NC} ${WHITE}%5s${NC}       ${WHITE}%4s${NC}\n" \
+            "$cluster_name_display" "$cluster_state" "$k8s_display" "$healthy_hosts" "$available_hosts" "$total_hosts" "$cluster_size"
+        
+        # Determine which is the last item for tree drawing
+        local has_cliques=false has_fabric=false has_compute=false has_config=false has_firmware=false
+        [[ "$cliques_list" != "-" && -n "$cliques_list" ]] && has_cliques=true
+        [[ "$fabric_name" != "N/A" && -n "$fabric_name" ]] && has_fabric=true
+        is_valid_ocid "$compute_cluster_id" && has_compute=true
+        is_valid_ocid "$instance_config_id" && has_config=true
+        [[ "$current_firmware" != "N/A" && -n "$current_firmware" ]] && has_firmware=true
+        
+        # Tree view - all items including OCID and Cliques
+        # Cliques (first in tree)
+        if [[ "$has_cliques" == true ]]; then
+            local tree_char="├"
+            [[ "$has_fabric" == false && "$has_compute" == false && "$has_config" == false && "$has_firmware" == false ]] && tree_char="└"
+            printf "  ${WHITE}%s─${NC} ${BOLD}${CYAN}Cliques:${NC}      ${CYAN}%s${NC}\n" "$tree_char" "$cliques_list"
+        fi
+        
+        # GPU Memory Cluster OCID (aligned with other OCIDs)
+        local tree_char="├"
+        [[ "$has_fabric" == false && "$has_compute" == false && "$has_config" == false && "$has_firmware" == false ]] && tree_char="└"
+        printf "  ${WHITE}%s─${NC} ${BOLD}${MAGENTA}GPU Cluster:${NC}  %-45s ${YELLOW}%s${NC}\n" "$tree_char" "${cluster_name:0:45}" "$gpu_cluster_ocid"
+        
+        # Fabric
+        if [[ "$has_fabric" == true ]]; then
+            tree_char="├"
+            [[ "$has_compute" == false && "$has_config" == false && "$has_firmware" == false ]] && tree_char="└"
+            printf "  ${WHITE}%s─${NC} ${BOLD}${ORANGE}Fabric:${NC}       %-45s ${YELLOW}%s${NC}\n" \
+                "$tree_char" "${fabric_name:0:45}" "$fabric_ocid"
         fi
         
         # Compute Cluster
-        if is_valid_ocid "$compute_cluster_id"; then
+        if [[ "$has_compute" == true ]]; then
             local compute_cluster_name
             compute_cluster_name=$(get_compute_cluster_name "$compute_cluster_id")
-            printf "          ${WHITE}├─${NC} ${BOLD}${BLUE}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "Compute Cluster:" "$compute_cluster_name" "$compute_cluster_id"
+            tree_char="├"
+            [[ "$has_config" == false && "$has_firmware" == false ]] && tree_char="└"
+            printf "  ${WHITE}%s─${NC} ${BOLD}${BLUE}Compute:${NC}      %-45s ${YELLOW}%s${NC}\n" \
+                "$tree_char" "${compute_cluster_name:0:45}" "$compute_cluster_id"
         fi
         
         # Instance Config
-        if is_valid_ocid "$instance_config_id"; then
+        if [[ "$has_config" == true ]]; then
             local instance_config_name
             instance_config_name=$(get_instance_config_name "$instance_config_id")
-            printf "          ${WHITE}├─${NC} ${BOLD}${GREEN}%-18s${NC} ${WHITE}%-44s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "Instance Config:" "$instance_config_name" "$instance_config_id"
+            tree_char="├"
+            [[ "$has_firmware" == false ]] && tree_char="└"
+            printf "  ${WHITE}%s─${NC} ${BOLD}${GREEN}Inst Config:${NC}  %-45s ${YELLOW}%s${NC}\n" \
+                "$tree_char" "${instance_config_name:0:45}" "$instance_config_id"
         fi
         
-        # Firmware (last)
-        if [[ "$fabric_name" != "N/A" && "$fabric_ocid" != "N/A" ]]; then
-            if [[ "$current_firmware" != "N/A" && -n "$current_firmware" ]]; then
-                local current_short="${current_firmware: -5}"
-                local target_short="${target_firmware: -5}"
-                local firmware_color="$WHITE"
-                
-                # Highlight in red if current != target
-                if [[ "$current_firmware" != "$target_firmware" && "$target_firmware" != "N/A" && -n "$target_firmware" ]]; then
-                    firmware_color="$RED"
-                fi
-                
-                # Color firmware update state
-                local update_state_color
-                update_state_color=$(color_firmware_state "$firmware_update_state")
-                
-                printf "          ${WHITE}└─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${update_state_color}%-12s${NC} ${firmware_color}current: %-10s target: %-10s${NC}\n" \
-                    "$firmware_update_state" "$current_short" "$target_short"
+        # Firmware (always last if present)
+        if [[ "$has_firmware" == true ]]; then
+            # Get last 5 chars of firmware versions
+            local current_short="${current_firmware: -5}"
+            local target_short="${target_firmware: -5}"
+            
+            # Color firmware update state
+            local update_state_color
+            update_state_color=$(color_firmware_state "$firmware_update_state")
+            
+            # Highlight target in red if current != target
+            local target_color="$YELLOW"
+            if [[ "$current_firmware" != "$target_firmware" && "$target_firmware" != "N/A" && -n "$target_firmware" ]]; then
+                target_color="$RED"
             fi
+            
+            printf "  ${WHITE}└─${NC} ${BOLD}${ORANGE}Firmware:${NC}     ${update_state_color}%-14s${NC} current: ${YELLOW}%-8s${NC} target: ${target_color}%s${NC}\n" \
+                "$firmware_update_state" "$current_short" "$target_short"
         fi
+        
         echo ""
     done <<< "$sorted_summary"
     
     # Print totals
-    print_separator 106
-    printf "${BOLD}${WHITE}%-48s %6s %8s %6s %6s       %6s${NC}\n" \
-        "TOTALS" "$total_k8s_nodes" "" "" "" "$total_gpu_cluster_size"
-    echo -e "${GRAY}  Total K8s Nodes (in GPU cliques): ${WHITE}$total_k8s_nodes${NC}"
-    echo -e "${GRAY}  Total GPU Memory Cluster Size: ${WHITE}$total_gpu_cluster_size${NC}"
+    print_separator 110
+    printf "${BOLD}${WHITE}%-30s %-12s %5s  %7s %5s %5s       %4s${NC}\n" \
+        "TOTALS" "" "$total_in_k8s" "" "" "" "$total_size"
+    echo ""
+    echo -e "${GRAY}  Total GPU Memory Cluster Size: ${WHITE}$total_size${NC}"
+    echo -e "${GRAY}  Total Instances in K8s:        ${GREEN}$total_in_k8s${NC}"
+    echo -e "${GRAY}  Total Instances NOT in K8s:    ${RED}$total_not_in_k8s${NC}"
     echo ""
     
     rm -f "$joined_temp" "$summary_temp"
@@ -4552,11 +4657,40 @@ list_instances_by_gpu_cluster() {
     k8s_data=$(create_temp_file) || { rm -f "$oci_data"; return 1; }
     
     log_info "Fetching instance details from OCI..."
+    # Get all instances for general info
+    local all_instances_json
+    all_instances_json=$(create_temp_file) || { rm -f "$oci_data" "$k8s_data"; return 1; }
+    
     oci compute instance list \
         --compartment-id "$compartment_id" \
         --region "$region" \
         --all \
-        --output json 2>/dev/null | jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"' > "$oci_data"
+        --output json 2>/dev/null > "$all_instances_json"
+    
+    # Get instances belonging to this GPU cluster via API (not freeform tag)
+    log_info "Fetching instances in GPU cluster via API..."
+    local cluster_instances_json
+    cluster_instances_json=$(create_temp_file) || { rm -f "$oci_data" "$k8s_data" "$all_instances_json"; return 1; }
+    
+    oci compute compute-gpu-memory-cluster-instance-summary list-compute-gpu-memory-cluster-instances \
+        --compute-gpu-memory-cluster-id "$gpu_cluster" \
+        --all \
+        --output json 2>/dev/null > "$cluster_instances_json"
+    
+    # Extract instance IDs from the cluster
+    local cluster_instance_ids
+    cluster_instance_ids=$(jq -r '(.data.items // .data // [])[] | .["instance-id"] // .id' "$cluster_instances_json" 2>/dev/null)
+    
+    # Build oci_data with only instances in this cluster
+    for inst_id in $cluster_instance_ids; do
+        [[ -z "$inst_id" ]] && continue
+        jq -r --arg id "$inst_id" '
+            .data[] | select(.id == $id) | 
+            "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"
+        ' "$all_instances_json" >> "$oci_data" 2>/dev/null
+    done
+    
+    rm -f "$all_instances_json" "$cluster_instances_json"
     
     log_info "Fetching Kubernetes node data..."
     # Fetch ALL nodes to avoid missing nodes without GPU labels yet
@@ -4568,52 +4702,70 @@ list_instances_by_gpu_cluster() {
     echo ""
     
     # Print table header with spanning headers
-    # Column positions: DisplayName(28) Node(18) State(11) CliqueID(40) State(10) OCID(95) State(10) Announce(18)
-    # K8s spans Node+State+CliqueID (70), OCI Instance spans State+OCID (106), CapTopo spans State (10)
-    printf "${BOLD}%-28s %-74s %-121s %-10s %-18s${NC}\n" \
-        "" "┌─────────────────────────────────────── K8s ─────────────────────────────────────┐" "                                          ┌──────────────────────── OCI Instance ────────────────────────┐" "CapTopo" ""
-    printf "${BOLD}%-28s %-18s %-11s %-40s %-10s %-95s %-10s %-18s${NC}\n" \
-        "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "State" "Announce"
-    print_separator 240
+    # Column positions: DisplayName(28) Node(15) State(7) CliqueID(43) State(11) OCID(95) Name(12) State(10) State(10) Announce(18)
+    printf "${BOLD}%-28s%-66s%-107s%-23s%-11s%-11s${NC}\n" \
+    "" \
+    "┌──────────────────────────── K8s ────────────────────────────┐" \
+    "┌──────────────────────────────────── OCI Instance ──────────────────────────────────────┐" \
+    "┌─ GPU Mem Cluster ─┐" \
+    "CapTopo" \
+    "Maintenance"
+    printf "${BOLD}%-28s %-15s %-7s %-43s %-11s %-95s %-12s %-10s %-10s %-18s${NC}\n" \
+        "Display Name" "Node" "State" "Clique ID" "State" "Instance OCID" "Name" "State" "State" "Announce"
+    print_separator 280
     
-    # Process instances in this cluster
-    local instance_id display_name oci_state gpu_mem
-    grep "|${gpu_cluster}\$" "$oci_data" 2>/dev/null | while IFS='|' read -r instance_id display_name oci_state gpu_mem; do
+    # Process instances in this cluster (oci_data now contains only instances in the cluster)
+    local instance_id display_name oci_state gpu_mem_tag
+    local instances_shown=0
+    local instances_in_k8s=0
+    while IFS='|' read -r instance_id display_name oci_state gpu_mem_tag; do
+        [[ -z "$instance_id" ]] && continue
+        ((instances_shown++))
+        
         local k8s_info
         # k8s_data format: providerID|nodeName|clique
         k8s_info=$(grep "$instance_id" "$k8s_data" 2>/dev/null)
-        [[ -z "$k8s_info" ]] && continue
         
-        local node_name clique_id
-        IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+        local node_name clique_id node_state
+        if [[ -n "$k8s_info" ]]; then
+            ((instances_in_k8s++))
+            IFS='|' read -r _ node_name clique_id <<< "$k8s_info"
+            node_state=$(get_node_state_cached "$instance_id")
+        else
+            node_name="-"
+            clique_id="-"
+            node_state="-"
+        fi
         
-        local node_state cap_topo_state announcements
-        node_state=$(get_node_state_cached "$instance_id")
+        # Get GPU memory cluster name
+        local gpu_mem_name
+        gpu_mem_name=$(get_cluster_name_from_id "$gpu_cluster" 2>/dev/null)
+        [[ -z "$gpu_mem_name" || "$gpu_mem_name" == "N/A" ]] && gpu_mem_name="-"
+        
+        # Get GPU memory cluster state
+        local gpu_mem_state
+        gpu_mem_state=$(get_cluster_state "$gpu_cluster" 2>/dev/null)
+        [[ -z "$gpu_mem_state" || "$gpu_mem_state" == "N/A" ]] && gpu_mem_state="-"
+        
+        local cap_topo_state announcements
         cap_topo_state=$(get_capacity_topology_state "$instance_id")
-        announcements=$(get_resource_announcements "$instance_id" "$gpu_mem")
+        announcements=$(get_resource_announcements "$instance_id" "$gpu_cluster")
         
         # Get colors
-        local ns_color st_color ct_color ann_color
+        local ns_color st_color ct_color ann_color gmc_color
         ns_color=$(color_node_state "$node_state")
         st_color=$(color_oci_state "$oci_state")
         ct_color=$(color_cap_topo_state "$cap_topo_state")
         ann_color=$(color_announcement "$announcements")
+        gmc_color=$(color_cluster_state "$gpu_mem_state")
         
-        printf "%-28s %-18s ${ns_color}%-11s${NC} %-40s ${st_color}%-10s${NC} %-95s ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
-            "$display_name" "$node_name" "$node_state" "$clique_id" "$oci_state" "$instance_id" "$cap_topo_state" "$announcements"
-    done
+        printf "%-28s %-15s ${ns_color}%-7s${NC} %-43s ${st_color}%-11s${NC} %-95s %-12s ${gmc_color}%-10s${NC} ${ct_color}%-10s${NC} ${ann_color}%-18s${NC}\n" \
+            "${display_name:0:27}" "${node_name:0:14}" "$node_state" "${clique_id:0:42}" "$oci_state" "$instance_id" "${gpu_mem_name:0:11}" "$gpu_mem_state" "$cap_topo_state" "$announcements"
+    done < "$oci_data"
     
     echo ""
     
-    # Count total instances
-    local total_count k8s_count
-    total_count=$(grep -c "|${gpu_cluster}\$" "$oci_data" 2>/dev/null) || total_count=0
-    # Use grep without ^ anchor because providerID has oci:// prefix
-    k8s_count=$(grep "|${gpu_cluster}\$" "$oci_data" 2>/dev/null | while IFS='|' read -r id _ _ _; do
-        grep -q "$id" "$k8s_data" 2>/dev/null && echo "1"
-    done | wc -l)
-    
-    echo -e "${CYAN}Total Instances:${NC} $total_count (${k8s_count} in Kubernetes)"
+    echo -e "${CYAN}Total Instances:${NC} $instances_shown (${instances_in_k8s} in Kubernetes)"
     
     rm -f "$oci_data" "$k8s_data"
 }
@@ -4887,11 +5039,13 @@ interactive_management_main_menu() {
         echo -e "  ${GREEN}8${NC}) ${WHITE}NVIDIA GPU Stack Health${NC}       - Check GPU Operator & DRA components per node"
         echo -e "  ${GREEN}9${NC}) ${WHITE}Resource Manager Stacks${NC}       - View stacks, jobs, logs, outputs, and state"
         echo -e "  ${GREEN}10${NC}) ${WHITE}Work Requests${NC}                - View work requests, status, errors, and logs"
+        echo -e "  ${GREEN}11${NC}) ${WHITE}File Storage (FSS)${NC}           - Manage file systems, mount targets, and exports"
+        echo -e "  ${GREEN}12${NC}) ${WHITE}Lustre File Systems${NC}          - Manage Lustre file systems and Object Storage links"
         echo ""
         echo -e "  ${CYAN}c${NC}) ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC}) ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-10, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [1-12, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -4933,6 +5087,12 @@ interactive_management_main_menu() {
             10)
                 manage_work_requests
                 ;;
+            11)
+                manage_file_storage
+                ;;
+            12)
+                manage_lustre_file_systems
+                ;;
             c|C|cache|CACHE)
                 display_cache_stats
                 ;;
@@ -4942,7 +5102,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-10, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter 1-12, c, or q.${NC}"
                 ;;
         esac
     done
@@ -5108,7 +5268,7 @@ display_cache_stats() {
     case "$action" in
         1)
             echo -e "${YELLOW}Clearing GPU caches...${NC}"
-            rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$COMPUTE_CLUSTER_CACHE"
+            rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$COMPUTE_CLUSTER_CACHE"
             echo -e "${GREEN}✓ GPU caches cleared${NC}"
             sleep 1
             display_cache_stats
@@ -8159,7 +8319,10 @@ display_instance_details() {
         # Line 2: Instance lifecycle actions
         echo -e "  ${CYAN}5${NC}) Reboot             ${CYAN}6${NC}) Force reboot       ${CYAN}7${NC}) Stop instance         ${CYAN}8${NC}) Start instance     ${RED}9${NC}) ${RED}TERMINATE${NC}"
         
-        # Line 3: K8s node actions (only if in K8s)
+        # Line 3: Unhealthy tagging options
+        echo -e "  ${YELLOW}t${NC}) Tag unhealthy (keep running)                        ${RED}x${NC}) ${RED}Tag unhealthy + TERMINATE${NC}"
+        
+        # Line 4: K8s node actions (only if in K8s)
         if [[ -n "$k8s_node_name" ]]; then
             echo -e "  ${BLUE}d${NC}) Drain K8s node     ${BLUE}c${NC}) Cordon node        ${BLUE}u${NC}) Uncordon node"
         fi
@@ -8167,7 +8330,7 @@ display_instance_details() {
         echo ""
         echo -e "  ${WHITE}Enter${NC}) Return to list"
         echo ""
-        echo -n -e "${CYAN}Select [r/1-9/d/c/u/Enter]: ${NC}"
+        echo -n -e "${CYAN}Select [r/1-9/t/x/d/c/u/Enter]: ${NC}"
         
         local action
         read -r action
@@ -8470,12 +8633,266 @@ display_instance_details() {
                 read -r
             fi
             ;;
+        t|T|tag|TAG)
+            # Tag instance as unhealthy (no terminate)
+            tag_instance_unhealthy "$instance_ocid" "$display_name" "false"
+            ;;
+        x|X)
+            # Tag instance as unhealthy AND terminate
+            tag_instance_unhealthy "$instance_ocid" "$display_name" "true"
+            ;;
         *)
             # Return to instance list (exit the actions loop)
             break
             ;;
     esac
     done  # End of actions loop
+}
+
+#--------------------------------------------------------------------------------
+# Tag instance as unhealthy with optional terminate
+# Args: $1 = instance OCID, $2 = display name, $3 = terminate (true/false)
+#--------------------------------------------------------------------------------
+tag_instance_unhealthy() {
+    local instance_ocid="$1"
+    local display_name="$2"
+    local do_terminate="${3:-false}"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    # Defined tag namespace and key
+    local tag_namespace="ComputeInstanceHostActions"
+    local tag_key="Unhealthy"
+    local tag_value="true"
+    
+    echo ""
+    if [[ "$do_terminate" == "true" ]]; then
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║              ⚠️  TAG UNHEALTHY + TERMINATE INSTANCE  ⚠️                         ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    else
+        echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║                         TAG INSTANCE AS UNHEALTHY                              ║${NC}"
+        echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    fi
+    echo ""
+    echo -e "${WHITE}Instance:${NC}  ${GREEN}$display_name${NC}"
+    echo -e "${WHITE}OCID:${NC}      ${YELLOW}$instance_ocid${NC}"
+    echo ""
+    echo -e "${WHITE}Tag to apply:${NC}"
+    echo -e "  ${CYAN}Namespace:${NC} ${MAGENTA}$tag_namespace${NC}"
+    echo -e "  ${CYAN}Key:${NC}       ${MAGENTA}$tag_key${NC}"
+    echo -e "  ${CYAN}Value:${NC}     ${MAGENTA}$tag_value${NC}"
+    echo ""
+    
+    if [[ "$do_terminate" == "true" ]]; then
+        echo -e "${RED}⚠️  This will TAG the instance as unhealthy AND TERMINATE it!${NC}"
+        echo ""
+        echo -n -e "${RED}Type 'yes' to confirm TAG + TERMINATE: ${NC}"
+    else
+        echo -e "${YELLOW}This will TAG the instance as unhealthy (instance will continue running).${NC}"
+        echo ""
+        echo -n -e "${CYAN}Confirm tag? (yes/no): ${NC}"
+    fi
+    
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${YELLOW}Operation cancelled${NC}"
+        echo ""
+        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+        read -r
+        return
+    fi
+    
+    # Get current defined tags
+    echo ""
+    echo -e "${YELLOW}Fetching current instance tags...${NC}"
+    
+    local instance_json
+    instance_json=$(oci compute instance get \
+        --instance-id "$instance_ocid" \
+        --region "$region" \
+        --output json 2>&1)
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Failed to fetch instance details:${NC}"
+        echo "$instance_json"
+        echo ""
+        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+        read -r
+        return 1
+    fi
+    
+    # Extract current defined-tags and add our new tag
+    local current_defined_tags
+    current_defined_tags=$(echo "$instance_json" | jq -r '.data["defined-tags"] // {}')
+    
+    # Merge in our new tag (preserving existing tags in the namespace)
+    local updated_defined_tags
+    updated_defined_tags=$(echo "$current_defined_tags" | jq --arg ns "$tag_namespace" --arg key "$tag_key" --arg val "$tag_value" '
+        .[$ns] = ((.[$ns] // {}) + {($key): $val})
+    ')
+    
+    # Build the update command
+    local update_cmd="oci compute instance update --instance-id \"$instance_ocid\" --region \"$region\" --defined-tags '$updated_defined_tags' --force"
+    
+    echo ""
+    echo -e "${WHITE}Command to execute:${NC}"
+    echo -e "${GRAY}$update_cmd${NC}"
+    echo ""
+    
+    # Log the action
+    log_action "TAG_UNHEALTHY" "$update_cmd"
+    
+    # Apply the tag
+    echo -e "${YELLOW}Applying tag...${NC}"
+    
+    local tag_result
+    tag_result=$(oci compute instance update \
+        --instance-id "$instance_ocid" \
+        --region "$region" \
+        --defined-tags "$updated_defined_tags" \
+        --force \
+        --output json 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Instance tagged as unhealthy successfully${NC}"
+        log_action_result "SUCCESS" "Instance $display_name tagged with $tag_namespace.$tag_key=$tag_value"
+        
+        # Verify the tag was applied
+        local applied_tag
+        applied_tag=$(echo "$tag_result" | jq -r --arg ns "$tag_namespace" --arg key "$tag_key" '.data["defined-tags"][$ns][$key] // "NOT_SET"')
+        echo -e "  ${CYAN}Verified:${NC} ${MAGENTA}$tag_namespace.$tag_key${NC} = ${GREEN}$applied_tag${NC}"
+        
+        # If terminate requested, show instance details with the tag first
+        if [[ "$do_terminate" == "true" ]]; then
+            echo ""
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}                           INSTANCE DETAILS WITH APPLIED TAG                                                    ${NC}"
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            
+            # Re-fetch instance to show updated tags
+            local updated_instance_json
+            updated_instance_json=$(oci compute instance get \
+                --instance-id "$instance_ocid" \
+                --region "$region" \
+                --output json 2>/dev/null)
+            
+            if [[ -n "$updated_instance_json" ]]; then
+                # Display key instance info
+                local inst_state inst_shape inst_ad inst_created
+                inst_state=$(echo "$updated_instance_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+                inst_shape=$(echo "$updated_instance_json" | jq -r '.data.shape // "N/A"')
+                inst_ad=$(echo "$updated_instance_json" | jq -r '.data["availability-domain"] // "N/A"')
+                inst_created=$(echo "$updated_instance_json" | jq -r '.data["time-created"] // "N/A"')
+                
+                echo -e "${WHITE}Instance:${NC}       ${GREEN}$display_name${NC}"
+                echo -e "${WHITE}OCID:${NC}           ${YELLOW}$instance_ocid${NC}"
+                echo -e "${WHITE}State:${NC}          ${CYAN}$inst_state${NC}"
+                echo -e "${WHITE}Shape:${NC}          ${CYAN}$inst_shape${NC}"
+                echo -e "${WHITE}AD:${NC}             ${CYAN}${inst_ad##*:}${NC}"
+                echo -e "${WHITE}Created:${NC}        ${GRAY}${inst_created:0:19}${NC}"
+                echo ""
+                
+                # Display defined tags (highlighting the unhealthy tag)
+                echo -e "${WHITE}─── Defined Tags ───${NC}"
+                local defined_tags
+                defined_tags=$(echo "$updated_instance_json" | jq -r '.data["defined-tags"] // {}')
+                
+                if [[ -n "$defined_tags" && "$defined_tags" != "{}" ]]; then
+                    echo "$defined_tags" | jq -r 'to_entries[] | .key as $ns | .value | to_entries[] | "\($ns).\(.key)=\(.value)"' 2>/dev/null | while read -r tag_line; do
+                        if [[ "$tag_line" == *"$tag_namespace.$tag_key"* ]]; then
+                            # Highlight the unhealthy tag
+                            echo -e "  ${RED}★ $tag_line${NC}  ${RED}← UNHEALTHY TAG APPLIED${NC}"
+                        else
+                            echo -e "  ${GRAY}$tag_line${NC}"
+                        fi
+                    done
+                else
+                    echo -e "  ${GRAY}(none)${NC}"
+                fi
+                
+                # Display freeform tags if any
+                local freeform_tags
+                freeform_tags=$(echo "$updated_instance_json" | jq -r '.data["freeform-tags"] // {}')
+                if [[ -n "$freeform_tags" && "$freeform_tags" != "{}" ]]; then
+                    echo ""
+                    echo -e "${WHITE}─── Freeform Tags ───${NC}"
+                    echo "$freeform_tags" | jq -r 'to_entries[] | "  \(.key)=\(.value)"' 2>/dev/null
+                fi
+            fi
+            
+            echo ""
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        fi
+    else
+        echo -e "${RED}✗ Failed to tag instance:${NC}"
+        echo "$tag_result"
+        log_action_result "FAILED" "Failed to tag instance $display_name"
+        echo ""
+        echo -n -e "${CYAN}Press Enter to continue...${NC}"
+        read -r
+        return 1
+    fi
+    
+    # If terminate requested, do it now
+    if [[ "$do_terminate" == "true" ]]; then
+        echo ""
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                    ⚠️  FINAL CONFIRMATION TO TERMINATE  ⚠️                       ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${WHITE}Instance ${GREEN}$display_name${NC}${WHITE} has been tagged as unhealthy.${NC}"
+        echo -e "${RED}Are you sure you want to TERMINATE this instance?${NC}"
+        echo ""
+        echo -n -e "${RED}Type 'TERMINATE' to proceed (or anything else to cancel): ${NC}"
+        
+        local final_confirm
+        read -r final_confirm
+        
+        if [[ "$final_confirm" != "TERMINATE" ]]; then
+            echo -e "${YELLOW}Termination cancelled. Instance remains tagged as unhealthy.${NC}"
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            return 0
+        fi
+        
+        echo ""
+        echo -e "${RED}Proceeding with instance termination...${NC}"
+        
+        local terminate_cmd="oci compute instance terminate --instance-id \"$instance_ocid\" --region \"$region\" --preserve-boot-volume false --force"
+        
+        echo ""
+        echo -e "${WHITE}Command to execute:${NC}"
+        echo -e "${GRAY}$terminate_cmd${NC}"
+        echo ""
+        
+        log_action "TERMINATE" "$terminate_cmd"
+        
+        local terminate_result
+        terminate_result=$(oci compute instance terminate \
+            --instance-id "$instance_ocid" \
+            --region "$region" \
+            --preserve-boot-volume false \
+            --force 2>&1)
+        
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓ Instance termination initiated${NC}"
+            log_action_result "SUCCESS" "Instance $display_name termination initiated"
+        else
+            echo -e "${RED}✗ Failed to terminate instance:${NC}"
+            echo "$terminate_result"
+            log_action_result "FAILED" "Failed to terminate instance $display_name"
+        fi
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Press Enter to continue...${NC}"
+    read -r
 }
 
 #--------------------------------------------------------------------------------
@@ -8590,8 +9007,8 @@ _display_existing_console_history() {
     
     # Use temp file for reliability
     local temp_output temp_error
-    temp_output=$(mktemp)
-    temp_error=$(mktemp)
+    temp_output=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    temp_error=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     # Capture raw output for display if empty
     local raw_output
@@ -8789,8 +9206,8 @@ compare_instance_to_instance() {
     
     # Create temp files for diff
     local tmp1 tmp2
-    tmp1=$(mktemp)
-    tmp2=$(mktemp)
+    tmp1=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    tmp2=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     # Decode user_data (handles gzip compression)
     decode_user_data_to_file "$instance_ud_b64" "$tmp1"
@@ -8925,8 +9342,8 @@ compare_instance_to_config() {
     
     # Create temp files for diff
     local tmp_instance tmp_ic
-    tmp_instance=$(mktemp)
-    tmp_ic=$(mktemp)
+    tmp_instance=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    tmp_ic=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     # Decode user_data (handles gzip compression)
     decode_user_data_to_file "$instance_ud_b64" "$tmp_instance"
@@ -9548,8 +9965,8 @@ compare_instance_configurations() {
     
     # Create temp files for diff
     local tmp1 tmp2
-    tmp1=$(mktemp)
-    tmp2=$(mktemp)
+    tmp1=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    tmp2=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     if [[ -n "$ud1" ]]; then
         decode_user_data_to_file "$ud1" "$tmp1" || echo "# Failed to decode user_data" > "$tmp1"
@@ -10065,7 +10482,7 @@ interactive_gpu_management() {
                 ;;
             refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
-                rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+                rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
                 ;;
             quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
                 return
@@ -10378,7 +10795,7 @@ create_gpu_memory_cluster_interactive() {
     
     # Refresh caches to get latest data
     echo -e "${YELLOW}Refreshing data from OCI...${NC}"
-    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
     fetch_gpu_fabrics
     fetch_gpu_clusters
     fetch_instance_configurations
@@ -10399,7 +10816,7 @@ create_gpu_memory_cluster_interactive() {
     
     local has_available=false
     local fabric_output_temp
-    fabric_output_temp=$(mktemp)
+    fabric_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     # Build map of fabric availability for later use
     declare -A FABRIC_AVAIL_MAP
@@ -10483,7 +10900,7 @@ create_gpu_memory_cluster_interactive() {
     print_separator 95
     
     local cc_output_temp
-    cc_output_temp=$(mktemp)
+    cc_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     local cid
     for cid in "${!CC_INDEX_MAP[@]}"; do
@@ -10557,7 +10974,7 @@ create_gpu_memory_cluster_interactive() {
     print_separator 70
     
     local ic_output_temp
-    ic_output_temp=$(mktemp)
+    ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     local iid
     for iid in "${!IC_INDEX_MAP[@]}"; do
@@ -10679,8 +11096,8 @@ create_gpu_memory_cluster_interactive() {
         echo -e "${WHITE}New Cluster OCID:${NC}  ${YELLOW}$new_cluster_id${NC}"
         echo -e "${WHITE}Initial State:${NC}     ${CYAN}$new_cluster_state${NC}"
         
-        # Invalidate cluster and fabric caches (fabric available-host-count changes)
-        rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE"
+        # Invalidate cluster, fabric, and instance-cluster map caches
+        rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE"
     else
         echo -e "${RED}Failed to create GPU Memory Cluster:${NC}"
         echo "$result"
@@ -10698,7 +11115,7 @@ update_gpu_memory_cluster_interactive() {
     
     # Refresh caches to get latest data
     echo -e "${YELLOW}Refreshing data from OCI...${NC}"
-    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
     fetch_gpu_fabrics
     fetch_gpu_clusters
     fetch_instance_configurations
@@ -10719,7 +11136,7 @@ update_gpu_memory_cluster_interactive() {
     
     # Collect cluster lines for sorting
     local cluster_lines_temp
-    cluster_lines_temp=$(mktemp)
+    cluster_lines_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     local has_clusters=false
     
     for gid in "${!CLUSTER_INDEX_MAP[@]}"; do
@@ -10889,7 +11306,7 @@ update_gpu_memory_cluster_interactive() {
             print_separator 160
             
             local ic_output_temp
-            ic_output_temp=$(mktemp)
+            ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
             
             local iid
             for iid in "${!IC_INDEX_MAP[@]}"; do
@@ -10943,7 +11360,7 @@ update_gpu_memory_cluster_interactive() {
             print_separator 160
             
             local ic_output_temp
-            ic_output_temp=$(mktemp)
+            ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
             
             local iid
             for iid in "${!IC_INDEX_MAP[@]}"; do
@@ -11068,8 +11485,8 @@ update_gpu_memory_cluster_interactive() {
         esac
         echo -e "${WHITE}Size:${NC}     ${CYAN}${updated_size}${NC}"
         
-        # Invalidate cluster and fabric caches (fabric available-host-count changes)
-        rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE"
+        # Invalidate cluster, fabric, and instance-cluster map caches
+        rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE"
     else
         echo -e "${RED}Failed to update GPU Memory Cluster:${NC}"
         echo "$result"
@@ -11089,7 +11506,7 @@ update_all_clusters_instance_config() {
     
     # Refresh caches to get latest data
     echo -e "${YELLOW}Refreshing data from OCI...${NC}"
-    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
     fetch_gpu_fabrics
     fetch_gpu_clusters
     fetch_instance_configurations
@@ -11128,7 +11545,7 @@ update_all_clusters_instance_config() {
     
     # Sort and display instance configs
     local ic_output_temp
-    ic_output_temp=$(mktemp)
+    ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     local iid
     for iid in "${!IC_INDEX_MAP[@]}"; do
@@ -11314,7 +11731,7 @@ update_all_clusters_instance_config() {
     echo ""
     
     # Invalidate caches
-    rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE"
+    rm -f "$CLUSTER_CACHE" "$FABRIC_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE"
     
     echo -e "Press Enter to continue..."
     read -r
@@ -13485,6 +13902,2086 @@ wr_search_by_resource() {
     fi
 }
 
+#================================================================================
+# FILE STORAGE SERVICE (FSS) MANAGEMENT
+#================================================================================
+
+#--------------------------------------------------------------------------------
+# Manage File Storage - Main menu
+#--------------------------------------------------------------------------------
+manage_file_storage() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local ad="${AVAILABILITY_DOMAIN:-}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                      FILE STORAGE SERVICE (FSS)                                                 ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        [[ -n "$ad" ]] && echo -e "  ${CYAN}AD:${NC}          ${WHITE}${ad}${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ File Systems ═══${NC}"
+        echo -e "  ${GREEN}1${NC}) ${WHITE}List File Systems${NC}            - List all file systems in compartment"
+        echo -e "  ${GREEN}2${NC}) ${WHITE}View File System Details${NC}     - Get detailed info about a file system"
+        echo -e "  ${GREEN}3${NC}) ${WHITE}Create File System${NC}           - Create a new file system"
+        echo -e "  ${GREEN}4${NC}) ${WHITE}Update File System${NC}           - Update file system name or tags"
+        echo -e "  ${GREEN}5${NC}) ${WHITE}Delete File System${NC}           - Delete a file system"
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Mount Targets ═══${NC}"
+        echo -e "  ${GREEN}6${NC}) ${WHITE}List Mount Targets${NC}           - List all mount targets in compartment"
+        echo -e "  ${GREEN}7${NC}) ${WHITE}View Mount Target Details${NC}    - Get detailed info including mount commands"
+        echo -e "  ${GREEN}8${NC}) ${WHITE}Create Mount Target${NC}          - Create a new mount target"
+        echo -e "  ${GREEN}9${NC}) ${WHITE}Delete Mount Target${NC}          - Delete a mount target"
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Exports ═══${NC}"
+        echo -e "  ${GREEN}10${NC}) ${WHITE}List Exports${NC}                - List all exports for a file system"
+        echo -e "  ${GREEN}11${NC}) ${WHITE}Create Export${NC}               - Export a file system to a mount target"
+        echo -e "  ${GREEN}12${NC}) ${WHITE}Delete Export${NC}               - Remove an export"
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Snapshots ═══${NC}"
+        echo -e "  ${GREEN}13${NC}) ${WHITE}List Snapshots${NC}              - List snapshots for a file system"
+        echo -e "  ${GREEN}14${NC}) ${WHITE}Create Snapshot${NC}             - Create a snapshot of a file system"
+        echo -e "  ${GREEN}15${NC}) ${WHITE}Delete Snapshot${NC}             - Delete a snapshot"
+        echo ""
+        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        read -r selection
+        
+        case "$selection" in
+            1) fss_list_file_systems "$compartment_id" "$ad" ;;
+            2) fss_view_file_system_details "$compartment_id" "$ad" ;;
+            3) fss_create_file_system "$compartment_id" "$ad" ;;
+            4) fss_update_file_system "$compartment_id" "$ad" ;;
+            5) fss_delete_file_system "$compartment_id" "$ad" ;;
+            6) fss_list_mount_targets "$compartment_id" "$ad" ;;
+            7) fss_view_mount_target_details "$compartment_id" "$ad" ;;
+            8) fss_create_mount_target "$compartment_id" "$ad" ;;
+            9) fss_delete_mount_target "$compartment_id" "$ad" ;;
+            10) fss_list_exports "$compartment_id" ;;
+            11) fss_create_export "$compartment_id" "$ad" ;;
+            12) fss_delete_export "$compartment_id" ;;
+            13) fss_list_snapshots "$compartment_id" "$ad" ;;
+            14) fss_create_snapshot "$compartment_id" "$ad" ;;
+            15) fss_delete_snapshot "$compartment_id" "$ad" ;;
+            b|B|back|BACK|"") return ;;
+            *) echo -e "${RED}Invalid selection${NC}" ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# FSS - List File Systems
+#--------------------------------------------------------------------------------
+fss_list_file_systems() {
+    local compartment_id="$1"
+    local ad="$2"
+    local action="${3:-none}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ File Systems ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci fs file-system list --compartment-id \"$compartment_id\" --all --output json"
+    [[ -n "$ad" ]] && list_cmd="oci fs file-system list --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local fs_json
+    if [[ -n "$ad" ]]; then
+        fs_json=$(oci fs file-system list \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --all \
+            --output json 2>/dev/null)
+    else
+        fs_json=$(oci fs file-system list \
+            --compartment-id "$compartment_id" \
+            --all \
+            --output json 2>/dev/null)
+    fi
+    
+    if [[ -z "$fs_json" || "$fs_json" == "null" ]]; then
+        echo -e "${YELLOW}No file systems found or unable to list${NC}"
+        return 1
+    fi
+    
+    local fs_count
+    fs_count=$(echo "$fs_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$fs_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No file systems found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $fs_count file system(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-35s %-12s %-15s %-20s %s${NC}\n" "#" "Display Name" "State" "Metered (GB)" "Availability Domain" "File System OCID"
+    print_separator 180
+    
+    local idx=0
+    declare -gA FSS_FS_MAP
+    FSS_FS_MAP=()
+    
+    while IFS='|' read -r display_name state metered_bytes ad_name fs_id; do
+        [[ -z "$display_name" ]] && continue
+        ((idx++))
+        
+        FSS_FS_MAP[$idx]="$fs_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local name_trunc="${display_name:0:33}"
+        [[ ${#display_name} -gt 33 ]] && name_trunc="${name_trunc}.."
+        
+        # Convert bytes to GB
+        local metered_gb="0"
+        [[ -n "$metered_bytes" && "$metered_bytes" != "null" ]] && metered_gb=$(echo "scale=2; $metered_bytes / 1073741824" | bc 2>/dev/null || echo "0")
+        
+        # Extract AD name (last part)
+        local ad_short="${ad_name##*:}"
+        
+        printf "${YELLOW}%-3s${NC} %-35s ${state_color}%-12s${NC} %-15s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "${metered_gb}" "$ad_short" "$fs_id"
+            
+    done < <(echo "$fs_json" | jq -r '.data[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["metered-bytes"])|\(.["availability-domain"])|\(.id)"' 2>/dev/null)
+    
+    FSS_FS_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter file system # (or Enter to cancel): ${NC}"
+            read -r fs_selection
+            if [[ -n "$fs_selection" && -n "${FSS_FS_MAP[$fs_selection]}" ]]; then
+                FSS_SELECTED_FS="${FSS_FS_MAP[$fs_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# FSS - View File System Details
+#--------------------------------------------------------------------------------
+fss_view_file_system_details() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_FS" ]] && return
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ File System Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci fs file-system get --file-system-id \"$FSS_SELECTED_FS\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local fs_json
+    fs_json=$(oci fs file-system get --file-system-id "$FSS_SELECTED_FS" --output json 2>/dev/null)
+    
+    if [[ -z "$fs_json" || "$fs_json" == "null" ]]; then
+        echo -e "${RED}Failed to get file system details${NC}"
+        return
+    fi
+    
+    local display_name state metered_bytes ad_name time_created fs_id
+    display_name=$(echo "$fs_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$fs_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    metered_bytes=$(echo "$fs_json" | jq -r '.data["metered-bytes"] // "0"')
+    ad_name=$(echo "$fs_json" | jq -r '.data["availability-domain"] // "N/A"')
+    time_created=$(echo "$fs_json" | jq -r '.data["time-created"] // "N/A"')
+    fs_id=$(echo "$fs_json" | jq -r '.data.id // "N/A"')
+    
+    local metered_gb
+    metered_gb=$(echo "scale=2; $metered_bytes / 1073741824" | bc 2>/dev/null || echo "0")
+    
+    local state_color="$GREEN"
+    case "$state" in
+        ACTIVE) state_color="$GREEN" ;;
+        CREATING|UPDATING) state_color="$YELLOW" ;;
+        *) state_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}$display_name${NC}"
+    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Metered Size:${NC}        ${WHITE}${metered_gb} GB${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
+    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}File System OCID:${NC}    ${YELLOW}$fs_id${NC}"
+    echo ""
+    
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Create File System
+#--------------------------------------------------------------------------------
+fss_create_file_system() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create File System ═══${NC}"
+    echo ""
+    
+    # Get AD if not set
+    if [[ -z "$ad" ]]; then
+        echo -e "${CYAN}Available Availability Domains:${NC}"
+        local ads_json
+        ads_json=$(oci iam availability-domain list --compartment-id "$compartment_id" --output json 2>/dev/null)
+        
+        local idx=0
+        declare -A AD_MAP
+        while read -r ad_name; do
+            [[ -z "$ad_name" ]] && continue
+            ((idx++))
+            AD_MAP[$idx]="$ad_name"
+            echo -e "  ${YELLOW}$idx${NC}) $ad_name"
+        done < <(echo "$ads_json" | jq -r '.data[].name' 2>/dev/null)
+        
+        echo ""
+        echo -n -e "${CYAN}Select AD #: ${NC}"
+        read -r ad_selection
+        ad="${AD_MAP[$ad_selection]}"
+        
+        if [[ -z "$ad" ]]; then
+            echo -e "${RED}Invalid selection${NC}"
+            return
+        fi
+    fi
+    
+    echo -n -e "${CYAN}Enter display name for file system: ${NC}"
+    read -r fs_name
+    
+    if [[ -z "$fs_name" ]]; then
+        echo -e "${RED}Display name is required${NC}"
+        return
+    fi
+    
+    echo ""
+    local create_cmd="oci fs file-system create --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --display-name \"$fs_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    # Log the action
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE FILE SYSTEM: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating file system...${NC}"
+    
+    local result
+    result=$(oci fs file-system create \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$ad" \
+        --display-name "$fs_name" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_fs_id
+        new_fs_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ File system created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_fs_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_fs_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Update File System
+#--------------------------------------------------------------------------------
+fss_update_file_system() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_FS" ]] && return
+    
+    echo ""
+    echo -n -e "${CYAN}Enter new display name: ${NC}"
+    read -r new_name
+    
+    if [[ -z "$new_name" ]]; then
+        echo -e "${RED}Display name is required${NC}"
+        return
+    fi
+    
+    echo ""
+    local update_cmd="oci fs file-system update --file-system-id \"$FSS_SELECTED_FS\" --display-name \"$new_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$update_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with update? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE FILE SYSTEM: $update_cmd" >> "$log_file"
+    
+    local result
+    result=$(oci fs file-system update \
+        --file-system-id "$FSS_SELECTED_FS" \
+        --display-name "$new_name" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ File system updated successfully${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated $FSS_SELECTED_FS" >> "$log_file"
+    else
+        echo -e "${RED}Failed to update file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Delete File System
+#--------------------------------------------------------------------------------
+fss_delete_file_system() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_FS" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will permanently delete the file system and all its data!${NC}"
+    echo ""
+    local delete_cmd="oci fs file-system delete --file-system-id \"$FSS_SELECTED_FS\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE FILE SYSTEM: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting file system...${NC}"
+    
+    local result
+    result=$(oci fs file-system delete \
+        --file-system-id "$FSS_SELECTED_FS" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ File system deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $FSS_SELECTED_FS" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - List Mount Targets
+#--------------------------------------------------------------------------------
+fss_list_mount_targets() {
+    local compartment_id="$1"
+    local ad="$2"
+    local action="${3:-none}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Mount Targets ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci fs mount-target list --compartment-id \"$compartment_id\" --all --output json"
+    [[ -n "$ad" ]] && list_cmd="oci fs mount-target list --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local mt_json
+    if [[ -n "$ad" ]]; then
+        mt_json=$(oci fs mount-target list \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --all \
+            --output json 2>/dev/null)
+    else
+        mt_json=$(oci fs mount-target list \
+            --compartment-id "$compartment_id" \
+            --all \
+            --output json 2>/dev/null)
+    fi
+    
+    if [[ -z "$mt_json" || "$mt_json" == "null" ]]; then
+        echo -e "${YELLOW}No mount targets found or unable to list${NC}"
+        return 1
+    fi
+    
+    local mt_count
+    mt_count=$(echo "$mt_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$mt_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No mount targets found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $mt_count mount target(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-30s %-12s %-20s %-18s %s${NC}\n" "#" "Display Name" "State" "Availability Domain" "Private IP" "Mount Target OCID"
+    print_separator 180
+    
+    local idx=0
+    declare -gA FSS_MT_MAP
+    FSS_MT_MAP=()
+    
+    while IFS='|' read -r display_name state ad_name private_ips mt_id; do
+        [[ -z "$display_name" ]] && continue
+        ((idx++))
+        
+        FSS_MT_MAP[$idx]="$mt_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local name_trunc="${display_name:0:28}"
+        [[ ${#display_name} -gt 28 ]] && name_trunc="${name_trunc}.."
+        
+        local ad_short="${ad_name##*:}"
+        
+        # Extract first private IP
+        local first_ip
+        first_ip=$(echo "$private_ips" | jq -r '.[0] // "N/A"' 2>/dev/null)
+        
+        printf "${YELLOW}%-3s${NC} %-30s ${state_color}%-12s${NC} %-20s %-18s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "$ad_short" "$first_ip" "$mt_id"
+            
+    done < <(echo "$mt_json" | jq -r '.data[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["availability-domain"])|\(.["private-ip-ids"])|\(.id)"' 2>/dev/null)
+    
+    FSS_MT_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter mount target # (or Enter to cancel): ${NC}"
+            read -r mt_selection
+            if [[ -n "$mt_selection" && -n "${FSS_MT_MAP[$mt_selection]}" ]]; then
+                FSS_SELECTED_MT="${FSS_MT_MAP[$mt_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# FSS - View Mount Target Details (with mount commands)
+#--------------------------------------------------------------------------------
+fss_view_mount_target_details() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_MT=""
+    fss_list_mount_targets "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_MT" ]] && return
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Mount Target Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci fs mount-target get --mount-target-id \"$FSS_SELECTED_MT\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local mt_json
+    mt_json=$(oci fs mount-target get --mount-target-id "$FSS_SELECTED_MT" --output json 2>/dev/null)
+    
+    if [[ -z "$mt_json" || "$mt_json" == "null" ]]; then
+        echo -e "${RED}Failed to get mount target details${NC}"
+        return
+    fi
+    
+    local display_name state ad_name subnet_id export_set_id time_created mt_id
+    display_name=$(echo "$mt_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$mt_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    ad_name=$(echo "$mt_json" | jq -r '.data["availability-domain"] // "N/A"')
+    subnet_id=$(echo "$mt_json" | jq -r '.data["subnet-id"] // "N/A"')
+    export_set_id=$(echo "$mt_json" | jq -r '.data["export-set-id"] // "N/A"')
+    time_created=$(echo "$mt_json" | jq -r '.data["time-created"] // "N/A"')
+    mt_id=$(echo "$mt_json" | jq -r '.data.id // "N/A"')
+    
+    # Get private IPs
+    local private_ip_ids
+    private_ip_ids=$(echo "$mt_json" | jq -r '.data["private-ip-ids"][]' 2>/dev/null)
+    
+    local state_color="$GREEN"
+    case "$state" in
+        ACTIVE) state_color="$GREEN" ;;
+        CREATING|UPDATING) state_color="$YELLOW" ;;
+        *) state_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}$display_name${NC}"
+    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
+    echo -e "  ${CYAN}Subnet OCID:${NC}         ${GRAY}$subnet_id${NC}"
+    echo -e "  ${CYAN}Export Set OCID:${NC}     ${GRAY}$export_set_id${NC}"
+    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}Mount Target OCID:${NC}   ${YELLOW}$mt_id${NC}"
+    echo ""
+    
+    # Resolve private IPs to actual addresses
+    if [[ -n "$private_ip_ids" ]]; then
+        echo -e "${BOLD}${WHITE}Private IP Addresses:${NC}"
+        for pip_id in $private_ip_ids; do
+            local pip_json
+            pip_json=$(oci network private-ip get --private-ip-id "$pip_id" --output json 2>/dev/null)
+            local ip_addr
+            ip_addr=$(echo "$pip_json" | jq -r '.data["ip-address"] // "N/A"')
+            local hostname
+            hostname=$(echo "$pip_json" | jq -r '.data["hostname-label"] // ""')
+            echo -e "  ${CYAN}IP:${NC} ${WHITE}$ip_addr${NC}  ${GRAY}$hostname${NC}"
+            
+            # Show mount command example
+            echo ""
+            echo -e "${BOLD}${WHITE}Mount Command Examples:${NC}"
+            echo -e "  ${GRAY}# Mount file system (replace <export-path> with actual export path)${NC}"
+            echo -e "  ${WHITE}sudo mount -t nfs -o nfsvers=3 ${ip_addr}:/<export-path> /mnt/fss${NC}"
+            echo ""
+            echo -e "  ${GRAY}# For NFSv4:${NC}"
+            echo -e "  ${WHITE}sudo mount -t nfs -o nfsvers=4 ${ip_addr}:/<export-path> /mnt/fss${NC}"
+        done
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Create Mount Target
+#--------------------------------------------------------------------------------
+fss_create_mount_target() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create Mount Target ═══${NC}"
+    echo ""
+    
+    # Get AD if not set
+    if [[ -z "$ad" ]]; then
+        echo -e "${CYAN}Available Availability Domains:${NC}"
+        local ads_json
+        ads_json=$(oci iam availability-domain list --compartment-id "$compartment_id" --output json 2>/dev/null)
+        
+        local idx=0
+        declare -A AD_MAP
+        while read -r ad_name; do
+            [[ -z "$ad_name" ]] && continue
+            ((idx++))
+            AD_MAP[$idx]="$ad_name"
+            echo -e "  ${YELLOW}$idx${NC}) $ad_name"
+        done < <(echo "$ads_json" | jq -r '.data[].name' 2>/dev/null)
+        
+        echo ""
+        echo -n -e "${CYAN}Select AD #: ${NC}"
+        read -r ad_selection
+        ad="${AD_MAP[$ad_selection]}"
+        
+        if [[ -z "$ad" ]]; then
+            echo -e "${RED}Invalid selection${NC}"
+            return
+        fi
+    fi
+    
+    # List subnets
+    echo ""
+    echo -e "${CYAN}Available Subnets:${NC}"
+    local subnets_json
+    subnets_json=$(oci network subnet list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+    
+    local idx=0
+    declare -A SUBNET_MAP
+    while IFS='|' read -r subnet_name subnet_id cidr; do
+        [[ -z "$subnet_name" ]] && continue
+        ((idx++))
+        SUBNET_MAP[$idx]="$subnet_id"
+        echo -e "  ${YELLOW}$idx${NC}) $subnet_name (${cidr})"
+    done < <(echo "$subnets_json" | jq -r '.data[] | "\(.["display-name"])|\(.id)|\(.["cidr-block"])"' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Select subnet #: ${NC}"
+    read -r subnet_selection
+    local subnet_id="${SUBNET_MAP[$subnet_selection]}"
+    
+    if [[ -z "$subnet_id" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    echo -n -e "${CYAN}Enter display name for mount target: ${NC}"
+    read -r mt_name
+    
+    if [[ -z "$mt_name" ]]; then
+        echo -e "${RED}Display name is required${NC}"
+        return
+    fi
+    
+    echo ""
+    local create_cmd="oci fs mount-target create --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --subnet-id \"$subnet_id\" --display-name \"$mt_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE MOUNT TARGET: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating mount target...${NC}"
+    
+    local result
+    result=$(oci fs mount-target create \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$ad" \
+        --subnet-id "$subnet_id" \
+        --display-name "$mt_name" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_mt_id
+        new_mt_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Mount target created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_mt_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_mt_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create mount target${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Delete Mount Target
+#--------------------------------------------------------------------------------
+fss_delete_mount_target() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_MT=""
+    fss_list_mount_targets "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_MT" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will delete the mount target!${NC}"
+    echo ""
+    local delete_cmd="oci fs mount-target delete --mount-target-id \"$FSS_SELECTED_MT\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE MOUNT TARGET: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting mount target...${NC}"
+    
+    local result
+    result=$(oci fs mount-target delete \
+        --mount-target-id "$FSS_SELECTED_MT" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Mount target deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $FSS_SELECTED_MT" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete mount target${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - List Exports
+#--------------------------------------------------------------------------------
+fss_list_exports() {
+    local compartment_id="$1"
+    local action="${2:-none}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Exports ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci fs export list --compartment-id \"$compartment_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local export_json
+    export_json=$(oci fs export list \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$export_json" || "$export_json" == "null" ]]; then
+        echo -e "${YELLOW}No exports found or unable to list${NC}"
+        return 1
+    fi
+    
+    local export_count
+    export_count=$(echo "$export_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$export_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No exports found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $export_count export(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-30s %-12s %-50s %s${NC}\n" "#" "Path" "State" "File System OCID" "Export OCID"
+    print_separator 180
+    
+    local idx=0
+    declare -gA FSS_EXPORT_MAP
+    FSS_EXPORT_MAP=()
+    
+    while IFS='|' read -r path state fs_id export_id; do
+        [[ -z "$path" ]] && continue
+        ((idx++))
+        
+        FSS_EXPORT_MAP[$idx]="$export_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local path_trunc="${path:0:28}"
+        [[ ${#path} -gt 28 ]] && path_trunc="${path_trunc}.."
+        
+        local fs_short="${fs_id:0:48}..."
+        
+        printf "${YELLOW}%-3s${NC} %-30s ${state_color}%-12s${NC} ${GRAY}%-50s %s${NC}\n" \
+            "$idx" "$path_trunc" "$state" "$fs_short" "$export_id"
+            
+    done < <(echo "$export_json" | jq -r '.data[] | "\(.path)|\(.["lifecycle-state"])|\(.["file-system-id"])|\(.id)"' 2>/dev/null)
+    
+    FSS_EXPORT_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter export # (or Enter to cancel): ${NC}"
+            read -r export_selection
+            if [[ -n "$export_selection" && -n "${FSS_EXPORT_MAP[$export_selection]}" ]]; then
+                FSS_SELECTED_EXPORT="${FSS_EXPORT_MAP[$export_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Create Export
+#--------------------------------------------------------------------------------
+fss_create_export() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create Export ═══${NC}"
+    echo ""
+    
+    # Select file system
+    echo -e "${CYAN}Select a file system to export:${NC}"
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    if [[ -z "$FSS_SELECTED_FS" ]]; then
+        echo -e "${RED}No file system selected${NC}"
+        return
+    fi
+    
+    # Select mount target (to get export set)
+    echo ""
+    echo -e "${CYAN}Select a mount target:${NC}"
+    FSS_SELECTED_MT=""
+    fss_list_mount_targets "$compartment_id" "$ad" "select"
+    
+    if [[ -z "$FSS_SELECTED_MT" ]]; then
+        echo -e "${RED}No mount target selected${NC}"
+        return
+    fi
+    
+    # Get export set ID from mount target
+    local mt_json
+    mt_json=$(oci fs mount-target get --mount-target-id "$FSS_SELECTED_MT" --output json 2>/dev/null)
+    local export_set_id
+    export_set_id=$(echo "$mt_json" | jq -r '.data["export-set-id"]')
+    
+    if [[ -z "$export_set_id" || "$export_set_id" == "null" ]]; then
+        echo -e "${RED}Could not get export set from mount target${NC}"
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter export path (e.g., /myfs): ${NC}"
+    read -r export_path
+    
+    if [[ -z "$export_path" ]]; then
+        export_path="/${RANDOM}"
+        echo -e "${YELLOW}Using default path: $export_path${NC}"
+    fi
+    
+    echo ""
+    local create_cmd="oci fs export create --file-system-id \"$FSS_SELECTED_FS\" --export-set-id \"$export_set_id\" --path \"$export_path\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE EXPORT: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating export...${NC}"
+    
+    local result
+    result=$(oci fs export create \
+        --file-system-id "$FSS_SELECTED_FS" \
+        --export-set-id "$export_set_id" \
+        --path "$export_path" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_export_id
+        new_export_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Export created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_export_id${NC}"
+        echo -e "  ${CYAN}Path:${NC} ${WHITE}$export_path${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_export_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create export${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Delete Export
+#--------------------------------------------------------------------------------
+fss_delete_export() {
+    local compartment_id="$1"
+    
+    FSS_SELECTED_EXPORT=""
+    fss_list_exports "$compartment_id" "select"
+    
+    [[ -z "$FSS_SELECTED_EXPORT" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will delete the export!${NC}"
+    echo ""
+    local delete_cmd="oci fs export delete --export-id \"$FSS_SELECTED_EXPORT\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE EXPORT: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting export...${NC}"
+    
+    local result
+    result=$(oci fs export delete \
+        --export-id "$FSS_SELECTED_EXPORT" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Export deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $FSS_SELECTED_EXPORT" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete export${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - List Snapshots
+#--------------------------------------------------------------------------------
+fss_list_snapshots() {
+    local compartment_id="$1"
+    local ad="$2"
+    local action="${3:-none}"
+    
+    # First select a file system
+    echo -e "${CYAN}Select a file system to view snapshots:${NC}"
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    if [[ -z "$FSS_SELECTED_FS" ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Snapshots ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci fs snapshot list --file-system-id \"$FSS_SELECTED_FS\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local snap_json
+    snap_json=$(oci fs snapshot list \
+        --file-system-id "$FSS_SELECTED_FS" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$snap_json" || "$snap_json" == "null" ]]; then
+        echo -e "${YELLOW}No snapshots found or unable to list${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 1
+    fi
+    
+    local snap_count
+    snap_count=$(echo "$snap_json" | jq '.data | length' 2>/dev/null)
+    
+    if [[ "$snap_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No snapshots found${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $snap_count snapshot(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-40s %-12s %-25s %s${NC}\n" "#" "Name" "State" "Time Created" "Snapshot OCID"
+    print_separator 160
+    
+    local idx=0
+    declare -gA FSS_SNAP_MAP
+    FSS_SNAP_MAP=()
+    
+    while IFS='|' read -r name state time_created snap_id; do
+        [[ -z "$name" ]] && continue
+        ((idx++))
+        
+        FSS_SNAP_MAP[$idx]="$snap_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local name_trunc="${name:0:38}"
+        [[ ${#name} -gt 38 ]] && name_trunc="${name_trunc}.."
+        
+        local time_short="${time_created:0:23}"
+        
+        printf "${YELLOW}%-3s${NC} %-40s ${state_color}%-12s${NC} %-25s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "$time_short" "$snap_id"
+            
+    done < <(echo "$snap_json" | jq -r '.data[] | "\(.name)|\(.["lifecycle-state"])|\(.["time-created"])|\(.id)"' 2>/dev/null)
+    
+    FSS_SNAP_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter snapshot # (or Enter to cancel): ${NC}"
+            read -r snap_selection
+            if [[ -n "$snap_selection" && -n "${FSS_SNAP_MAP[$snap_selection]}" ]]; then
+                FSS_SELECTED_SNAP="${FSS_SNAP_MAP[$snap_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Create Snapshot
+#--------------------------------------------------------------------------------
+fss_create_snapshot() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create Snapshot ═══${NC}"
+    echo ""
+    
+    # Select file system
+    echo -e "${CYAN}Select a file system:${NC}"
+    FSS_SELECTED_FS=""
+    fss_list_file_systems "$compartment_id" "$ad" "select"
+    
+    if [[ -z "$FSS_SELECTED_FS" ]]; then
+        echo -e "${RED}No file system selected${NC}"
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Enter snapshot name: ${NC}"
+    read -r snap_name
+    
+    if [[ -z "$snap_name" ]]; then
+        snap_name="snapshot-$(date +%Y%m%d-%H%M%S)"
+        echo -e "${YELLOW}Using default name: $snap_name${NC}"
+    fi
+    
+    echo ""
+    local create_cmd="oci fs snapshot create --file-system-id \"$FSS_SELECTED_FS\" --name \"$snap_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE SNAPSHOT: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating snapshot...${NC}"
+    
+    local result
+    result=$(oci fs snapshot create \
+        --file-system-id "$FSS_SELECTED_FS" \
+        --name "$snap_name" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_snap_id
+        new_snap_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Snapshot created successfully${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_snap_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_snap_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create snapshot${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Delete Snapshot
+#--------------------------------------------------------------------------------
+fss_delete_snapshot() {
+    local compartment_id="$1"
+    local ad="$2"
+    
+    FSS_SELECTED_SNAP=""
+    fss_list_snapshots "$compartment_id" "$ad" "select"
+    
+    [[ -z "$FSS_SELECTED_SNAP" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will delete the snapshot!${NC}"
+    echo ""
+    local delete_cmd="oci fs snapshot delete --snapshot-id \"$FSS_SELECTED_SNAP\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE SNAPSHOT: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting snapshot...${NC}"
+    
+    local result
+    result=$(oci fs snapshot delete \
+        --snapshot-id "$FSS_SELECTED_SNAP" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Snapshot deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $FSS_SELECTED_SNAP" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete snapshot${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#================================================================================
+# LUSTRE FILE SYSTEM MANAGEMENT
+#================================================================================
+
+#--------------------------------------------------------------------------------
+# Manage Lustre File Systems - Main menu
+#--------------------------------------------------------------------------------
+manage_lustre_file_systems() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                        LUSTRE FILE SYSTEMS                                                      ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Lustre File Systems ═══${NC}"
+        echo -e "  ${GREEN}1${NC}) ${WHITE}List Lustre File Systems${NC}     - List all Lustre file systems"
+        echo -e "  ${GREEN}2${NC}) ${WHITE}View Lustre Details${NC}          - Get detailed info with mount commands"
+        echo -e "  ${GREEN}3${NC}) ${WHITE}Create Lustre File System${NC}    - Create a new Lustre file system"
+        echo -e "  ${GREEN}4${NC}) ${WHITE}Update Lustre File System${NC}    - Update name or capacity"
+        echo -e "  ${GREEN}5${NC}) ${WHITE}Delete Lustre File System${NC}    - Delete a Lustre file system"
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Object Storage Links ═══${NC}"
+        echo -e "  ${GREEN}6${NC}) ${WHITE}List Object Storage Links${NC}    - List HSM links to Object Storage"
+        echo -e "  ${GREEN}7${NC}) ${WHITE}Create Object Storage Link${NC}   - Link Lustre to Object Storage bucket"
+        echo -e "  ${GREEN}8${NC}) ${WHITE}Start Import from Object${NC}     - Import data from Object Storage"
+        echo -e "  ${GREEN}9${NC}) ${WHITE}Start Export to Object${NC}       - Export data to Object Storage"
+        echo -e "  ${GREEN}10${NC}) ${WHITE}Delete Object Storage Link${NC}  - Remove an Object Storage link"
+        echo ""
+        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        read -r selection
+        
+        case "$selection" in
+            1) lfs_list_file_systems "$compartment_id" ;;
+            2) lfs_view_file_system_details "$compartment_id" ;;
+            3) lfs_create_file_system "$compartment_id" ;;
+            4) lfs_update_file_system "$compartment_id" ;;
+            5) lfs_delete_file_system "$compartment_id" ;;
+            6) lfs_list_object_storage_links "$compartment_id" ;;
+            7) lfs_create_object_storage_link "$compartment_id" ;;
+            8) lfs_start_import_from_object "$compartment_id" ;;
+            9) lfs_start_export_to_object "$compartment_id" ;;
+            10) lfs_delete_object_storage_link "$compartment_id" ;;
+            b|B|back|BACK|"") return ;;
+            *) echo -e "${RED}Invalid selection${NC}" ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - List File Systems
+#--------------------------------------------------------------------------------
+lfs_list_file_systems() {
+    local compartment_id="$1"
+    local action="${2:-none}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Lustre File Systems ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci lfs lustre-file-system-collection list-lustre-file-systems --compartment-id \"$compartment_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local lfs_json
+    lfs_json=$(oci lfs lustre-file-system-collection list-lustre-file-systems \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$lfs_json" || "$lfs_json" == "null" ]]; then
+        echo -e "${YELLOW}No Lustre file systems found or unable to list${NC}"
+        return 1
+    fi
+    
+    local lfs_count
+    lfs_count=$(echo "$lfs_json" | jq '.data.items | length' 2>/dev/null)
+    
+    if [[ "$lfs_count" -eq 0 || -z "$lfs_count" ]]; then
+        echo -e "${YELLOW}No Lustre file systems found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $lfs_count Lustre file system(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-30s %-12s %-10s %-20s %s${NC}\n" "#" "Display Name" "State" "Capacity" "Availability Domain" "Lustre FS OCID"
+    print_separator 180
+    
+    local idx=0
+    declare -gA LFS_MAP
+    LFS_MAP=()
+    
+    while IFS='|' read -r display_name state capacity_gb ad_name lfs_id; do
+        [[ -z "$display_name" ]] && continue
+        ((idx++))
+        
+        LFS_MAP[$idx]="$lfs_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local name_trunc="${display_name:0:28}"
+        [[ ${#display_name} -gt 28 ]] && name_trunc="${name_trunc}.."
+        
+        local ad_short="${ad_name##*:}"
+        
+        printf "${YELLOW}%-3s${NC} %-30s ${state_color}%-12s${NC} %-10s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "${capacity_gb}TB" "$ad_short" "$lfs_id"
+            
+    done < <(echo "$lfs_json" | jq -r '.data.items[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-tbs"] // "N/A")|\(.["availability-domain"])|\(.id)"' 2>/dev/null)
+    
+    LFS_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter Lustre file system # (or Enter to cancel): ${NC}"
+            read -r lfs_selection
+            if [[ -n "$lfs_selection" && -n "${LFS_MAP[$lfs_selection]}" ]]; then
+                LFS_SELECTED="${LFS_MAP[$lfs_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - View File System Details (with mount commands)
+#--------------------------------------------------------------------------------
+lfs_view_file_system_details() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED=""
+    lfs_list_file_systems "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED" ]] && return
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Lustre File System Details ═══${NC}"
+    echo ""
+    
+    local get_cmd="oci lfs lustre-file-system get --lustre-file-system-id \"$LFS_SELECTED\" --output json"
+    echo -e "${GRAY}$get_cmd${NC}"
+    echo ""
+    
+    local lfs_json
+    lfs_json=$(oci lfs lustre-file-system get --lustre-file-system-id "$LFS_SELECTED" --output json 2>/dev/null)
+    
+    if [[ -z "$lfs_json" || "$lfs_json" == "null" ]]; then
+        echo -e "${RED}Failed to get Lustre file system details${NC}"
+        return
+    fi
+    
+    local display_name state capacity_tb ad_name subnet_id time_created lfs_id
+    local mount_command file_system_name mgs_address
+    
+    display_name=$(echo "$lfs_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$lfs_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    capacity_tb=$(echo "$lfs_json" | jq -r '.data["capacity-in-tbs"] // "N/A"')
+    ad_name=$(echo "$lfs_json" | jq -r '.data["availability-domain"] // "N/A"')
+    subnet_id=$(echo "$lfs_json" | jq -r '.data["subnet-id"] // "N/A"')
+    time_created=$(echo "$lfs_json" | jq -r '.data["time-created"] // "N/A"')
+    lfs_id=$(echo "$lfs_json" | jq -r '.data.id // "N/A"')
+    
+    # Lustre-specific fields
+    file_system_name=$(echo "$lfs_json" | jq -r '.data["file-system-name"] // "N/A"')
+    mgs_address=$(echo "$lfs_json" | jq -r '.data["mgs-address"] // "N/A"')
+    
+    local state_color="$GREEN"
+    case "$state" in
+        ACTIVE) state_color="$GREEN" ;;
+        CREATING|UPDATING) state_color="$YELLOW" ;;
+        *) state_color="$RED" ;;
+    esac
+    
+    echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}$display_name${NC}"
+    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Capacity:${NC}            ${WHITE}${capacity_tb} TB${NC}"
+    echo -e "  ${CYAN}File System Name:${NC}    ${WHITE}$file_system_name${NC}"
+    echo -e "  ${CYAN}MGS Address:${NC}         ${WHITE}$mgs_address${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
+    echo -e "  ${CYAN}Subnet OCID:${NC}         ${GRAY}$subnet_id${NC}"
+    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}Lustre FS OCID:${NC}      ${YELLOW}$lfs_id${NC}"
+    echo ""
+    
+    if [[ "$mgs_address" != "N/A" && -n "$file_system_name" ]]; then
+        echo -e "${BOLD}${WHITE}Mount Commands:${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Install Lustre client (Oracle Linux / RHEL):${NC}"
+        echo -e "  ${WHITE}sudo yum install -y lustre-client${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Create mount point and mount:${NC}"
+        echo -e "  ${WHITE}sudo mkdir -p /mnt/lustre${NC}"
+        echo -e "  ${WHITE}sudo mount -t lustre ${mgs_address}:/${file_system_name} /mnt/lustre${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Add to /etc/fstab for persistent mount:${NC}"
+        echo -e "  ${WHITE}${mgs_address}:/${file_system_name} /mnt/lustre lustre defaults,_netdev 0 0${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Create File System
+#--------------------------------------------------------------------------------
+lfs_create_file_system() {
+    local compartment_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create Lustre File System ═══${NC}"
+    echo ""
+    
+    # Get AD
+    echo -e "${CYAN}Available Availability Domains:${NC}"
+    local ads_json
+    ads_json=$(oci iam availability-domain list --compartment-id "$compartment_id" --output json 2>/dev/null)
+    
+    local idx=0
+    declare -A AD_MAP
+    while read -r ad_name; do
+        [[ -z "$ad_name" ]] && continue
+        ((idx++))
+        AD_MAP[$idx]="$ad_name"
+        echo -e "  ${YELLOW}$idx${NC}) $ad_name"
+    done < <(echo "$ads_json" | jq -r '.data[].name' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Select AD #: ${NC}"
+    read -r ad_selection
+    local ad="${AD_MAP[$ad_selection]}"
+    
+    if [[ -z "$ad" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    # List subnets
+    echo ""
+    echo -e "${CYAN}Available Subnets:${NC}"
+    local subnets_json
+    subnets_json=$(oci network subnet list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+    
+    idx=0
+    declare -A SUBNET_MAP
+    while IFS='|' read -r subnet_name subnet_id cidr; do
+        [[ -z "$subnet_name" ]] && continue
+        ((idx++))
+        SUBNET_MAP[$idx]="$subnet_id"
+        echo -e "  ${YELLOW}$idx${NC}) $subnet_name (${cidr})"
+    done < <(echo "$subnets_json" | jq -r '.data[] | "\(.["display-name"])|\(.id)|\(.["cidr-block"])"' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Select subnet #: ${NC}"
+    read -r subnet_selection
+    local subnet_id="${SUBNET_MAP[$subnet_selection]}"
+    
+    if [[ -z "$subnet_id" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    echo -n -e "${CYAN}Enter display name: ${NC}"
+    read -r lfs_name
+    
+    if [[ -z "$lfs_name" ]]; then
+        echo -e "${RED}Display name is required${NC}"
+        return
+    fi
+    
+    echo -n -e "${CYAN}Enter file system name (e.g., lustrefs1): ${NC}"
+    read -r fs_name
+    
+    if [[ -z "$fs_name" ]]; then
+        fs_name="lustrefs$(date +%s)"
+        echo -e "${YELLOW}Using default: $fs_name${NC}"
+    fi
+    
+    echo -e "${CYAN}Select capacity:${NC}"
+    echo -e "  ${YELLOW}1${NC}) 48 TB"
+    echo -e "  ${YELLOW}2${NC}) 96 TB"
+    echo -e "  ${YELLOW}3${NC}) 144 TB"
+    echo -e "  ${YELLOW}4${NC}) Custom"
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r cap_selection
+    
+    local capacity_tb
+    case "$cap_selection" in
+        1) capacity_tb=48 ;;
+        2) capacity_tb=96 ;;
+        3) capacity_tb=144 ;;
+        4)
+            echo -n -e "${CYAN}Enter capacity in TB: ${NC}"
+            read -r capacity_tb
+            ;;
+        *) capacity_tb=48 ;;
+    esac
+    
+    echo ""
+    local create_cmd="oci lfs lustre-file-system create --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --subnet-id \"$subnet_id\" --display-name \"$lfs_name\" --file-system-name \"$fs_name\" --capacity-in-tbs $capacity_tb"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE LUSTRE: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating Lustre file system (this may take several minutes)...${NC}"
+    
+    local result
+    result=$(oci lfs lustre-file-system create \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$ad" \
+        --subnet-id "$subnet_id" \
+        --display-name "$lfs_name" \
+        --file-system-name "$fs_name" \
+        --capacity-in-tbs "$capacity_tb" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_lfs_id
+        new_lfs_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Lustre file system creation initiated${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_lfs_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_lfs_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create Lustre file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Update File System
+#--------------------------------------------------------------------------------
+lfs_update_file_system() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED=""
+    lfs_list_file_systems "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED" ]] && return
+    
+    echo ""
+    echo -e "${CYAN}What would you like to update?${NC}"
+    echo -e "  ${YELLOW}1${NC}) Display name"
+    echo -e "  ${YELLOW}2${NC}) Capacity"
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r update_type
+    
+    local update_cmd=""
+    case "$update_type" in
+        1)
+            echo -n -e "${CYAN}Enter new display name: ${NC}"
+            read -r new_name
+            [[ -z "$new_name" ]] && { echo -e "${RED}Name required${NC}"; return; }
+            update_cmd="oci lfs lustre-file-system update --lustre-file-system-id \"$LFS_SELECTED\" --display-name \"$new_name\""
+            ;;
+        2)
+            echo -n -e "${CYAN}Enter new capacity in TB: ${NC}"
+            read -r new_capacity
+            [[ -z "$new_capacity" ]] && { echo -e "${RED}Capacity required${NC}"; return; }
+            update_cmd="oci lfs lustre-file-system update --lustre-file-system-id \"$LFS_SELECTED\" --capacity-in-tbs $new_capacity"
+            ;;
+        *)
+            echo -e "${RED}Invalid selection${NC}"
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$update_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with update? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE LUSTRE: $update_cmd" >> "$log_file"
+    
+    local result
+    if [[ "$update_type" == "1" ]]; then
+        result=$(oci lfs lustre-file-system update \
+            --lustre-file-system-id "$LFS_SELECTED" \
+            --display-name "$new_name" \
+            --output json 2>&1)
+    else
+        result=$(oci lfs lustre-file-system update \
+            --lustre-file-system-id "$LFS_SELECTED" \
+            --capacity-in-tbs "$new_capacity" \
+            --output json 2>&1)
+    fi
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Lustre file system updated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated $LFS_SELECTED" >> "$log_file"
+    else
+        echo -e "${RED}Failed to update Lustre file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Delete File System
+#--------------------------------------------------------------------------------
+lfs_delete_file_system() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED=""
+    lfs_list_file_systems "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will permanently delete the Lustre file system and ALL data!${NC}"
+    echo ""
+    local delete_cmd="oci lfs lustre-file-system delete --lustre-file-system-id \"$LFS_SELECTED\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE LUSTRE: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting Lustre file system...${NC}"
+    
+    local result
+    result=$(oci lfs lustre-file-system delete \
+        --lustre-file-system-id "$LFS_SELECTED" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Lustre file system deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $LFS_SELECTED" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete Lustre file system${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - List Object Storage Links
+#--------------------------------------------------------------------------------
+lfs_list_object_storage_links() {
+    local compartment_id="$1"
+    local action="${2:-none}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Object Storage Links ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci lfs object-storage-link-collection list-object-storage-links --compartment-id \"$compartment_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local links_json
+    links_json=$(oci lfs object-storage-link-collection list-object-storage-links \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$links_json" || "$links_json" == "null" ]]; then
+        echo -e "${YELLOW}No Object Storage links found or unable to list${NC}"
+        return 1
+    fi
+    
+    local link_count
+    link_count=$(echo "$links_json" | jq '.data.items | length' 2>/dev/null)
+    
+    if [[ "$link_count" -eq 0 || -z "$link_count" ]]; then
+        echo -e "${YELLOW}No Object Storage links found${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Found $link_count Object Storage link(s)${NC}"
+    echo ""
+    
+    printf "${BOLD}%-3s %-25s %-12s %-30s %s${NC}\n" "#" "Display Name" "State" "Bucket" "Link OCID"
+    print_separator 160
+    
+    local idx=0
+    declare -gA LFS_LINK_MAP
+    LFS_LINK_MAP=()
+    
+    while IFS='|' read -r display_name state bucket_name link_id; do
+        [[ -z "$display_name" ]] && continue
+        ((idx++))
+        
+        LFS_LINK_MAP[$idx]="$link_id"
+        
+        local state_color="$GREEN"
+        case "$state" in
+            ACTIVE) state_color="$GREEN" ;;
+            CREATING|UPDATING) state_color="$YELLOW" ;;
+            DELETING|DELETED|FAILED) state_color="$RED" ;;
+            *) state_color="$GRAY" ;;
+        esac
+        
+        local name_trunc="${display_name:0:23}"
+        [[ ${#display_name} -gt 23 ]] && name_trunc="${name_trunc}.."
+        
+        local bucket_trunc="${bucket_name:0:28}"
+        [[ ${#bucket_name} -gt 28 ]] && bucket_trunc="${bucket_trunc}.."
+        
+        printf "${YELLOW}%-3s${NC} %-25s ${state_color}%-12s${NC} %-30s ${GRAY}%s${NC}\n" \
+            "$idx" "$name_trunc" "$state" "$bucket_trunc" "$link_id"
+            
+    done < <(echo "$links_json" | jq -r '.data.items[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["bucket-name"] // "N/A")|\(.id)"' 2>/dev/null)
+    
+    LFS_LINK_COUNT=$idx
+    echo ""
+    
+    case "$action" in
+        none)
+            echo -e "Press Enter to continue..."
+            read -r
+            ;;
+        select)
+            echo -n -e "${CYAN}Enter link # (or Enter to cancel): ${NC}"
+            read -r link_selection
+            if [[ -n "$link_selection" && -n "${LFS_LINK_MAP[$link_selection]}" ]]; then
+                LFS_SELECTED_LINK="${LFS_LINK_MAP[$link_selection]}"
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Create Object Storage Link
+#--------------------------------------------------------------------------------
+lfs_create_object_storage_link() {
+    local compartment_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Create Object Storage Link ═══${NC}"
+    echo ""
+    
+    # Select Lustre file system
+    echo -e "${CYAN}Select a Lustre file system:${NC}"
+    LFS_SELECTED=""
+    lfs_list_file_systems "$compartment_id" "select"
+    
+    if [[ -z "$LFS_SELECTED" ]]; then
+        echo -e "${RED}No Lustre file system selected${NC}"
+        return
+    fi
+    
+    echo -n -e "${CYAN}Enter Object Storage namespace: ${NC}"
+    read -r os_namespace
+    
+    echo -n -e "${CYAN}Enter bucket name: ${NC}"
+    read -r bucket_name
+    
+    echo -n -e "${CYAN}Enter link display name: ${NC}"
+    read -r link_name
+    
+    if [[ -z "$os_namespace" || -z "$bucket_name" ]]; then
+        echo -e "${RED}Namespace and bucket name are required${NC}"
+        return
+    fi
+    
+    [[ -z "$link_name" ]] && link_name="link-$bucket_name"
+    
+    echo ""
+    local create_cmd="oci lfs object-storage-link create --lustre-file-system-id \"$LFS_SELECTED\" --bucket-name \"$bucket_name\" --namespace \"$os_namespace\" --display-name \"$link_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE OS LINK: $create_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Creating Object Storage link...${NC}"
+    
+    local result
+    result=$(oci lfs object-storage-link create \
+        --lustre-file-system-id "$LFS_SELECTED" \
+        --bucket-name "$bucket_name" \
+        --namespace "$os_namespace" \
+        --display-name "$link_name" \
+        --output json 2>&1)
+    
+    if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
+        local new_link_id
+        new_link_id=$(echo "$result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Object Storage link created${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${YELLOW}$new_link_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created $new_link_id" >> "$log_file"
+    else
+        echo -e "${RED}Failed to create Object Storage link${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Start Import from Object Storage
+#--------------------------------------------------------------------------------
+lfs_start_import_from_object() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED_LINK=""
+    lfs_list_object_storage_links "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED_LINK" ]] && return
+    
+    echo ""
+    local import_cmd="oci lfs object-storage-link start-import-from-object --object-storage-link-id \"$LFS_SELECTED_LINK\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$import_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Start import from Object Storage? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] START IMPORT: $import_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Starting import...${NC}"
+    
+    local result
+    result=$(oci lfs object-storage-link start-import-from-object \
+        --object-storage-link-id "$LFS_SELECTED_LINK" 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Import started${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Import started for $LFS_SELECTED_LINK" >> "$log_file"
+    else
+        echo -e "${RED}Failed to start import${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Start Export to Object Storage
+#--------------------------------------------------------------------------------
+lfs_start_export_to_object() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED_LINK=""
+    lfs_list_object_storage_links "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED_LINK" ]] && return
+    
+    echo ""
+    local export_cmd="oci lfs object-storage-link start-export-to-object --object-storage-link-id \"$LFS_SELECTED_LINK\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$export_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Start export to Object Storage? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] START EXPORT: $export_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Starting export...${NC}"
+    
+    local result
+    result=$(oci lfs object-storage-link start-export-to-object \
+        --object-storage-link-id "$LFS_SELECTED_LINK" 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Export started${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Export started for $LFS_SELECTED_LINK" >> "$log_file"
+    else
+        echo -e "${RED}Failed to start export${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - Delete Object Storage Link
+#--------------------------------------------------------------------------------
+lfs_delete_object_storage_link() {
+    local compartment_id="$1"
+    
+    LFS_SELECTED_LINK=""
+    lfs_list_object_storage_links "$compartment_id" "select"
+    
+    [[ -z "$LFS_SELECTED_LINK" ]] && return
+    
+    echo ""
+    echo -e "${RED}WARNING: This will delete the Object Storage link!${NC}"
+    echo ""
+    local delete_cmd="oci lfs object-storage-link delete --object-storage-link-id \"$LFS_SELECTED_LINK\" --force"
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$delete_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${RED}Type 'DELETE' to confirm: ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return
+    fi
+    
+    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE OS LINK: $delete_cmd" >> "$log_file"
+    
+    echo ""
+    echo -e "${CYAN}Deleting Object Storage link...${NC}"
+    
+    local result
+    result=$(oci lfs object-storage-link delete \
+        --object-storage-link-id "$LFS_SELECTED_LINK" \
+        --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Object Storage link deleted${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted $LFS_SELECTED_LINK" >> "$log_file"
+    else
+        echo -e "${RED}Failed to delete Object Storage link${NC}"
+        echo "$result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
 #--------------------------------------------------------------------------------
 # Manage GPU Instance Tagging - Main menu
 #--------------------------------------------------------------------------------
@@ -15287,7 +17784,7 @@ delete_instance_configuration_interactive() {
     
     # Sort and display instance configs
     local ic_output_temp
-    ic_output_temp=$(mktemp)
+    ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
     local iid
     for iid in "${!IC_INDEX_MAP[@]}"; do
@@ -15472,6 +17969,8 @@ show_help() {
     echo "                      - NVIDIA GPU Stack Health (GPU Operator & DRA per node)"
     echo "                      - Resource Manager Stacks (view stacks, jobs, logs, state)"
     echo "                      - Work Requests (view status, errors, logs)"
+    echo "                      - File Storage (FSS) - file systems, mount targets, exports"
+    echo "                      - Lustre File Systems - create, mount, Object Storage links"
     echo ""
     echo -e "${BOLD}Setup & Maintenance:${NC}"
     echo "  --setup             Run initial setup to create/update variables.sh"
@@ -16030,8 +18529,12 @@ main() {
         fi
     fi
     
-    # Create cache directory
+    # Create cache and temp directories
     mkdir -p "$CACHE_DIR"
+    mkdir -p "$TEMP_DIR"
+    
+    # Cleanup temp files on exit
+    trap 'rm -rf "${TEMP_DIR:?}"/* 2>/dev/null' EXIT
     
     # Parse global options
     local custom_compartment=""
