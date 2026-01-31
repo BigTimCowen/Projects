@@ -202,6 +202,46 @@ create_temp_file() {
     echo "$tmp"
 }
 
+# Show progress bar for parallel operations
+# Args: $1 = output_dir, $2 = file_pattern, $3 = total_count, $4 = description
+# Runs in background, call with & and capture PID, then kill when done
+show_parallel_progress() {
+    local output_dir="$1"
+    local file_pattern="$2"
+    local total="$3"
+    local desc="${4:-Processing}"
+    
+    local spinner='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local spin_idx=0
+    
+    while true; do
+        local completed
+        completed=$(find "$output_dir" -name "$file_pattern" 2>/dev/null | wc -l)
+        local pct=0
+        [[ "$total" -gt 0 ]] && pct=$((completed * 100 / total))
+        
+        # Build progress bar (20 chars wide)
+        local filled=$((pct / 5))
+        local empty=$((20 - filled))
+        local bar=""
+        for ((i=0; i<filled; i++)); do bar+="█"; done
+        for ((i=0; i<empty; i++)); do bar+="░"; done
+        
+        # Get spinner character
+        local spin_char="${spinner:$spin_idx:1}"
+        spin_idx=$(( (spin_idx + 1) % ${#spinner} ))
+        
+        # Print progress (carriage return to overwrite)
+        printf "\r  ${CYAN}%s${NC} [${GREEN}%s${NC}] %3d%% (%d/%d) %s " "$spin_char" "$bar" "$pct" "$completed" "$total" "$desc"
+        
+        # Exit if complete
+        [[ "$completed" -ge "$total" ]] && break
+        
+        sleep 0.2
+    done
+    printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) %s \n" "$total" "$total" "$desc"
+}
+
 # Lookup value from pipe-delimited cache file
 # Args: $1 = cache file, $2 = key, $3 = field number (1-indexed)
 # Returns: field value or "N/A" if not found
@@ -322,7 +362,22 @@ fetch_gpu_clusters() {
     local compartment="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     [[ -z "$compartment" ]] && { log_warn "COMPARTMENT_ID not set. GPU cluster details unavailable."; return 1; }
     
-    is_cache_fresh "$CLUSTER_CACHE" && is_cache_fresh "$INSTANCE_CLUSTER_MAP_CACHE" && return 0
+    # Check if cache exists and is fresh
+    if is_cache_fresh "$CLUSTER_CACHE" && is_cache_fresh "$INSTANCE_CLUSTER_MAP_CACHE"; then
+        # Even if cache is fresh, invalidate if any cluster is in a transitional state
+        # This ensures we pick up new instances when clusters are scaling
+        if [[ -f "$CLUSTER_CACHE" ]]; then
+            local transitional_states
+            transitional_states=$(grep -E "\|UPDATING\||\|SCALING\||\|CREATING\|" "$CLUSTER_CACHE" 2>/dev/null | wc -l)
+            if [[ "$transitional_states" -gt 0 ]]; then
+                log_info "Detected $transitional_states cluster(s) in transitional state - refreshing cache..."
+            else
+                return 0
+            fi
+        else
+            return 0
+        fi
+    fi
     
     log_info "Fetching GPU memory clusters from OCI..."
     
@@ -349,64 +404,100 @@ fetch_gpu_clusters() {
         echo "# Format: InstanceOCID|ClusterOCID|ClusterDisplayName"
     } > "$INSTANCE_CLUSTER_MAP_CACHE"
     
-    # Get cluster IDs and fetch details for each to get instance-configuration-id and compute-cluster-id
+    # Get cluster IDs
     local cluster_ids
     cluster_ids=$(jq -r '.data.items[]?.id // empty' "$raw_json" 2>/dev/null)
     
-    local cluster_id
-    for cluster_id in $cluster_ids; do
-        [[ -z "$cluster_id" ]] && continue
+    local cluster_count
+    cluster_count=$(echo "$cluster_ids" | grep -c . 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$cluster_count" ]] && cluster_count=0
+    
+    if [[ "$cluster_count" -eq 0 ]]; then
+        rm -f "$raw_json"
+        return 0
+    fi
+    
+    # Create temp directory for parallel outputs
+    local parallel_temp="${TEMP_DIR}/gpu_cluster_parallel_$$"
+    mkdir -p "$parallel_temp"
+    
+    # Export function and variables for xargs subshells
+    export -f create_temp_file 2>/dev/null || true
+    
+    # Define worker function for parallel processing
+    _fetch_single_cluster() {
+        local cluster_id="$1"
+        local output_dir="$2"
+        [[ -z "$cluster_id" ]] && return
         
-        local cluster_detail_file
-        cluster_detail_file=$(create_temp_file) || continue
+        local cluster_file="${output_dir}/cluster_${cluster_id##*.}.txt"
+        local instance_file="${output_dir}/instances_${cluster_id##*.}.txt"
         
-        local cluster_display_name=""
+        # Fetch cluster details
+        local cluster_json
+        cluster_json=$(oci compute compute-gpu-memory-cluster get \
+            --compute-gpu-memory-cluster-id "$cluster_id" \
+            --output json 2>/dev/null)
         
-        if oci compute compute-gpu-memory-cluster get \
-                --compute-gpu-memory-cluster-id "$cluster_id" \
-                --output json > "$cluster_detail_file" 2>/dev/null; then
+        if [[ -n "$cluster_json" ]] && echo "$cluster_json" | jq -e '.data' > /dev/null 2>&1; then
+            local cluster_display_name
+            cluster_display_name=$(echo "$cluster_json" | jq -r '.data["display-name"] // "N/A"')
             
-            # Validate JSON before processing
-            if jq -e '.data' "$cluster_detail_file" > /dev/null 2>&1; then
-                # Extract display name for mapping
-                cluster_display_name=$(jq -r '.data["display-name"] // "N/A"' "$cluster_detail_file")
-                
-                # Try gpu-memory-fabric-id first, then fallback to extracting from display name
-                jq -r '
-                    .data["display-name"] as $name |
-                    (.data["gpu-memory-fabric-id"] // "") as $fabric_id |
-                    (if $fabric_id != "" and $fabric_id != null then 
-                        ($fabric_id[-5:] | ascii_downcase)
-                     else 
-                        (($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}).suffix)
-                     end) as $fabric_suffix |
-                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($fabric_suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")|\(.data["size"] // 0)"
-                ' "$cluster_detail_file" >> "$CLUSTER_CACHE" 2>/dev/null
-            fi
-        fi
-        
-        rm -f "$cluster_detail_file"
-        
-        # Fetch instances belonging to this cluster
-        local instances_json
-        instances_json=$(create_temp_file) || continue
-        
-        if oci compute compute-gpu-memory-cluster-instance-summary list-compute-gpu-memory-cluster-instances \
+            # Write cluster cache line
+            echo "$cluster_json" | jq -r '
+                .data["display-name"] as $name |
+                (.data["gpu-memory-fabric-id"] // "") as $fabric_id |
+                (if $fabric_id != "" and $fabric_id != null then 
+                    ($fabric_id[-5:] | ascii_downcase)
+                 else 
+                    (($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}).suffix)
+                 end) as $fabric_suffix |
+                "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($fabric_suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")|\(.data["size"] // 0)"
+            ' > "$cluster_file" 2>/dev/null
+            
+            # Fetch instances for this cluster
+            local instances_json
+            instances_json=$(oci compute compute-gpu-memory-cluster-instance-summary list-compute-gpu-memory-cluster-instances \
                 --compute-gpu-memory-cluster-id "$cluster_id" \
                 --all \
-                --output json > "$instances_json" 2>/dev/null; then
+                --output json 2>/dev/null)
             
-            # Extract instance OCIDs and map them to this cluster
-            jq -r --arg cluster_id "$cluster_id" --arg cluster_name "$cluster_display_name" '
-                (.data.items // .data // [])[] | 
-                "\(.["instance-id"] // .id)|\($cluster_id)|\($cluster_name)"
-            ' "$instances_json" >> "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null
+            if [[ -n "$instances_json" ]]; then
+                echo "$instances_json" | jq -r --arg cluster_id "$cluster_id" --arg cluster_name "$cluster_display_name" '
+                    (.data.items // .data // [])[] | 
+                    "\(.["instance-id"] // .id)|\($cluster_id)|\($cluster_name)"
+                ' > "$instance_file" 2>/dev/null
+            fi
         fi
-        
-        rm -f "$instances_json"
-    done
+    }
+    export -f _fetch_single_cluster
     
+    # Determine parallelism (max 8 to avoid API throttling)
+    local parallel_jobs=8
+    [[ "$cluster_count" -lt "$parallel_jobs" ]] && parallel_jobs="$cluster_count"
+    
+    log_info "Fetching $cluster_count clusters in parallel (jobs=$parallel_jobs)..."
+    
+    # Start progress bar in background
+    show_parallel_progress "$parallel_temp" "cluster_*.txt" "$cluster_count" "GPU clusters" &
+    local progress_pid=$!
+    
+    # Run parallel fetch
+    echo "$cluster_ids" | xargs -P "$parallel_jobs" -I {} bash -c '_fetch_single_cluster "$@"' _ {} "$parallel_temp"
+    
+    # Stop progress bar
+    kill "$progress_pid" 2>/dev/null
+    wait "$progress_pid" 2>/dev/null
+    printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) GPU clusters \n" "$cluster_count" "$cluster_count"
+    
+    # Aggregate results from parallel outputs
+    cat "$parallel_temp"/cluster_*.txt >> "$CLUSTER_CACHE" 2>/dev/null
+    cat "$parallel_temp"/instances_*.txt >> "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null
+    
+    # Cleanup
+    rm -rf "$parallel_temp"
     rm -f "$raw_json"
+    
     return 0
 }
 
@@ -988,32 +1079,71 @@ fetch_capacity_topology() {
         echo "# Format: InstanceOCID|HostLifecycleState|HostLifecycleDetails|TopologyOCID"
     } > "$CAPACITY_TOPOLOGY_CACHE"
     
-    # Get topology IDs and fetch bare metal hosts for each
+    # Get topology IDs
     local topology_ids
     topology_ids=$(jq -r '.data.items[]?.id // empty' "$topologies_json" 2>/dev/null)
     
-    local topo_id
-    for topo_id in $topology_ids; do
-        [[ -z "$topo_id" ]] && continue
+    local topo_count
+    topo_count=$(echo "$topology_ids" | grep -c . 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$topo_count" ]] && topo_count=0
+    
+    if [[ "$topo_count" -eq 0 ]]; then
+        rm -f "$topologies_json"
+        return 0
+    fi
+    
+    # Create temp directory for parallel outputs
+    local parallel_temp="${TEMP_DIR}/capacity_topo_parallel_$$"
+    mkdir -p "$parallel_temp"
+    
+    # Define worker function for parallel processing
+    _fetch_single_topology() {
+        local topo_id="$1"
+        local output_dir="$2"
+        [[ -z "$topo_id" ]] && return
+        
+        local output_file="${output_dir}/topo_${topo_id##*.}.txt"
         
         local hosts_json
-        hosts_json=$(create_temp_file) || continue
+        hosts_json=$(oci compute capacity-topology bare-metal-host list \
+            --capacity-topology-id "$topo_id" \
+            --all \
+            --output json 2>/dev/null)
         
-        if oci compute capacity-topology bare-metal-host list \
-                --capacity-topology-id "$topo_id" \
-                --all \
-                --output json > "$hosts_json" 2>/dev/null; then
-            
-            jq -r --arg topo "$topo_id" '
+        if [[ -n "$hosts_json" ]]; then
+            echo "$hosts_json" | jq -r --arg topo "$topo_id" '
                 .data.items[]? | 
                 "\(.["instance-id"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["lifecycle-details"] // "N/A")|\($topo)"
-            ' "$hosts_json" >> "$CAPACITY_TOPOLOGY_CACHE" 2>/dev/null
+            ' > "$output_file" 2>/dev/null
         fi
-        
-        rm -f "$hosts_json"
-    done
+    }
+    export -f _fetch_single_topology
     
+    # Determine parallelism (max 8 to avoid API throttling)
+    local parallel_jobs=8
+    [[ "$topo_count" -lt "$parallel_jobs" ]] && parallel_jobs="$topo_count"
+    
+    log_info "Fetching $topo_count topologies in parallel (jobs=$parallel_jobs)..."
+    
+    # Start progress bar in background
+    show_parallel_progress "$parallel_temp" "topo_*.txt" "$topo_count" "capacity topologies" &
+    local progress_pid=$!
+    
+    # Run parallel fetch
+    echo "$topology_ids" | xargs -P "$parallel_jobs" -I {} bash -c '_fetch_single_topology "$@"' _ {} "$parallel_temp"
+    
+    # Stop progress bar
+    kill "$progress_pid" 2>/dev/null
+    wait "$progress_pid" 2>/dev/null
+    printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) capacity topologies \n" "$topo_count" "$topo_count"
+    
+    # Aggregate results from parallel outputs
+    cat "$parallel_temp"/topo_*.txt >> "$CAPACITY_TOPOLOGY_CACHE" 2>/dev/null
+    
+    # Cleanup
+    rm -rf "$parallel_temp"
     rm -f "$topologies_json"
+    
     return 0
 }
 
@@ -3224,7 +3354,7 @@ list_maintenance_instances() {
         ((instance_idx++))
         
         # Store mapping in temp file (subshell workaround)
-        echo "m${instance_idx}|${ocid}|${k8s_node}|${dn}|${k8s_cordon}" >> /tmp/maint_map_$$
+        echo "m${instance_idx}|${ocid}|${k8s_node}|${dn}|${k8s_cordon}" >> ${TEMP_DIR}/maint_map_$$
         
         # Color coding
         local oci_color="$GREEN"
@@ -3266,11 +3396,11 @@ list_maintenance_instances() {
     done
     
     # Read instance map from temp file
-    if [[ -f /tmp/maint_map_$$ ]]; then
+    if [[ -f ${TEMP_DIR}/maint_map_$$ ]]; then
         while IFS='|' read -r idx ocid k8s_node dn cordon_status; do
             MAINT_INSTANCE_MAP[$idx]="${ocid}|${k8s_node}|${dn}|${cordon_status}"
-        done < /tmp/maint_map_$$
-        rm -f /tmp/maint_map_$$
+        done < ${TEMP_DIR}/maint_map_$$
+        rm -f ${TEMP_DIR}/maint_map_$$
     fi
     
     echo ""
@@ -7607,7 +7737,7 @@ manage_compute_instances() {
         local instance_idx=0
         
         # Clear any old temp file
-        rm -f /tmp/instance_map_$$
+        rm -f ${TEMP_DIR}/instance_map_$$
         
         # Fetch K8s nodes once for lookup (include taints and unschedulable status)
         local k8s_nodes_json
@@ -7644,7 +7774,7 @@ manage_compute_instances() {
             local iid="i${instance_idx}"
             
             # Store in map (need to use a temp file since we're in a subshell)
-            echo "${iid}|${ocid}" >> /tmp/instance_map_$$
+            echo "${iid}|${ocid}" >> ${TEMP_DIR}/instance_map_$$
             
             # Color state
             local state_color="$GREEN"
@@ -7725,16 +7855,16 @@ manage_compute_instances() {
                 time_display="${time_display/T/ }"
             fi
             
-            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-8s${NC} ${taint_color}%-10s${NC} ${pod_color}%-5s${NC} %-24s %-12s ${GRAY}%-16s${NC} ${GRAY}%s${NC}\n" \
+            printf "${YELLOW}%-5s${NC} %-32s ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-8s${NC} ${taint_color}%-10s${NC} ${pod_color}%-5s${NC} %-24s %-12s ${GRAY}%-16s${NC} ${YELLOW}%s${NC}\n" \
                 "$iid" "$name_trunc" "$state" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$shape_trunc" "$ad_short" "$time_display" "$ocid"
         done
         
         # Read map from temp file
-        if [[ -f /tmp/instance_map_$$ ]]; then
+        if [[ -f ${TEMP_DIR}/instance_map_$$ ]]; then
             while IFS='|' read -r iid ocid; do
                 INSTANCE_INDEX_MAP[$iid]="$ocid"
-            done < /tmp/instance_map_$$
-            rm -f /tmp/instance_map_$$
+            done < ${TEMP_DIR}/instance_map_$$
+            rm -f ${TEMP_DIR}/instance_map_$$
         fi
         
         local total_instances=${#INSTANCE_INDEX_MAP[@]}
@@ -7868,7 +7998,7 @@ display_instances_properties_view() {
         echo -e "${YELLOW}Fetching boot volumes in parallel...${NC}"
         
         # Create temp directory for parallel results
-        local tmp_bv_dir="/tmp/bv_fetch_$$"
+        local tmp_bv_dir="${TEMP_DIR}/bv_fetch_$$"
         mkdir -p "$tmp_bv_dir"
         
         local bv_count=0
@@ -7943,7 +8073,7 @@ display_instances_properties_view() {
     else
         echo -e "${YELLOW}Fetching images in parallel...${NC}"
         
-        local tmp_img_dir="/tmp/img_fetch_$$"
+        local tmp_img_dir="${TEMP_DIR}/img_fetch_$$"
         mkdir -p "$tmp_img_dir"
         
         local img_count=0
@@ -7990,7 +8120,7 @@ display_instances_properties_view() {
     # ========== BUILD DISPLAY DATA ==========
     echo -e "${YELLOW}Building display...${NC}"
     
-    local tmp_data="/tmp/instance_props_$$"
+    local tmp_data="${TEMP_DIR}/instance_props_$$"
     rm -f "$tmp_data"
     
     # Load caches into associative arrays for fast lookup
@@ -15912,7 +16042,7 @@ fss_show_overview() {
                         elif [[ "$fs_bytes" -ge 1048576 ]]; then
                             fs_size="$(echo "scale=1; $fs_bytes / 1048576" | bc) MB"
                         elif [[ "$fs_bytes" -ge 1024 ]]; then
-                            fs_size="$(echo "scale=1; $fs_bytes / 1024" | bc) KB"
+                            fs_size="$(echo "scale=1; $fs_bytes / 1000" | bc) KB"
                         else
                             fs_size="${fs_bytes} B"
                         fi
@@ -15982,7 +16112,7 @@ fss_show_overview() {
                 elif [[ "$fs_bytes" -ge 1048576 ]]; then
                     fs_size="$(echo "scale=1; $fs_bytes / 1048576" | bc) MB"
                 elif [[ "$fs_bytes" -ge 1024 ]]; then
-                    fs_size="$(echo "scale=1; $fs_bytes / 1024" | bc) KB"
+                    fs_size="$(echo "scale=1; $fs_bytes / 1000" | bc) KB"
                 else
                     fs_size="${fs_bytes} B"
                 fi
@@ -17556,40 +17686,366 @@ manage_lustre_file_systems() {
         echo -e "  ${CYAN}Compartment:${NC} ${YELLOW}${compartment_id}${NC}"
         echo ""
         
-        echo -e "${BOLD}${WHITE}═══ Lustre File Systems ═══${NC}"
-        echo -e "  ${GREEN}1${NC}) ${WHITE}List Lustre File Systems${NC}     - List all Lustre file systems"
-        echo -e "  ${GREEN}2${NC}) ${WHITE}View Lustre Details${NC}          - Get detailed info with mount commands"
-        echo -e "  ${GREEN}3${NC}) ${WHITE}Create Lustre File System${NC}    - Create a new Lustre file system"
-        echo -e "  ${GREEN}4${NC}) ${WHITE}Update Lustre File System${NC}    - Update name or capacity"
-        echo -e "  ${GREEN}5${NC}) ${WHITE}Delete Lustre File System${NC}    - Delete a Lustre file system"
+        # Fetch all Lustre file systems across all ADs
+        echo -e "${GRAY}Fetching Lustre file systems...${NC}"
+        local lfs_json
+        lfs_json=$(oci lfs lustre-file-system-collection list-lustre-file-systems \
+            --compartment-id "$compartment_id" \
+            --all \
+            --output json 2>/dev/null)
+        
+        local lfs_count=0
+        if [[ -n "$lfs_json" && "$lfs_json" != "null" ]]; then
+            lfs_count=$(echo "$lfs_json" | jq '.data.items | length' 2>/dev/null || echo "0")
+        fi
+        
+        # Display summary table
+        echo -e "${BOLD}${WHITE}═══ Lustre File Systems Summary (${lfs_count} found) ═══${NC}"
         echo ""
-        echo -e "${BOLD}${WHITE}═══ Object Storage Links ═══${NC}"
-        echo -e "  ${GREEN}6${NC}) ${WHITE}List Object Storage Links${NC}    - List HSM links to Object Storage"
-        echo -e "  ${GREEN}7${NC}) ${WHITE}Create Object Storage Link${NC}   - Link Lustre to Object Storage bucket"
-        echo -e "  ${GREEN}8${NC}) ${WHITE}Start Import from Object${NC}     - Import data from Object Storage"
-        echo -e "  ${GREEN}9${NC}) ${WHITE}Start Export to Object${NC}       - Export data to Object Storage"
-        echo -e "  ${GREEN}10${NC}) ${WHITE}Delete Object Storage Link${NC}  - Remove an Object Storage link"
+        
+        if [[ "$lfs_count" -gt 0 ]]; then
+            # Group by AD
+            local ads_list
+            ads_list=$(echo "$lfs_json" | jq -r '.data.items[]["availability-domain"]' 2>/dev/null | sort -u)
+            
+            declare -gA LFS_MAP
+            LFS_MAP=()
+            local idx=0
+            
+            for ad in $ads_list; do
+                local ad_short="${ad##*:}"
+                echo -e "${BOLD}${CYAN}─── $ad_short ───${NC}"
+                echo ""
+                
+                printf "  ${BOLD}%-3s %-28s %-10s %-8s %-12s %-10s %-8s %-20s${NC}\n" \
+                    "#" "Display Name" "State" "Capacity" "Perf Tier" "Version" "OS Link" "MGS Address"
+                print_separator 120
+                
+                # Get file systems for this AD
+                while IFS='|' read -r display_name state capacity_gb perf_tier version mgs_address lfs_id; do
+                    [[ -z "$display_name" ]] && continue
+                    ((idx++))
+                    
+                    LFS_MAP[$idx]="$lfs_id"
+                    
+                    local state_color="$GREEN"
+                    case "$state" in
+                        ACTIVE) state_color="$GREEN" ;;
+                        CREATING|UPDATING) state_color="$YELLOW" ;;
+                        DELETING|DELETED|FAILED) state_color="$RED" ;;
+                        *) state_color="$GRAY" ;;
+                    esac
+                    
+                    local name_trunc="${display_name:0:26}"
+                    [[ ${#display_name} -gt 26 ]] && name_trunc="${name_trunc}.."
+                    
+                    # Convert capacity to TB
+                    local capacity_display="N/A"
+                    if [[ "$capacity_gb" =~ ^[0-9]+$ ]] && [[ "$capacity_gb" -gt 0 ]]; then
+                        capacity_display=$(echo "scale=1; $capacity_gb / 1000" | bc)
+                        capacity_display="${capacity_display}TB"
+                    fi
+                    
+                    # Shorten performance tier
+                    local perf_short="N/A"
+                    case "$perf_tier" in
+                        MBPS_PER_TB_125) perf_short="125/TB" ;;
+                        MBPS_PER_TB_250) perf_short="250/TB" ;;
+                        MBPS_PER_TB_500) perf_short="500/TB" ;;
+                        MBPS_PER_TB_1000) perf_short="1000/TB" ;;
+                        *) perf_short="${perf_tier:0:10}" ;;
+                    esac
+                    
+                    # Check for object storage links
+                    local os_link_status="${GRAY}None${NC}"
+                    local os_links_json
+                    os_links_json=$(oci lfs data-repository-association-collection list-data-repository-associations \
+                        --lustre-file-system-id "$lfs_id" \
+                        --output json 2>/dev/null)
+                    
+                    if [[ -n "$os_links_json" ]]; then
+                        local link_count
+                        link_count=$(echo "$os_links_json" | jq '.data.items | length' 2>/dev/null || echo "0")
+                        if [[ "$link_count" -gt 0 ]]; then
+                            local link_state
+                            link_state=$(echo "$os_links_json" | jq -r '.data.items[0]["lifecycle-state"] // "N/A"' 2>/dev/null)
+                            case "$link_state" in
+                                ACTIVE) os_link_status="${GREEN}Active${NC}" ;;
+                                CREATING) os_link_status="${YELLOW}Creating${NC}" ;;
+                                *) os_link_status="${YELLOW}${link_state:0:8}${NC}" ;;
+                            esac
+                            [[ "$link_count" -gt 1 ]] && os_link_status="${os_link_status} (${link_count})"
+                        fi
+                    fi
+                    
+                    # Version display
+                    local version_display="${version:0:8}"
+                    [[ "$version" == "null" || -z "$version" ]] && version_display="N/A"
+                    
+                    # MGS address display
+                    local mgs_display="${mgs_address:0:18}"
+                    [[ "$mgs_address" == "null" || -z "$mgs_address" ]] && mgs_display="N/A"
+                    
+                    printf "  ${YELLOW}%-3s${NC} %-28s ${state_color}%-10s${NC} %-8s %-12s %-10s %-8b %-20s\n" \
+                        "$idx" "$name_trunc" "$state" "$capacity_display" "$perf_short" "$version_display" "$os_link_status" "$mgs_display"
+                    
+                done < <(echo "$lfs_json" | jq -r --arg ad "$ad" '
+                    .data.items[] | 
+                    select(.["availability-domain"] == $ad) | 
+                    "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-gbs"] // 0)|\(.["performance-tier"] // "N/A")|\(.["lustre-version"] // .["major-version"] // "N/A")|\(.["mgs-address"] // "N/A")|\(.id)"
+                ' 2>/dev/null)
+                
+                echo ""
+            done
+            
+            LFS_COUNT=$idx
+        else
+            echo -e "  ${YELLOW}No Lustre file systems found in this compartment${NC}"
+            echo ""
+        fi
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo -e "  ${YELLOW}#${NC}   ${WHITE}View details${NC}               - Enter number to view file system details"
         echo ""
-        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo -e "${BOLD}${WHITE}─── File System Operations ───${NC}"
+        echo -e "  ${GREEN}c${NC})  ${WHITE}Create Lustre File System${NC}  - Create a new Lustre file system"
+        echo -e "  ${GREEN}u${NC})  ${WHITE}Update Lustre File System${NC}  - Update name or capacity"
+        echo -e "  ${RED}d${NC})  ${WHITE}Delete Lustre File System${NC}  - Delete a Lustre file system"
+        echo ""
+        echo -e "${BOLD}${WHITE}─── Object Storage Links ───${NC}"
+        echo -e "  ${GREEN}ol${NC}) ${WHITE}List Object Storage Links${NC}  - List all HSM links"
+        echo -e "  ${GREEN}oc${NC}) ${WHITE}Create Object Storage Link${NC} - Link Lustre to Object Storage"
+        echo -e "  ${GREEN}oi${NC}) ${WHITE}Start Import from Object${NC}   - Import data from Object Storage"
+        echo -e "  ${GREEN}oe${NC}) ${WHITE}Start Export to Object${NC}     - Export data to Object Storage"
+        echo -e "  ${RED}od${NC}) ${WHITE}Delete Object Storage Link${NC} - Remove an Object Storage link"
+        echo ""
+        echo -e "  ${WHITE}r${NC})  Refresh"
+        echo -e "  ${WHITE}b${NC})  Back to main menu"
         echo ""
         echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
         read -r selection
         
         case "$selection" in
-            1) lfs_list_file_systems "$compartment_id" ;;
-            2) lfs_view_file_system_details "$compartment_id" ;;
-            3) lfs_create_file_system "$compartment_id" ;;
-            4) lfs_update_file_system "$compartment_id" ;;
-            5) lfs_delete_file_system "$compartment_id" ;;
-            6) lfs_list_object_storage_links "$compartment_id" ;;
-            7) lfs_create_object_storage_link "$compartment_id" ;;
-            8) lfs_start_import_from_object "$compartment_id" ;;
-            9) lfs_start_export_to_object "$compartment_id" ;;
-            10) lfs_delete_object_storage_link "$compartment_id" ;;
+            [0-9]|[0-9][0-9])
+                if [[ -n "${LFS_MAP[$selection]}" ]]; then
+                    LFS_SELECTED="${LFS_MAP[$selection]}"
+                    lfs_view_selected_details "$compartment_id"
+                else
+                    echo -e "${RED}Invalid selection${NC}"
+                fi
+                ;;
+            c|C) lfs_create_file_system "$compartment_id" ;;
+            u|U) lfs_update_file_system "$compartment_id" ;;
+            d|D) lfs_delete_file_system "$compartment_id" ;;
+            ol|OL) lfs_list_object_storage_links "$compartment_id" ;;
+            oc|OC) lfs_create_object_storage_link "$compartment_id" ;;
+            oi|OI) lfs_start_import_from_object "$compartment_id" ;;
+            oe|OE) lfs_start_export_to_object "$compartment_id" ;;
+            od|OD) lfs_delete_object_storage_link "$compartment_id" ;;
+            r|R) continue ;;
             b|B|back|BACK|"") return ;;
             *) echo -e "${RED}Invalid selection${NC}" ;;
         esac
     done
+}
+
+# View details of already selected LFS
+lfs_view_selected_details() {
+    local compartment_id="$1"
+    
+    [[ -z "$LFS_SELECTED" ]] && return
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Lustre File System Details ═══${NC}"
+    echo ""
+    
+    local lfs_json
+    lfs_json=$(oci lfs lustre-file-system get --lustre-file-system-id "$LFS_SELECTED" --output json 2>/dev/null)
+    
+    if [[ -z "$lfs_json" || "$lfs_json" == "null" ]]; then
+        echo -e "${RED}Failed to get Lustre file system details${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Call the existing details display logic
+    _display_lfs_details "$lfs_json"
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+# Internal function to display LFS details (reusable)
+_display_lfs_details() {
+    local lfs_json="$1"
+    
+    # Basic fields
+    local display_name state capacity_tb ad_name subnet_id time_created lfs_id
+    local file_system_name mgs_address
+    
+    display_name=$(echo "$lfs_json" | jq -r '.data["display-name"] // "N/A"')
+    state=$(echo "$lfs_json" | jq -r '.data["lifecycle-state"] // "N/A"')
+    local capacity_gb
+    capacity_gb=$(echo "$lfs_json" | jq -r '.data["capacity-in-gbs"] // 0')
+    capacity_tb=$(echo "scale=1; $capacity_gb / 1000" | bc)
+    ad_name=$(echo "$lfs_json" | jq -r '.data["availability-domain"] // "N/A"')
+    subnet_id=$(echo "$lfs_json" | jq -r '.data["subnet-id"] // "N/A"')
+    time_created=$(echo "$lfs_json" | jq -r '.data["time-created"] // "N/A"')
+    lfs_id=$(echo "$lfs_json" | jq -r '.data.id // "N/A"')
+    
+    # Lustre-specific fields
+    file_system_name=$(echo "$lfs_json" | jq -r '.data["file-system-name"] // "N/A"')
+    mgs_address=$(echo "$lfs_json" | jq -r '.data["mgs-address"] // "N/A"')
+    
+    # Performance tier
+    local performance_tier
+    performance_tier=$(echo "$lfs_json" | jq -r '.data["performance-tier"] // "N/A"')
+    local throughput_display="N/A"
+    if [[ "$performance_tier" != "N/A" && "$capacity_gb" -gt 0 ]]; then
+        local tier_value
+        case "$performance_tier" in
+            MBPS_PER_TB_125) tier_value=125 ;;
+            MBPS_PER_TB_250) tier_value=250 ;;
+            MBPS_PER_TB_500) tier_value=500 ;;
+            MBPS_PER_TB_1000) tier_value=1000 ;;
+            *) tier_value=0 ;;
+        esac
+        if [[ "$tier_value" -gt 0 ]]; then
+            local expected_throughput
+            expected_throughput=$(echo "$capacity_tb * $tier_value" | bc | cut -d'.' -f1)
+            throughput_display="${expected_throughput} MB/s (${tier_value} MB/s per TB)"
+        fi
+    fi
+    
+    # Lustre version
+    local lustre_version
+    lustre_version=$(echo "$lfs_json" | jq -r '.data["lustre-version"] // .data["major-version"] // "N/A"')
+    
+    # Root squash configuration
+    local root_squash
+    root_squash=$(echo "$lfs_json" | jq -r '.data["root-squash-configuration"]["root-squash"] // .data["root-squash"] // "N/A"')
+    
+    # Network Security Groups
+    local nsg_ids
+    nsg_ids=$(echo "$lfs_json" | jq -r '.data["nsg-ids"] // []')
+    
+    # Encryption / KMS
+    local kms_key_id
+    kms_key_id=$(echo "$lfs_json" | jq -r '.data["kms-key-id"] // "N/A"')
+    local encryption_type="Oracle-managed"
+    if [[ "$kms_key_id" != "N/A" && "$kms_key_id" != "null" && -n "$kms_key_id" ]]; then
+        encryption_type="Customer-managed (KMS)"
+    fi
+    
+    local state_color="$GREEN"
+    case "$state" in
+        ACTIVE) state_color="$GREEN" ;;
+        CREATING|UPDATING) state_color="$YELLOW" ;;
+        *) state_color="$RED" ;;
+    esac
+    
+    # Display basic info section
+    echo -e "${BOLD}${CYAN}─── Basic Information ───${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}$display_name${NC}"
+    echo -e "  ${CYAN}File System Name:${NC}    ${WHITE}$file_system_name${NC}"
+    echo -e "  ${CYAN}Lustre Version:${NC}      ${WHITE}$lustre_version${NC}"
+    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
+    echo -e "  ${CYAN}Lustre FS OCID:${NC}      ${YELLOW}$lfs_id${NC}"
+    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
+    echo ""
+    
+    # Display capacity and performance section
+    echo -e "${BOLD}${CYAN}─── Capacity & Performance ───${NC}"
+    echo -e "  ${CYAN}Capacity:${NC}            ${WHITE}${capacity_tb} TB (${capacity_gb} GB)${NC}"
+    echo -e "  ${CYAN}Performance Tier:${NC}    ${WHITE}$performance_tier${NC}"
+    echo -e "  ${CYAN}Expected Throughput:${NC} ${WHITE}$throughput_display${NC}"
+    echo ""
+    
+    # Display network section
+    echo -e "${BOLD}${CYAN}─── Network Configuration ───${NC}"
+    echo -e "  ${CYAN}MGS Address:${NC}         ${WHITE}$mgs_address${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
+    echo -e "  ${CYAN}Subnet OCID:${NC}         ${YELLOW}$subnet_id${NC}"
+    local nsg_display
+    nsg_display=$(echo "$nsg_ids" | jq -r 'if length > 0 then .[] else empty end' 2>/dev/null)
+    if [[ -n "$nsg_display" ]]; then
+        echo -e "  ${CYAN}Network Security Groups:${NC}"
+        echo "$nsg_ids" | jq -r '.[]?' 2>/dev/null | while read -r nsg; do
+            [[ -n "$nsg" ]] && echo -e "    ${YELLOW}$nsg${NC}"
+        done
+    else
+        echo -e "  ${CYAN}Network Security Groups:${NC} ${GRAY}None${NC}"
+    fi
+    echo ""
+    
+    # Display security section
+    echo -e "${BOLD}${CYAN}─── Security Configuration ───${NC}"
+    echo -e "  ${CYAN}Root Squash:${NC}         ${WHITE}$root_squash${NC}"
+    echo -e "  ${CYAN}Encryption:${NC}          ${WHITE}$encryption_type${NC}"
+    if [[ "$kms_key_id" != "N/A" && "$kms_key_id" != "null" && -n "$kms_key_id" ]]; then
+        echo -e "  ${CYAN}KMS Key OCID:${NC}        ${YELLOW}$kms_key_id${NC}"
+    fi
+    echo ""
+    
+    # Fetch and display Object Storage Links
+    echo -e "${BOLD}${CYAN}─── Object Storage Links ───${NC}"
+    local os_links_json
+    os_links_json=$(oci lfs data-repository-association-collection list-data-repository-associations \
+        --lustre-file-system-id "$lfs_id" \
+        --output json 2>/dev/null)
+    
+    local link_count=0
+    if [[ -n "$os_links_json" ]]; then
+        link_count=$(echo "$os_links_json" | jq '.data.items | length' 2>/dev/null || echo "0")
+    fi
+    
+    if [[ "$link_count" -gt 0 ]]; then
+        local link_idx=0
+        while IFS='|' read -r assoc_id assoc_state fs_path bucket prefix import_policy export_policy; do
+            ((link_idx++))
+            
+            local link_state_color="$GREEN"
+            case "$assoc_state" in
+                ACTIVE) link_state_color="$GREEN" ;;
+                CREATING|UPDATING) link_state_color="$YELLOW" ;;
+                *) link_state_color="$RED" ;;
+            esac
+            
+            echo -e "  ${CYAN}Link #${link_idx}:${NC}"
+            echo -e "    ${CYAN}State:${NC}              ${link_state_color}${assoc_state}${NC}"
+            echo -e "    ${CYAN}File System Path:${NC}   ${WHITE}$fs_path${NC}"
+            echo -e "    ${CYAN}Bucket:${NC}             ${WHITE}$bucket${NC}"
+            echo -e "    ${CYAN}Prefix:${NC}             ${WHITE}${prefix:-none}${NC}"
+            echo -e "    ${CYAN}Import Policy:${NC}      ${WHITE}$import_policy${NC}"
+            echo -e "    ${CYAN}Export Policy:${NC}      ${WHITE}$export_policy${NC}"
+            echo -e "    ${CYAN}Association OCID:${NC}   ${YELLOW}$assoc_id${NC}"
+            echo ""
+        done < <(echo "$os_links_json" | jq -r '
+            .data.items[] |
+            "\(.id)|\(.["lifecycle-state"])|\(.["file-system-path"] // "N/A")|\(.bucket // "N/A")|\(.prefix // "")|\(.["data-repository-import-policy"]["import-policy-type"] // "N/A")|\(.["data-repository-export-policy"]["export-policy-type"] // "N/A")"
+        ' 2>/dev/null)
+    else
+        echo -e "  ${GRAY}No Object Storage links configured${NC}"
+        echo ""
+    fi
+    
+    # Mount commands
+    if [[ "$mgs_address" != "N/A" && "$mgs_address" != "null" && -n "$file_system_name" ]]; then
+        echo -e "${BOLD}${CYAN}─── Mount Commands ───${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Install Lustre client (Oracle Linux / RHEL):${NC}"
+        echo -e "  ${WHITE}sudo yum install -y lustre-client${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Create mount point and mount:${NC}"
+        echo -e "  ${WHITE}sudo mkdir -p /mnt/lustre${NC}"
+        echo -e "  ${WHITE}sudo mount -t lustre ${mgs_address}:/${file_system_name} /mnt/lustre${NC}"
+        echo ""
+        echo -e "  ${GRAY}# Add to /etc/fstab for persistent mount:${NC}"
+        echo -e "  ${WHITE}${mgs_address}:/${file_system_name} /mnt/lustre lustre defaults,_netdev 0 0${NC}"
+    fi
 }
 
 #--------------------------------------------------------------------------------
@@ -17655,10 +18111,20 @@ lfs_list_file_systems() {
         
         local ad_short="${ad_name##*:}"
         
+        # Display capacity - API may return in GB, convert to TB for display
+        local capacity_display
+        if [[ "$capacity_gb" =~ ^[0-9]+$ ]] && [[ "$capacity_gb" -gt 500 ]]; then
+            # Likely in GB, convert to TB
+            capacity_display=$(echo "scale=1; $capacity_gb / 1000" | bc)
+            capacity_display="${capacity_display}TB"
+        else
+            capacity_display="${capacity_gb}TB"
+        fi
+        
         printf "${YELLOW}%-3s${NC} %-30s ${state_color}%-12s${NC} %-10s %-20s ${GRAY}%s${NC}\n" \
-            "$idx" "$name_trunc" "$state" "${capacity_gb}TB" "$ad_short" "$lfs_id"
+            "$idx" "$name_trunc" "$state" "$capacity_display" "$ad_short" "$lfs_id"
             
-    done < <(echo "$lfs_json" | jq -r '.data.items[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-tbs"] // "N/A")|\(.["availability-domain"])|\(.id)"' 2>/dev/null)
+    done < <(echo "$lfs_json" | jq -r '.data.items[] | "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-gbs"] // .["capacity-in-tbs"] // "N/A")|\(.["availability-domain"])|\(.id)"' 2>/dev/null)
     
     LFS_COUNT=$idx
     echo ""
@@ -17707,12 +18173,17 @@ lfs_view_file_system_details() {
         return
     fi
     
+    # Basic fields
     local display_name state capacity_tb ad_name subnet_id time_created lfs_id
-    local mount_command file_system_name mgs_address
+    local file_system_name mgs_address
     
     display_name=$(echo "$lfs_json" | jq -r '.data["display-name"] // "N/A"')
     state=$(echo "$lfs_json" | jq -r '.data["lifecycle-state"] // "N/A"')
-    capacity_tb=$(echo "$lfs_json" | jq -r '.data["capacity-in-tbs"] // "N/A"')
+    capacity_tb=$(echo "$lfs_json" | jq -r '.data["capacity-in-gbs"] // .data["capacity-in-tbs"] // "N/A"')
+    # Convert to TB if in GB
+    if [[ "$capacity_tb" =~ ^[0-9]+$ ]] && [[ "$capacity_tb" -gt 500 ]]; then
+        capacity_tb=$(echo "scale=1; $capacity_tb / 1000" | bc)
+    fi
     ad_name=$(echo "$lfs_json" | jq -r '.data["availability-domain"] // "N/A"')
     subnet_id=$(echo "$lfs_json" | jq -r '.data["subnet-id"] // "N/A"')
     time_created=$(echo "$lfs_json" | jq -r '.data["time-created"] // "N/A"')
@@ -17722,6 +18193,66 @@ lfs_view_file_system_details() {
     file_system_name=$(echo "$lfs_json" | jq -r '.data["file-system-name"] // "N/A"')
     mgs_address=$(echo "$lfs_json" | jq -r '.data["mgs-address"] // "N/A"')
     
+    # Performance tier
+    local performance_tier
+    performance_tier=$(echo "$lfs_json" | jq -r '.data["performance-tier"] // "N/A"')
+    local throughput_display="N/A"
+    if [[ "$performance_tier" != "N/A" && "$capacity_tb" != "N/A" ]]; then
+        local tier_value
+        case "$performance_tier" in
+            MBPS_PER_TB_125) tier_value=125 ;;
+            MBPS_PER_TB_250) tier_value=250 ;;
+            MBPS_PER_TB_500) tier_value=500 ;;
+            MBPS_PER_TB_1000) tier_value=1000 ;;
+            *) tier_value=0 ;;
+        esac
+        if [[ "$tier_value" -gt 0 ]]; then
+            local expected_throughput
+            expected_throughput=$(echo "$capacity_tb * $tier_value" | bc | cut -d'.' -f1)
+            throughput_display="${expected_throughput} MB/s (${tier_value} MB/s per TB)"
+        fi
+    fi
+    
+    # Lustre version
+    local lustre_version
+    lustre_version=$(echo "$lfs_json" | jq -r '.data["lustre-version"] // .data["major-version"] // "N/A"')
+    
+    # Root squash configuration
+    local root_squash
+    root_squash=$(echo "$lfs_json" | jq -r '.data["root-squash-configuration"]["root-squash"] // .data["root-squash"] // "N/A"')
+    
+    # Network Security Groups
+    local nsg_ids nsg_display
+    nsg_ids=$(echo "$lfs_json" | jq -r '.data["nsg-ids"] // []')
+    if [[ "$nsg_ids" == "[]" || "$nsg_ids" == "null" || -z "$nsg_ids" ]]; then
+        nsg_display="None"
+    else
+        nsg_display=$(echo "$nsg_ids" | jq -r 'if length > 0 then .[] else "None" end' 2>/dev/null)
+    fi
+    
+    # Encryption / KMS
+    local kms_key_id
+    kms_key_id=$(echo "$lfs_json" | jq -r '.data["kms-key-id"] // "N/A"')
+    local encryption_type="Oracle-managed"
+    if [[ "$kms_key_id" != "N/A" && "$kms_key_id" != "null" && -n "$kms_key_id" ]]; then
+        encryption_type="Customer-managed (KMS)"
+    fi
+    
+    # Cluster placement and replication
+    local cluster_placement_group_id replication_target_id
+    cluster_placement_group_id=$(echo "$lfs_json" | jq -r '.data["cluster-placement-group-id"] // "N/A"')
+    replication_target_id=$(echo "$lfs_json" | jq -r '.data["replication-target-id"] // "N/A"')
+    
+    # Object Storage Links (data repository associations)
+    local data_repository_associations
+    data_repository_associations=$(echo "$lfs_json" | jq -r '.data["data-repository-associations"] // []')
+    
+    # Lifecycle details and freeform tags
+    local lifecycle_details freeform_tags defined_tags
+    lifecycle_details=$(echo "$lfs_json" | jq -r '.data["lifecycle-details"] // "N/A"')
+    freeform_tags=$(echo "$lfs_json" | jq -r '.data["freeform-tags"] // {}')
+    defined_tags=$(echo "$lfs_json" | jq -r '.data["defined-tags"] // {}')
+    
     local state_color="$GREEN"
     case "$state" in
         ACTIVE) state_color="$GREEN" ;;
@@ -17729,19 +18260,124 @@ lfs_view_file_system_details() {
         *) state_color="$RED" ;;
     esac
     
+    # Display basic info section
+    echo -e "${BOLD}${CYAN}─── Basic Information ───${NC}"
     echo -e "  ${CYAN}Display Name:${NC}        ${WHITE}$display_name${NC}"
-    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
-    echo -e "  ${CYAN}Capacity:${NC}            ${WHITE}${capacity_tb} TB${NC}"
     echo -e "  ${CYAN}File System Name:${NC}    ${WHITE}$file_system_name${NC}"
-    echo -e "  ${CYAN}MGS Address:${NC}         ${WHITE}$mgs_address${NC}"
-    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
-    echo -e "  ${CYAN}Subnet OCID:${NC}         ${GRAY}$subnet_id${NC}"
-    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
+    echo -e "  ${CYAN}Lustre Version:${NC}      ${WHITE}$lustre_version${NC}"
+    echo -e "  ${CYAN}State:${NC}               ${state_color}$state${NC}"
+    [[ "$lifecycle_details" != "N/A" && -n "$lifecycle_details" ]] && \
+        echo -e "  ${CYAN}Lifecycle Details:${NC}   ${WHITE}$lifecycle_details${NC}"
     echo -e "  ${CYAN}Lustre FS OCID:${NC}      ${YELLOW}$lfs_id${NC}"
+    echo -e "  ${CYAN}Time Created:${NC}        ${WHITE}$time_created${NC}"
     echo ""
     
+    # Display capacity and performance section
+    echo -e "${BOLD}${CYAN}─── Capacity & Performance ───${NC}"
+    echo -e "  ${CYAN}Capacity:${NC}            ${WHITE}${capacity_tb} TB${NC}"
+    echo -e "  ${CYAN}Performance Tier:${NC}    ${WHITE}$performance_tier${NC}"
+    echo -e "  ${CYAN}Expected Throughput:${NC} ${WHITE}$throughput_display${NC}"
+    echo ""
+    
+    # Display network section
+    echo -e "${BOLD}${CYAN}─── Network Configuration ───${NC}"
+    echo -e "  ${CYAN}MGS Address:${NC}         ${WHITE}$mgs_address${NC}"
+    echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}$ad_name${NC}"
+    echo -e "  ${CYAN}Subnet OCID:${NC}         ${YELLOW}$subnet_id${NC}"
+    echo -e "  ${CYAN}Network Security Groups:${NC}"
+    if [[ "$nsg_display" == "None" ]]; then
+        echo -e "    ${GRAY}None${NC}"
+    else
+        echo "$nsg_ids" | jq -r '.[]?' 2>/dev/null | while read -r nsg; do
+            [[ -n "$nsg" ]] && echo -e "    ${YELLOW}$nsg${NC}"
+        done
+    fi
+    echo ""
+    
+    # Display security section
+    echo -e "${BOLD}${CYAN}─── Security Configuration ───${NC}"
+    echo -e "  ${CYAN}Root Squash:${NC}         ${WHITE}$root_squash${NC}"
+    echo -e "  ${CYAN}Encryption:${NC}          ${WHITE}$encryption_type${NC}"
+    if [[ "$kms_key_id" != "N/A" && "$kms_key_id" != "null" && -n "$kms_key_id" ]]; then
+        echo -e "  ${CYAN}KMS Key OCID:${NC}        ${YELLOW}$kms_key_id${NC}"
+    fi
+    echo ""
+    
+    # Display Object Storage Links section (if configured)
+    local has_data_repos
+    has_data_repos=$(echo "$data_repository_associations" | jq 'if type == "array" then length > 0 else false end' 2>/dev/null)
+    if [[ "$has_data_repos" == "true" ]]; then
+        echo -e "${BOLD}${CYAN}─── Object Storage Links ───${NC}"
+        local assoc_count
+        assoc_count=$(echo "$data_repository_associations" | jq 'length' 2>/dev/null)
+        local i
+        for ((i=0; i<assoc_count; i++)); do
+            local assoc_id assoc_state fs_path bucket prefix import_policy export_policy
+            assoc_id=$(echo "$data_repository_associations" | jq -r ".[$i].id // \"N/A\"")
+            assoc_state=$(echo "$data_repository_associations" | jq -r ".[$i][\"lifecycle-state\"] // \"N/A\"")
+            fs_path=$(echo "$data_repository_associations" | jq -r ".[$i][\"file-system-path\"] // \"N/A\"")
+            bucket=$(echo "$data_repository_associations" | jq -r ".[$i].bucket // \"N/A\"")
+            prefix=$(echo "$data_repository_associations" | jq -r ".[$i].prefix // \"none\"")
+            import_policy=$(echo "$data_repository_associations" | jq -r ".[$i][\"data-repository-import-policy\"][\"import-policy-type\"] // \"N/A\"" 2>/dev/null)
+            export_policy=$(echo "$data_repository_associations" | jq -r ".[$i][\"data-repository-export-policy\"][\"export-policy-type\"] // \"N/A\"" 2>/dev/null)
+            
+            local assoc_state_color="$GREEN"
+            case "$assoc_state" in
+                ACTIVE) assoc_state_color="$GREEN" ;;
+                CREATING|UPDATING) assoc_state_color="$YELLOW" ;;
+                *) assoc_state_color="$RED" ;;
+            esac
+            
+            echo -e "  ${CYAN}Association ID:${NC}      ${YELLOW}$assoc_id${NC}"
+            echo -e "    ${CYAN}State:${NC}              ${assoc_state_color}${assoc_state}${NC}"
+            echo -e "    ${CYAN}File System Path:${NC}   ${WHITE}$fs_path${NC}"
+            echo -e "    ${CYAN}Bucket:${NC}             ${WHITE}$bucket${NC}"
+            echo -e "    ${CYAN}Prefix:${NC}             ${WHITE}$prefix${NC}"
+            echo -e "    ${CYAN}Import Policy:${NC}      ${WHITE}$import_policy${NC}"
+            echo -e "    ${CYAN}Export Policy:${NC}      ${WHITE}$export_policy${NC}"
+            echo ""
+        done
+    fi
+    
+    # Display placement section (if applicable)
+    if [[ "$cluster_placement_group_id" != "N/A" && "$cluster_placement_group_id" != "null" && -n "$cluster_placement_group_id" ]]; then
+        echo -e "${BOLD}${CYAN}─── Placement ───${NC}"
+        echo -e "  ${CYAN}Cluster Placement Group:${NC} ${YELLOW}$cluster_placement_group_id${NC}"
+        echo ""
+    fi
+    
+    # Display replication section (if applicable)
+    if [[ "$replication_target_id" != "N/A" && "$replication_target_id" != "null" && -n "$replication_target_id" ]]; then
+        echo -e "${BOLD}${CYAN}─── Replication ───${NC}"
+        echo -e "  ${CYAN}Replication Target:${NC} ${YELLOW}$replication_target_id${NC}"
+        echo ""
+    fi
+    
+    # Display tags section
+    local has_freeform_tags has_defined_tags
+    has_freeform_tags=$(echo "$freeform_tags" | jq 'length > 0' 2>/dev/null)
+    has_defined_tags=$(echo "$defined_tags" | jq 'to_entries | length > 0' 2>/dev/null)
+    
+    if [[ "$has_freeform_tags" == "true" || "$has_defined_tags" == "true" ]]; then
+        echo -e "${BOLD}${CYAN}─── Tags ───${NC}"
+        if [[ "$has_freeform_tags" == "true" ]]; then
+            echo -e "  ${CYAN}Freeform Tags:${NC}"
+            echo "$freeform_tags" | jq -r 'to_entries[] | "    \(.key): \(.value)"' 2>/dev/null | while read -r line; do
+                echo -e "  ${WHITE}$line${NC}"
+            done
+        fi
+        if [[ "$has_defined_tags" == "true" ]]; then
+            echo -e "  ${CYAN}Defined Tags:${NC}"
+            echo "$defined_tags" | jq -r 'to_entries[] | .key as $ns | .value | to_entries[] | "    \($ns).\(.key): \(.value)"' 2>/dev/null | while read -r line; do
+                echo -e "  ${WHITE}$line${NC}"
+            done
+        fi
+        echo ""
+    fi
+    
+    # Mount commands
     if [[ "$mgs_address" != "N/A" && -n "$file_system_name" ]]; then
-        echo -e "${BOLD}${WHITE}Mount Commands:${NC}"
+        echo -e "${BOLD}${CYAN}─── Mount Commands ───${NC}"
         echo ""
         echo -e "  ${GRAY}# Install Lustre client (Oracle Linux / RHEL):${NC}"
         echo -e "  ${WHITE}sudo yum install -y lustre-client${NC}"
@@ -17818,6 +18454,31 @@ lfs_create_file_system() {
         return
     fi
     
+    # List NSGs (optional)
+    echo ""
+    echo -e "${CYAN}Available Network Security Groups (optional):${NC}"
+    local nsgs_json
+    nsgs_json=$(oci network nsg list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+    
+    idx=0
+    declare -A NSG_MAP
+    echo -e "  ${YELLOW}0${NC}) None (skip NSG)"
+    while IFS='|' read -r nsg_name nsg_id; do
+        [[ -z "$nsg_name" ]] && continue
+        ((idx++))
+        NSG_MAP[$idx]="$nsg_id"
+        echo -e "  ${YELLOW}$idx${NC}) $nsg_name"
+    done < <(echo "$nsgs_json" | jq -r '.data[] | "\(.["display-name"])|\(.id)"' 2>/dev/null)
+    
+    echo ""
+    echo -n -e "${CYAN}Select NSG # (0 for none): ${NC}"
+    read -r nsg_selection
+    local nsg_id=""
+    if [[ "$nsg_selection" != "0" && -n "${NSG_MAP[$nsg_selection]}" ]]; then
+        nsg_id="${NSG_MAP[$nsg_selection]}"
+    fi
+    
+    echo ""
     echo -n -e "${CYAN}Enter display name: ${NC}"
     read -r lfs_name
     
@@ -17826,38 +18487,227 @@ lfs_create_file_system() {
         return
     fi
     
-    echo -n -e "${CYAN}Enter file system name (e.g., lustrefs1): ${NC}"
+    echo ""
+    echo -e "${GRAY}File system name rules: 1-8 characters, letters (a-z, A-Z), numbers, and underscore only${NC}"
+    echo -n -e "${CYAN}Enter file system name (e.g., lfs1, myfs_01): ${NC}"
     read -r fs_name
     
     if [[ -z "$fs_name" ]]; then
-        fs_name="lustrefs$(date +%s)"
+        # Generate default: lfs + random 4 digits
+        fs_name="lfs$(shuf -i 1000-9999 -n 1)"
         echo -e "${YELLOW}Using default: $fs_name${NC}"
     fi
     
+    # Validate file system name: 1-8 characters, alphanumeric and underscore only
+    while true; do
+        if [[ ${#fs_name} -lt 1 || ${#fs_name} -gt 8 ]]; then
+            echo -e "${RED}File system name must be 1-8 characters. You entered: ${#fs_name} characters${NC}"
+        elif [[ ! "$fs_name" =~ ^[a-zA-Z0-9_]+$ ]]; then
+            echo -e "${RED}File system name can only contain letters (a-z, A-Z), numbers, and underscore${NC}"
+        else
+            break
+        fi
+        echo -n -e "${CYAN}Enter valid name: ${NC}"
+        read -r fs_name
+        if [[ -z "$fs_name" ]]; then
+            echo -e "${RED}Name required. Aborting.${NC}"
+            return
+        fi
+    done
+    
+    # Capacity selection with proper Lustre sizing rules
+    echo ""
     echo -e "${CYAN}Select capacity:${NC}"
-    echo -e "  ${YELLOW}1${NC}) 48 TB"
-    echo -e "  ${YELLOW}2${NC}) 96 TB"
-    echo -e "  ${YELLOW}3${NC}) 144 TB"
-    echo -e "  ${YELLOW}4${NC}) Custom"
+    echo -e "${GRAY}  Rules: Min 31,200 GB (31.2 TB), must be multiple of 10,400 GB (10.4 TB)${NC}"
+    echo -e "  ${YELLOW}1${NC})  31.2 TB  (31,200 GB - minimum)"
+    echo -e "  ${YELLOW}2${NC})  41.6 TB  (41,600 GB)"
+    echo -e "  ${YELLOW}3${NC})  52.0 TB  (52,000 GB)"
+    echo -e "  ${YELLOW}4${NC})  62.4 TB  (62,400 GB)"
+    echo -e "  ${YELLOW}5${NC})  72.8 TB  (72,800 GB)"
+    echo -e "  ${YELLOW}6${NC})  83.2 TB  (83,200 GB)"
+    echo -e "  ${YELLOW}7${NC})  93.6 TB  (93,600 GB)"
+    echo -e "  ${YELLOW}8${NC}) 104.0 TB (104,000 GB)"
+    echo -e "  ${YELLOW}9${NC}) 114.4 TB (114,400 GB)"
+    echo -e "  ${YELLOW}10${NC}) 124.8 TB (124,800 GB)"
+    echo -e "  ${YELLOW}11${NC}) 166.4 TB (166,400 GB)"
+    echo -e "  ${YELLOW}12${NC}) 208.0 TB (208,000 GB)"
+    echo -e "  ${YELLOW}c${NC})  Custom"
     echo -n -e "${CYAN}Select #: ${NC}"
     read -r cap_selection
     
     local capacity_tb
     case "$cap_selection" in
-        1) capacity_tb=48 ;;
-        2) capacity_tb=96 ;;
-        3) capacity_tb=144 ;;
-        4)
+        1) capacity_tb="31.2" ;;
+        2) capacity_tb="41.6" ;;
+        3) capacity_tb="52.0" ;;
+        4) capacity_tb="62.4" ;;
+        5) capacity_tb="72.8" ;;
+        6) capacity_tb="83.2" ;;
+        7) capacity_tb="93.6" ;;
+        8) capacity_tb="104.0" ;;
+        9) capacity_tb="114.4" ;;
+        10) capacity_tb="124.8" ;;
+        11) capacity_tb="166.4" ;;
+        12) capacity_tb="208.0" ;;
+        c|C|13)
+            echo ""
+            echo -e "${GRAY}Capacity must be a multiple of 10.4 TB (10,400 GB), minimum 31.2 TB${NC}"
+            echo -e "${GRAY}Examples: 31.2, 41.6, 52.0, 62.4, 72.8, 83.2, 93.6, 104.0, 114.4, 124.8, 135.2, ...${NC}"
             echo -n -e "${CYAN}Enter capacity in TB: ${NC}"
             read -r capacity_tb
+            # Validate the capacity
+            if ! lfs_validate_capacity "$capacity_tb"; then
+                local entered_gb
+                entered_gb=$(echo "scale=0; $capacity_tb * 1000 / 1" | bc 2>/dev/null)
+                echo -e "${RED}Invalid capacity. ${entered_gb} GB is not a multiple of 10,400 GB.${NC}"
+                echo -e "${GRAY}Nearest valid values: $(( (entered_gb / 10400) * 10400 )) GB or $(( ((entered_gb / 10400) + 1) * 10400 )) GB${NC}"
+                return
+            fi
             ;;
-        *) capacity_tb=48 ;;
+        *) capacity_tb="31.2" ;;
     esac
     
+    # Performance tier selection
     echo ""
-    local create_cmd="oci lfs lustre-file-system create --compartment-id \"$compartment_id\" --availability-domain \"$ad\" --subnet-id \"$subnet_id\" --display-name \"$lfs_name\" --file-system-name \"$fs_name\" --capacity-in-tbs $capacity_tb"
+    echo -e "${CYAN}Select performance tier (MB/s per TB):${NC}"
+    echo -e "  ${YELLOW}1${NC}) MBPS_PER_TB_125   (125 MB/s per TB)"
+    echo -e "  ${YELLOW}2${NC}) MBPS_PER_TB_250   (250 MB/s per TB)"
+    echo -e "  ${YELLOW}3${NC}) MBPS_PER_TB_500   (500 MB/s per TB)"
+    echo -e "  ${YELLOW}4${NC}) MBPS_PER_TB_1000  (1000 MB/s per TB)"
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r perf_selection
+    
+    local performance_tier
+    case "$perf_selection" in
+        1) performance_tier="MBPS_PER_TB_125" ;;
+        2) performance_tier="MBPS_PER_TB_250" ;;
+        3) performance_tier="MBPS_PER_TB_500" ;;
+        4) performance_tier="MBPS_PER_TB_1000" ;;
+        *) performance_tier="MBPS_PER_TB_125" ;;
+    esac
+    
+    # Calculate expected throughput
+    local expected_throughput
+    case "$performance_tier" in
+        MBPS_PER_TB_125) expected_throughput=$(echo "$capacity_tb * 125" | bc) ;;
+        MBPS_PER_TB_250) expected_throughput=$(echo "$capacity_tb * 250" | bc) ;;
+        MBPS_PER_TB_500) expected_throughput=$(echo "$capacity_tb * 500" | bc) ;;
+        MBPS_PER_TB_1000) expected_throughput=$(echo "$capacity_tb * 1000" | bc) ;;
+    esac
+    echo -e "${GRAY}  Expected throughput: ~${expected_throughput} MB/s${NC}"
+    
+    # Root squash selection
+    echo ""
+    echo -e "${CYAN}Select root squash mode:${NC}"
+    echo -e "  ${YELLOW}1${NC}) NONE  (no root squashing - root has full access)"
+    echo -e "  ${YELLOW}2${NC}) ROOT  (root is squashed to anonymous user)"
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r squash_selection
+    
+    local root_squash
+    case "$squash_selection" in
+        1) root_squash="NONE" ;;
+        2) root_squash="ROOT" ;;
+        *) root_squash="NONE" ;;
+    esac
+    
+    # Encryption selection
+    echo ""
+    echo -e "${CYAN}Select encryption:${NC}"
+    echo -e "  ${YELLOW}1${NC}) Oracle-managed keys (default)"
+    echo -e "  ${YELLOW}2${NC}) Customer-managed keys (KMS)"
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r enc_selection
+    
+    local kms_key_id=""
+    if [[ "$enc_selection" == "2" ]]; then
+        echo ""
+        echo -e "${CYAN}Available KMS Keys:${NC}"
+        local vaults_json keys_found=0
+        
+        # List vaults first
+        vaults_json=$(oci kms management vault list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+        
+        idx=0
+        declare -A KMS_KEY_MAP
+        
+        while IFS='|' read -r vault_name vault_id mgmt_endpoint; do
+            [[ -z "$vault_id" ]] && continue
+            [[ "$vault_name" == "null" ]] && continue
+            
+            # List keys in this vault
+            local keys_json
+            keys_json=$(oci kms management key list --compartment-id "$compartment_id" --endpoint "$mgmt_endpoint" --all --output json 2>/dev/null)
+            
+            while IFS='|' read -r key_name key_id key_state; do
+                [[ -z "$key_id" ]] && continue
+                [[ "$key_state" != "ENABLED" ]] && continue
+                ((idx++))
+                ((keys_found++))
+                KMS_KEY_MAP[$idx]="$key_id"
+                echo -e "  ${YELLOW}$idx${NC}) $key_name (Vault: $vault_name)"
+            done < <(echo "$keys_json" | jq -r '.data[] | "\(.["display-name"])|\(.id)|\(.["lifecycle-state"])"' 2>/dev/null)
+            
+        done < <(echo "$vaults_json" | jq -r '.data[] | select(.["lifecycle-state"]=="ACTIVE") | "\(.["display-name"])|\(.id)|\(.["management-endpoint"])"' 2>/dev/null)
+        
+        if [[ $keys_found -eq 0 ]]; then
+            echo -e "${YELLOW}No KMS keys found. Using Oracle-managed keys.${NC}"
+        else
+            echo ""
+            echo -n -e "${CYAN}Select KMS key #: ${NC}"
+            read -r kms_selection
+            kms_key_id="${KMS_KEY_MAP[$kms_selection]}"
+            
+            if [[ -z "$kms_key_id" ]]; then
+                echo -e "${YELLOW}Invalid selection. Using Oracle-managed keys.${NC}"
+                kms_key_id=""
+            fi
+        fi
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Configuration Summary ═══${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}      $lfs_name"
+    echo -e "  ${CYAN}File System Name:${NC}  $fs_name"
+    echo -e "  ${CYAN}Availability Domain:${NC} $ad"
+    echo -e "  ${CYAN}Subnet:${NC}            ${subnet_id:0:50}..."
+    [[ -n "$nsg_id" ]] && echo -e "  ${CYAN}NSG:${NC}               ${nsg_id:0:50}..."
+    echo -e "  ${CYAN}Capacity:${NC}          ${capacity_tb} TB"
+    echo -e "  ${CYAN}Performance Tier:${NC}  $performance_tier (~${expected_throughput} MB/s)"
+    echo -e "  ${CYAN}Root Squash:${NC}       $root_squash"
+    if [[ -n "$kms_key_id" ]]; then
+        echo -e "  ${CYAN}Encryption:${NC}        Customer-managed (KMS)"
+        echo -e "  ${CYAN}KMS Key:${NC}           ${kms_key_id:0:50}..."
+    else
+        echo -e "  ${CYAN}Encryption:${NC}        Oracle-managed"
+    fi
+    echo ""
+    
+    # Convert TB to GB for API (API uses --capacity-in-gbs)
+    # API requires multiples of 10400 GB
+    # Preset values: 31.2 TB = 31200 GB, 41.6 TB = 41600 GB, etc.
+    local capacity_gb
+    capacity_gb=$(echo "scale=0; $capacity_tb * 1000 / 1" | bc)
+    
+    # Build root-squash-configuration JSON
+    local root_squash_config="{\"rootSquash\": \"$root_squash\"}"
+    
+    # Build the create command (display shows TB, API uses GB)
+    local create_cmd="oci lfs lustre-file-system create"
+    create_cmd+=" --compartment-id \"$compartment_id\""
+    create_cmd+=" --availability-domain \"$ad\""
+    create_cmd+=" --subnet-id \"$subnet_id\""
+    create_cmd+=" --display-name \"$lfs_name\""
+    create_cmd+=" --file-system-name \"$fs_name\""
+    create_cmd+=" --capacity-in-gbs $capacity_gb"
+    create_cmd+=" --performance-tier $performance_tier"
+    create_cmd+=" --root-squash-configuration '$root_squash_config'"
+    [[ -n "$nsg_id" ]] && create_cmd+=" --nsg-ids '[\"$nsg_id\"]'"
+    [[ -n "$kms_key_id" ]] && create_cmd+=" --kms-key-id \"$kms_key_id\""
+    
     echo -e "${GRAY}Command to execute:${NC}"
     echo -e "${WHITE}$create_cmd${NC}"
+    echo -e "${GRAY}(${capacity_tb} TB = ${capacity_gb} GB)${NC}"
     echo ""
     
     echo -n -e "${YELLOW}Proceed with creation? (y/N): ${NC}"
@@ -17868,21 +18718,64 @@ lfs_create_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOG_DIR:-./logs}/lustre_actions_$(date +%Y%m%d).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE LUSTRE: $create_cmd" >> "$log_file"
     
     echo ""
     echo -e "${CYAN}Creating Lustre file system (this may take several minutes)...${NC}"
     
+    # Build the actual command with optional parameters
     local result
-    result=$(oci lfs lustre-file-system create \
-        --compartment-id "$compartment_id" \
-        --availability-domain "$ad" \
-        --subnet-id "$subnet_id" \
-        --display-name "$lfs_name" \
-        --file-system-name "$fs_name" \
-        --capacity-in-tbs "$capacity_tb" \
-        --output json 2>&1)
+    if [[ -n "$kms_key_id" && -n "$nsg_id" ]]; then
+        result=$(oci lfs lustre-file-system create \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --subnet-id "$subnet_id" \
+            --display-name "$lfs_name" \
+            --file-system-name "$fs_name" \
+            --capacity-in-gbs "$capacity_gb" \
+            --performance-tier "$performance_tier" \
+            --root-squash-configuration "$root_squash_config" \
+            --nsg-ids "[\"$nsg_id\"]" \
+            --kms-key-id "$kms_key_id" \
+            --output json 2>&1)
+    elif [[ -n "$kms_key_id" ]]; then
+        result=$(oci lfs lustre-file-system create \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --subnet-id "$subnet_id" \
+            --display-name "$lfs_name" \
+            --file-system-name "$fs_name" \
+            --capacity-in-gbs "$capacity_gb" \
+            --performance-tier "$performance_tier" \
+            --root-squash-configuration "$root_squash_config" \
+            --kms-key-id "$kms_key_id" \
+            --output json 2>&1)
+    elif [[ -n "$nsg_id" ]]; then
+        result=$(oci lfs lustre-file-system create \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --subnet-id "$subnet_id" \
+            --display-name "$lfs_name" \
+            --file-system-name "$fs_name" \
+            --capacity-in-gbs "$capacity_gb" \
+            --performance-tier "$performance_tier" \
+            --root-squash-configuration "$root_squash_config" \
+            --nsg-ids "[\"$nsg_id\"]" \
+            --output json 2>&1)
+    else
+        result=$(oci lfs lustre-file-system create \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --subnet-id "$subnet_id" \
+            --display-name "$lfs_name" \
+            --file-system-name "$fs_name" \
+            --capacity-in-gbs "$capacity_gb" \
+            --performance-tier "$performance_tier" \
+            --root-squash-configuration "$root_squash_config" \
+            --output json 2>&1)
+    fi
     
     if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
         local new_lfs_id
@@ -17902,6 +18795,42 @@ lfs_create_file_system() {
 }
 
 #--------------------------------------------------------------------------------
+# Lustre - Validate capacity follows sizing rules
+# Min 31.2 TB, increment 10.4 TB (≤124.8 TB), increment 41.6 TB (>124.8 TB)
+#--------------------------------------------------------------------------------
+lfs_validate_capacity() {
+    local capacity="$1"
+    
+    # Check if it's a valid number
+    if ! [[ "$capacity" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        return 1
+    fi
+    
+    # Convert to GB and check if it's a multiple of 10400
+    local capacity_gb
+    capacity_gb=$(echo "scale=0; $capacity * 1000 / 1" | bc)
+    
+    # Minimum is 31200 GB (3 * 10400)
+    if [[ "$capacity_gb" -lt 31200 ]]; then
+        return 1
+    fi
+    
+    # Must be multiple of 10400
+    local remainder=$((capacity_gb % 10400))
+    if [[ "$remainder" -ne 0 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Convert TB to valid GB (multiple of 10400)
+lfs_tb_to_gb() {
+    local tb="$1"
+    echo "scale=0; $tb * 1000 / 1" | bc
+}
+
+#--------------------------------------------------------------------------------
 # Lustre - Update File System
 #--------------------------------------------------------------------------------
 lfs_update_file_system() {
@@ -17912,26 +18841,171 @@ lfs_update_file_system() {
     
     [[ -z "$LFS_SELECTED" ]] && return
     
+    # Get current file system details
+    local lfs_json
+    lfs_json=$(oci lfs lustre-file-system get --lustre-file-system-id "$LFS_SELECTED" --output json 2>/dev/null)
+    
+    # Get capacity in GB (API returns GB)
+    local current_capacity_gb
+    current_capacity_gb=$(echo "$lfs_json" | jq -r '.data["capacity-in-gbs"] // "0"')
+    
+    # Convert GB to TB for display (1000 GB = 1 TB for Lustre)
+    local current_capacity_tb
+    current_capacity_tb=$(echo "scale=1; $current_capacity_gb / 1000" | bc)
+    
+    local current_name
+    current_name=$(echo "$lfs_json" | jq -r '.data["display-name"] // "N/A"')
+    
+    # Get NSG IDs if configured
+    local nsg_ids_json
+    nsg_ids_json=$(echo "$lfs_json" | jq -c '.data["nsg-ids"] // []')
+    local has_nsg="false"
+    if [[ "$nsg_ids_json" != "[]" && "$nsg_ids_json" != "null" && -n "$nsg_ids_json" ]]; then
+        local nsg_count
+        nsg_count=$(echo "$nsg_ids_json" | jq 'length' 2>/dev/null || echo "0")
+        if [[ "$nsg_count" -gt 0 ]]; then
+            has_nsg="true"
+        fi
+    fi
+    
     echo ""
+    echo -e "${WHITE}Current file system:${NC} $current_name"
+    echo -e "${WHITE}Current capacity:${NC}    ${current_capacity_tb} TB (${current_capacity_gb} GB)"
+    if [[ "$has_nsg" == "true" ]]; then
+        echo -e "${WHITE}NSG configured:${NC}      ${GREEN}Yes${NC} (will be preserved)"
+    fi
+    echo ""
+    
     echo -e "${CYAN}What would you like to update?${NC}"
     echo -e "  ${YELLOW}1${NC}) Display name"
-    echo -e "  ${YELLOW}2${NC}) Capacity"
+    echo -e "  ${YELLOW}2${NC}) Capacity (increase only)"
     echo -n -e "${CYAN}Select #: ${NC}"
     read -r update_type
     
     local update_cmd=""
+    local new_name=""
+    local new_capacity_gb=""
+    local new_capacity_tb=""
+    local nsg_param=""
+    
+    # Build NSG parameter if NSGs are configured
+    if [[ "$has_nsg" == "true" ]]; then
+        nsg_param="--nsg-ids '$nsg_ids_json'"
+    fi
+    
     case "$update_type" in
         1)
             echo -n -e "${CYAN}Enter new display name: ${NC}"
             read -r new_name
             [[ -z "$new_name" ]] && { echo -e "${RED}Name required${NC}"; return; }
             update_cmd="oci lfs lustre-file-system update --lustre-file-system-id \"$LFS_SELECTED\" --display-name \"$new_name\""
+            [[ -n "$nsg_param" ]] && update_cmd="$update_cmd $nsg_param --force"
             ;;
         2)
-            echo -n -e "${CYAN}Enter new capacity in TB: ${NC}"
-            read -r new_capacity
-            [[ -z "$new_capacity" ]] && { echo -e "${RED}Capacity required${NC}"; return; }
-            update_cmd="oci lfs lustre-file-system update --lustre-file-system-id \"$LFS_SELECTED\" --capacity-in-tbs $new_capacity"
+            echo ""
+            echo -e "${GRAY}Lustre capacity sizing rules:${NC}"
+            echo -e "${GRAY}  - Capacity can only be INCREASED (not decreased)${NC}"
+            echo -e "${GRAY}  - Minimum: 31200 GB (31.2 TB)${NC}"
+            echo -e "${GRAY}  - Increment: 10400 GB (10.4 TB) when capacity ≤ 124800 GB${NC}"
+            echo -e "${GRAY}  - Increment: 41600 GB (41.6 TB) when capacity > 124800 GB${NC}"
+            echo -e "${GRAY}  - All values must be multiples of 10400 GB${NC}"
+            echo ""
+            
+            # Calculate next valid capacities in GB (must be multiples of 10400)
+            echo -e "${CYAN}Suggested next capacities:${NC}"
+            local next_caps_gb=()
+            local next_caps_tb=()
+            
+            # Find next valid capacity (round up to next multiple of 10400)
+            local next_gb=$((current_capacity_gb + 10400))
+            # Round to nearest multiple of 10400
+            next_gb=$(( ((next_gb + 10399) / 10400) * 10400 ))
+            
+            if [[ "$next_gb" -le 124800 ]]; then
+                # Show next few 10400 GB increments
+                for i in 1 2 3 4 5; do
+                    if [[ "$next_gb" -le 124800 ]]; then
+                        next_caps_gb+=("$next_gb")
+                        local tb_val=$(echo "scale=1; $next_gb / 1000" | bc)
+                        next_caps_tb+=("$tb_val")
+                        next_gb=$((next_gb + 10400))
+                    else
+                        break
+                    fi
+                done
+                # Add first 41600 increment option (166400 GB = 166.4 TB)
+                if [[ ${#next_caps_gb[@]} -lt 6 ]]; then
+                    next_caps_gb+=("166400")
+                    next_caps_tb+=("166.4")
+                fi
+            else
+                # Already above 124800, show 41600 increments
+                # Round up to next multiple of 41600 above 124800
+                next_gb=$(( ((current_capacity_gb - 124800 + 41600) / 41600) * 41600 + 124800 ))
+                if [[ "$next_gb" -le "$current_capacity_gb" ]]; then
+                    next_gb=$((next_gb + 41600))
+                fi
+                for i in 1 2 3 4 5; do
+                    next_caps_gb+=("$next_gb")
+                    local tb_val=$(echo "scale=1; $next_gb / 1000" | bc)
+                    next_caps_tb+=("$tb_val")
+                    next_gb=$((next_gb + 41600))
+                done
+            fi
+            
+            local idx=0
+            for i in "${!next_caps_gb[@]}"; do
+                ((idx++))
+                echo -e "  ${YELLOW}$idx${NC}) ${next_caps_tb[$i]} TB (${next_caps_gb[$i]} GB)"
+            done
+            echo -e "  ${YELLOW}c${NC}) Custom capacity (in GB)"
+            echo ""
+            echo -n -e "${CYAN}Select #: ${NC}"
+            read -r cap_selection
+            
+            if [[ "$cap_selection" == "c" || "$cap_selection" == "C" ]]; then
+                echo ""
+                echo -e "${GRAY}Enter capacity in GB (must be multiple of 10400, e.g., 41600, 52000, 62400)${NC}"
+                echo -n -e "${CYAN}Enter new capacity in GB: ${NC}"
+                read -r new_capacity_gb
+                
+                # Validate it's a number
+                if ! [[ "$new_capacity_gb" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}Invalid number${NC}"
+                    return
+                fi
+                
+                # Validate it's a multiple of 10400
+                if [[ $((new_capacity_gb % 10400)) -ne 0 ]]; then
+                    echo -e "${RED}Capacity must be a multiple of 10400 GB${NC}"
+                    local suggested=$(( ((new_capacity_gb + 10399) / 10400) * 10400 ))
+                    echo -e "${YELLOW}Suggested: ${suggested} GB${NC}"
+                    return
+                fi
+                
+                # Validate minimum
+                if [[ "$new_capacity_gb" -lt 31200 ]]; then
+                    echo -e "${RED}Minimum capacity is 31200 GB${NC}"
+                    return
+                fi
+                
+                # Check that it's an increase
+                if [[ "$new_capacity_gb" -le "$current_capacity_gb" ]]; then
+                    echo -e "${RED}New capacity must be greater than current capacity (${current_capacity_gb} GB)${NC}"
+                    return
+                fi
+                
+                new_capacity_tb=$(echo "scale=1; $new_capacity_gb / 1000" | bc)
+            elif [[ "$cap_selection" =~ ^[0-9]+$ ]] && [[ "$cap_selection" -ge 1 ]] && [[ "$cap_selection" -le ${#next_caps_gb[@]} ]]; then
+                new_capacity_gb="${next_caps_gb[$((cap_selection-1))]}"
+                new_capacity_tb="${next_caps_tb[$((cap_selection-1))]}"
+            else
+                echo -e "${RED}Invalid selection${NC}"
+                return
+            fi
+            
+            update_cmd="oci lfs lustre-file-system update --lustre-file-system-id \"$LFS_SELECTED\" --capacity-in-gbs $new_capacity_gb"
+            [[ -n "$nsg_param" ]] && update_cmd="$update_cmd $nsg_param --force"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -17942,6 +19016,9 @@ lfs_update_file_system() {
     echo ""
     echo -e "${GRAY}Command to execute:${NC}"
     echo -e "${WHITE}$update_cmd${NC}"
+    if [[ "$update_type" == "2" ]]; then
+        echo -e "${GRAY}(${new_capacity_tb} TB = ${new_capacity_gb} GB)${NC}"
+    fi
     echo ""
     
     echo -n -e "${YELLOW}Proceed with update? (y/N): ${NC}"
@@ -17952,25 +19029,61 @@ lfs_update_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOG_DIR:-./logs}/lustre_actions_$(date +%Y%m%d).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE LUSTRE: $update_cmd" >> "$log_file"
     
     local result
     if [[ "$update_type" == "1" ]]; then
-        result=$(oci lfs lustre-file-system update \
-            --lustre-file-system-id "$LFS_SELECTED" \
-            --display-name "$new_name" \
-            --output json 2>&1)
+        if [[ "$has_nsg" == "true" ]]; then
+            result=$(oci lfs lustre-file-system update \
+                --lustre-file-system-id "$LFS_SELECTED" \
+                --display-name "$new_name" \
+                --nsg-ids "$nsg_ids_json" \
+                --force \
+                --output json 2>&1)
+        else
+            result=$(oci lfs lustre-file-system update \
+                --lustre-file-system-id "$LFS_SELECTED" \
+                --display-name "$new_name" \
+                --output json 2>&1)
+        fi
     else
-        result=$(oci lfs lustre-file-system update \
-            --lustre-file-system-id "$LFS_SELECTED" \
-            --capacity-in-tbs "$new_capacity" \
-            --output json 2>&1)
+        if [[ "$has_nsg" == "true" ]]; then
+            result=$(oci lfs lustre-file-system update \
+                --lustre-file-system-id "$LFS_SELECTED" \
+                --capacity-in-gbs "$new_capacity_gb" \
+                --nsg-ids "$nsg_ids_json" \
+                --force \
+                --output json 2>&1)
+        else
+            result=$(oci lfs lustre-file-system update \
+                --lustre-file-system-id "$LFS_SELECTED" \
+                --capacity-in-gbs "$new_capacity_gb" \
+                --output json 2>&1)
+        fi
     fi
+    
+    # Check for success - either direct response with data.id OR async work request
+    local work_request_id
+    work_request_id=$(echo "$result" | jq -r '.["opc-work-request-id"] // empty' 2>/dev/null)
     
     if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
         echo -e "${GREEN}✓ Lustre file system updated${NC}"
+        if [[ "$update_type" == "2" ]]; then
+            echo -e "  ${CYAN}New capacity:${NC} ${new_capacity_tb} TB / ${new_capacity_gb} GB (was ${current_capacity_tb} TB / ${current_capacity_gb} GB)"
+        fi
+        [[ "$has_nsg" == "true" ]] && echo -e "  ${CYAN}NSG:${NC} Preserved"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated $LFS_SELECTED" >> "$log_file"
+    elif [[ -n "$work_request_id" ]]; then
+        echo -e "${GREEN}✓ Lustre file system update initiated${NC}"
+        if [[ "$update_type" == "2" ]]; then
+            echo -e "  ${CYAN}New capacity:${NC} ${new_capacity_tb} TB / ${new_capacity_gb} GB (was ${current_capacity_tb} TB / ${current_capacity_gb} GB)"
+        fi
+        [[ "$has_nsg" == "true" ]] && echo -e "  ${CYAN}NSG:${NC} Preserved"
+        echo -e "  ${CYAN}Work Request:${NC} ${YELLOW}$work_request_id${NC}"
+        echo -e "  ${GRAY}File system will show UPDATING state until complete${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Update initiated, work-request: $work_request_id" >> "$log_file"
     else
         echo -e "${RED}Failed to update Lustre file system${NC}"
         echo "$result"
