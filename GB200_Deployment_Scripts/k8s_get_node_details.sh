@@ -25,7 +25,7 @@
 #
 # Author: Tim Cowen
 # Version: 2.2
-# Please use at your own risk.  
+# Please use at your own risk.
 #
 
 set -o pipefail
@@ -17727,7 +17727,7 @@ manage_lustre_file_systems() {
                 print_separator 120
                 
                 # Get file systems for this AD
-                while IFS='|' read -r display_name state capacity_gb perf_tier version mgs_address lfs_id; do
+                while IFS='|' read -r display_name state capacity_gb perf_tier version mgs_address fs_name lfs_id; do
                     [[ -z "$display_name" ]] && continue
                     ((idx++))
                     
@@ -17794,10 +17794,15 @@ manage_lustre_file_systems() {
                     printf "  ${YELLOW}%-3s${NC} %-28s ${state_color}%-10s${NC} %-8s %-12s %-10s %-8b %-20s\n" \
                         "$idx" "$name_trunc" "$state" "$capacity_display" "$perf_short" "$version_display" "$os_link_status" "$mgs_display"
                     
+                    # Show mount command if MGS address and file system name are available
+                    if [[ "$mgs_address" != "null" && -n "$mgs_address" && "$fs_name" != "null" && -n "$fs_name" ]]; then
+                        printf "      ${GRAY}Mount: sudo mount -t lustre %s:/%s /mnt/lustre${NC}\n" "$mgs_address" "$fs_name"
+                    fi
+                    
                 done < <(echo "$lfs_json" | jq -r --arg ad "$ad" '
                     .data.items[] | 
                     select(.["availability-domain"] == $ad) | 
-                    "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-gbs"] // 0)|\(.["performance-tier"] // "N/A")|\(.["lustre-version"] // .["major-version"] // "N/A")|\(.["mgs-address"] // "N/A")|\(.id)"
+                    "\(.["display-name"])|\(.["lifecycle-state"])|\(.["capacity-in-gbs"] // 0)|\(.["performance-tier"] // "N/A")|\(.["lustre-version"] // .["major-version"] // "N/A")|\(.["mgs-address"] // "N/A")|\(.["file-system-name"] // "N/A")|\(.id)"
                 ' 2>/dev/null)
                 
                 echo ""
@@ -17824,6 +17829,9 @@ manage_lustre_file_systems() {
         echo -e "  ${GREEN}oe${NC}) ${WHITE}Start Export to Object${NC}     - Export data to Object Storage"
         echo -e "  ${RED}od${NC}) ${WHITE}Delete Object Storage Link${NC} - Remove an Object Storage link"
         echo ""
+        echo -e "${BOLD}${WHITE}─── Monitoring ───${NC}"
+        echo -e "  ${GREEN}w${NC})  ${WHITE}Work Requests${NC}              - View Lustre work requests (async operations)"
+        echo ""
         echo -e "  ${WHITE}r${NC})  Refresh"
         echo -e "  ${WHITE}b${NC})  Back to main menu"
         echo ""
@@ -17847,6 +17855,7 @@ manage_lustre_file_systems() {
             oi|OI) lfs_start_import_from_object "$compartment_id" ;;
             oe|OE) lfs_start_export_to_object "$compartment_id" ;;
             od|OD) lfs_delete_object_storage_link "$compartment_id" ;;
+            w|W) lfs_list_work_requests "$compartment_id" ;;
             r|R) continue ;;
             b|B|back|BACK|"") return ;;
             *) echo -e "${RED}Invalid selection${NC}" ;;
@@ -19093,6 +19102,247 @@ lfs_update_file_system() {
         echo -e "${RED}Failed to update Lustre file system${NC}"
         echo "$result"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - List Work Requests
+#--------------------------------------------------------------------------------
+lfs_list_work_requests() {
+    local compartment_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Lustre Work Requests ═══${NC}"
+    echo ""
+    
+    local list_cmd="oci lfs work-request list --compartment-id \"$compartment_id\" --all --output json"
+    echo -e "${GRAY}$list_cmd${NC}"
+    echo ""
+    
+    local wr_json
+    wr_json=$(oci lfs work-request list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+    
+    if [[ -z "$wr_json" || "$wr_json" == "null" ]]; then
+        echo -e "${YELLOW}No work requests found or unable to list${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Handle both .data.items and .data structures
+    local wr_count
+    wr_count=$(echo "$wr_json" | jq '.data.items | length // 0' 2>/dev/null)
+    [[ -z "$wr_count" || "$wr_count" == "null" ]] && wr_count=0
+    
+    if [[ "$wr_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No work requests found${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo -e "${GREEN}Found $wr_count work request(s)${NC}"
+    echo ""
+    
+    # Header
+    printf "${BOLD}%-3s %-22s %-12s %-6s %-20s %-20s %s${NC}\n" \
+        "#" "Operation Type" "Status" "%" "Time Started" "Time Finished" "Work Request ID"
+    print_separator 160
+    
+    local idx=0
+    declare -A WR_MAP
+    WR_MAP=()
+    
+    while IFS='|' read -r op_type status percent_complete time_started time_finished wr_id; do
+        [[ -z "$op_type" ]] && continue
+        ((idx++))
+        
+        WR_MAP[$idx]="$wr_id"
+        
+        local status_color="$GREEN"
+        case "$status" in
+            SUCCEEDED|COMPLETED) status_color="$GREEN" ;;
+            IN_PROGRESS|ACCEPTED) status_color="$YELLOW" ;;
+            FAILED|CANCELED|CANCELING) status_color="$RED" ;;
+            *) status_color="$GRAY" ;;
+        esac
+        
+        # Format times - extract just date and time
+        local start_display="${time_started:0:19}"
+        [[ "$time_started" == "null" || -z "$time_started" ]] && start_display="N/A"
+        start_display="${start_display/T/ }"
+        
+        local finish_display="${time_finished:0:19}"
+        [[ "$time_finished" == "null" || -z "$time_finished" ]] && finish_display="--"
+        finish_display="${finish_display/T/ }"
+        
+        # Shorten operation type for display
+        local op_short="$op_type"
+        case "$op_type" in
+            CREATE_LUSTRE_FILE_SYSTEM) op_short="CREATE_LFS" ;;
+            UPDATE_LUSTRE_FILE_SYSTEM) op_short="UPDATE_LFS" ;;
+            DELETE_LUSTRE_FILE_SYSTEM) op_short="DELETE_LFS" ;;
+            *) op_short="${op_type:0:20}" ;;
+        esac
+        
+        # Format percent
+        local pct_display
+        if [[ "$percent_complete" == "null" || -z "$percent_complete" ]]; then
+            pct_display="--"
+        else
+            pct_display=$(printf "%.0f%%" "$percent_complete")
+        fi
+        
+        printf "${YELLOW}%-3s${NC} %-22s ${status_color}%-12s${NC} %-6s %-20s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_short" "$status" "$pct_display" "$start_display" "$finish_display" "$wr_id"
+            
+    done < <(echo "$wr_json" | jq -r '.data.items[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.["time-finished"])|\(.id)"' 2>/dev/null)
+    
+    echo ""
+    echo -e "${CYAN}Options:${NC}"
+    echo -e "  ${YELLOW}#${NC}  View work request details"
+    echo -e "  ${WHITE}Enter${NC} to go back"
+    echo ""
+    echo -n -e "${CYAN}Select #: ${NC}"
+    read -r wr_selection
+    
+    if [[ -n "$wr_selection" && -n "${WR_MAP[$wr_selection]}" ]]; then
+        lfs_view_work_request_details "${WR_MAP[$wr_selection]}"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# Lustre - View Work Request Details
+#--------------------------------------------------------------------------------
+lfs_view_work_request_details() {
+    local wr_id="$1"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Work Request Details ═══${NC}"
+    echo ""
+    
+    local wr_json
+    wr_json=$(oci lfs work-request get --work-request-id "$wr_id" --output json 2>/dev/null)
+    
+    if [[ -z "$wr_json" || "$wr_json" == "null" ]]; then
+        echo -e "${RED}Failed to get work request details${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Extract fields
+    local op_type status percent_complete time_accepted time_started time_finished
+    op_type=$(echo "$wr_json" | jq -r '.data["operation-type"] // "N/A"')
+    status=$(echo "$wr_json" | jq -r '.data.status // "N/A"')
+    percent_complete=$(echo "$wr_json" | jq -r '.data["percent-complete"] // "N/A"')
+    time_accepted=$(echo "$wr_json" | jq -r '.data["time-accepted"] // "N/A"')
+    time_started=$(echo "$wr_json" | jq -r '.data["time-started"] // "N/A"')
+    time_finished=$(echo "$wr_json" | jq -r '.data["time-finished"] // "N/A"')
+    
+    local status_color="$GREEN"
+    case "$status" in
+        SUCCEEDED|COMPLETED) status_color="$GREEN" ;;
+        IN_PROGRESS|ACCEPTED) status_color="$YELLOW" ;;
+        FAILED|CANCELED|CANCELING) status_color="$RED" ;;
+        *) status_color="$GRAY" ;;
+    esac
+    
+    echo -e "${BOLD}${CYAN}─── Basic Information ───${NC}"
+    echo -e "  ${CYAN}Operation Type:${NC}   ${WHITE}$op_type${NC}"
+    echo -e "  ${CYAN}Status:${NC}           ${status_color}$status${NC}"
+    echo -e "  ${CYAN}Progress:${NC}         ${WHITE}${percent_complete}%${NC}"
+    echo -e "  ${CYAN}Work Request ID:${NC}  ${YELLOW}$wr_id${NC}"
+    echo ""
+    
+    echo -e "${BOLD}${CYAN}─── Timing ───${NC}"
+    echo -e "  ${CYAN}Time Accepted:${NC}    ${WHITE}${time_accepted/T/ }${NC}"
+    echo -e "  ${CYAN}Time Started:${NC}     ${WHITE}${time_started/T/ }${NC}"
+    echo -e "  ${CYAN}Time Finished:${NC}    ${WHITE}${time_finished/T/ }${NC}"
+    
+    # Calculate duration if both start and finish are available
+    if [[ "$time_started" != "N/A" && "$time_started" != "null" && "$time_finished" != "N/A" && "$time_finished" != "null" ]]; then
+        local start_epoch finish_epoch duration_sec
+        start_epoch=$(date -d "${time_started}" +%s 2>/dev/null || echo "0")
+        finish_epoch=$(date -d "${time_finished}" +%s 2>/dev/null || echo "0")
+        if [[ "$start_epoch" -gt 0 && "$finish_epoch" -gt 0 ]]; then
+            duration_sec=$((finish_epoch - start_epoch))
+            local duration_min=$((duration_sec / 60))
+            local duration_sec_rem=$((duration_sec % 60))
+            echo -e "  ${CYAN}Duration:${NC}         ${WHITE}${duration_min}m ${duration_sec_rem}s${NC}"
+        fi
+    fi
+    echo ""
+    
+    # Resources affected
+    local resources
+    resources=$(echo "$wr_json" | jq -r '.data.resources // []')
+    local resource_count
+    resource_count=$(echo "$resources" | jq 'length' 2>/dev/null || echo "0")
+    
+    if [[ "$resource_count" -gt 0 ]]; then
+        echo -e "${BOLD}${CYAN}─── Resources Affected ───${NC}"
+        while IFS='|' read -r entity_type entity_uri action_type; do
+            [[ -z "$entity_type" ]] && continue
+            echo -e "  ${CYAN}Type:${NC}   ${WHITE}$entity_type${NC}"
+            echo -e "  ${CYAN}Action:${NC} ${WHITE}$action_type${NC}"
+            echo -e "  ${CYAN}URI:${NC}    ${YELLOW}$entity_uri${NC}"
+            echo ""
+        done < <(echo "$resources" | jq -r '.[] | "\(.["entity-type"])|\(.["entity-uri"])|\(.["action-type"])"' 2>/dev/null)
+    fi
+    
+    # Fetch errors from separate API (errors are not in the main work-request get response)
+    echo -e "${BOLD}${RED}─── Errors ───${NC}"
+    local errors_json
+    errors_json=$(oci lfs work-request-error list --work-request-id "$wr_id" --all --output json 2>/dev/null)
+    
+    local error_count=0
+    if [[ -n "$errors_json" && "$errors_json" != "null" ]]; then
+        error_count=$(echo "$errors_json" | jq '.data.items | length // 0' 2>/dev/null || echo "0")
+    fi
+    
+    if [[ "$error_count" -gt 0 ]]; then
+        while IFS='|' read -r code message timestamp; do
+            [[ -z "$code" ]] && continue
+            local ts_display="${timestamp/T/ }"
+            ts_display="${ts_display:0:19}"
+            echo -e "  ${RED}Code:${NC}      ${WHITE}$code${NC}"
+            echo -e "  ${RED}Message:${NC}   ${WHITE}$message${NC}"
+            echo -e "  ${RED}Timestamp:${NC} ${GRAY}$ts_display${NC}"
+            echo ""
+        done < <(echo "$errors_json" | jq -r '.data.items[] | "\(.code)|\(.message)|\(.timestamp)"' 2>/dev/null)
+    else
+        echo -e "  ${GREEN}No errors${NC}"
+    fi
+    echo ""
+    
+    # Logs
+    echo -e "${BOLD}${CYAN}─── Work Request Logs ───${NC}"
+    local logs_json
+    logs_json=$(oci lfs work-request-log list --work-request-id "$wr_id" --all --output json 2>/dev/null)
+    
+    local log_count=0
+    if [[ -n "$logs_json" && "$logs_json" != "null" ]]; then
+        log_count=$(echo "$logs_json" | jq '.data.items | length // 0' 2>/dev/null || echo "0")
+    fi
+    
+    if [[ "$log_count" -gt 0 ]]; then
+        echo ""
+        while IFS='|' read -r timestamp message; do
+            [[ -z "$timestamp" ]] && continue
+            local ts_display="${timestamp/T/ }"
+            ts_display="${ts_display:0:19}"
+            echo -e "  ${GRAY}[$ts_display]${NC} ${WHITE}$message${NC}"
+        done < <(echo "$logs_json" | jq -r '.data.items[] | "\(.timestamp)|\(.message)"' 2>/dev/null)
+    else
+        echo -e "  ${GRAY}No logs available${NC}"
     fi
     
     echo ""
