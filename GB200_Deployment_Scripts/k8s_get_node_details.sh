@@ -6,21 +6,26 @@
 #   Lists GPU instances in OCI/Kubernetes with detailed information including
 #   GPU memory clusters, fabrics, capacity topology, and announcements.
 #
-# Dependencies:
+# Dependencies on the node it is run from:
 #   - oci CLI (configured)
 #   - kubectl (configured with cluster access)
 #   - jq (JSON processor)
+#   - base64, gunzip, xxd (for user-data decoding)
+#   - helm
 #
 # Usage:
-#   ./k8s_get_nodes_details.sh [OPTIONS] [instance-ocid] [OPTIONS]
+#   ./k8s_get_nodes_details.sh [OPTIONS] [resource-ocid] [OPTIONS]
 #   Run with --help for full usage information.
 #
 # Configuration:
-#   Requires variables.sh with COMPARTMENT_ID, REGION, and TENANCY_ID
+#   If you have a variables.sh file already precreated will use the value in it, else will prompt to create one.
+#   It'll query for the resources to populate the file accordingly.
+#   It assumes that you are running the components for the AI stack in the same compartment, compute, network, storage.
 #   Optional: OKE_CLUSTER_ID to specify which OKE cluster to manage
 #
-# Author: GPU Infrastructure Team
+# Author: Tim Cowen
 # Version: 2.2
+# Please use at your own risk.  
 #
 
 set -o pipefail
