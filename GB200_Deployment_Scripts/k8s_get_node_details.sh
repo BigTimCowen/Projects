@@ -8413,7 +8413,7 @@ compartment_submenu() {
                 
                 if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
                     # Log the action
-                    local log_file="${LOG_DIR:-./logs}/compartment_actions_$(date +%Y%m%d).log"
+                    local log_file="${LOGS_DIR}/compartment_actions_$(date +%Y%m%d).log"
                     mkdir -p "$(dirname "$log_file")" 2>/dev/null
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE COMPARTMENT: $cmd" >> "$log_file"
                     
@@ -8505,7 +8505,7 @@ compartment_submenu() {
                 fi
                 
                 # Log the action
-                local log_file="${LOG_DIR:-./logs}/compartment_actions_$(date +%Y%m%d).log"
+                local log_file="${LOGS_DIR}/compartment_actions_$(date +%Y%m%d).log"
                 mkdir -p "$(dirname "$log_file")" 2>/dev/null
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE COMPARTMENT: $del_cmd" >> "$log_file"
                 
@@ -8671,7 +8671,7 @@ create_subcompartment_enhanced() {
     fi
     
     # Log the action
-    local log_file="${LOG_DIR:-./logs}/compartment_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/compartment_actions_$(date +%Y%m%d).log"
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE COMPARTMENT: $cmd" >> "$log_file"
     
@@ -16118,7 +16118,8 @@ compute_boot_volume_replacement() {
     local pre_selected_instance="${1:-}"
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     local region="${EFFECTIVE_REGION:-$REGION}"
-    local log_file="${LOG_DIR:-${SCRIPT_DIR}/logs}/bvr_actions.log"
+    local log_file="${LOGS_DIR}/bvr_actions.log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     echo ""
@@ -19578,14 +19579,14 @@ manage_instance_configurations() {
         echo -e "  ${YELLOW}i#${NC}          - View instance configuration details and user-data (e.g., 'i1', 'i2')"
         echo -e "  ${GREEN}create${NC}      - Create a new Instance Configuration"
         echo -e "  ${YELLOW}rename${NC}      - Rename an Instance Configuration (with recommended name)"
-        echo -e "  ${RED}delete${NC}      - Delete an Instance Configuration"
+        echo -e "  ${RED}delete${NC}      - Delete Instance Configuration(s) (delete i1, delete i1,i3, delete all)"
         echo -e "  ${BLUE}update-all${NC}  - Update ALL GPU Memory Clusters with a selected Instance Configuration"
         echo -e "  ${MAGENTA}compare${NC}     - Compare full configuration between two instance configurations"
         echo -e "  ${MAGENTA}diff${NC}        - Quick cloud-init diff (config vs config, or config vs local file)"
         echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [i#/create/rename/delete/update-all/compare/diff/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [i#/create/rename/delete [i#|i#,i#|all]/update-all/compare/diff/refresh/back]: ${NC}"
         
         local input
         read -r input
@@ -19604,6 +19605,10 @@ manage_instance_configurations() {
                 ;;
             delete|DELETE)
                 delete_instance_configuration_interactive
+                ;;
+            delete\ *|DELETE\ *)
+                local delete_args="${input#* }"
+                delete_instance_configuration_interactive "$delete_args"
                 ;;
             update-all|UPDATE-ALL)
                 update_all_clusters_instance_config
@@ -26303,7 +26308,7 @@ fss_create_file_system() {
     fi
     
     # Log the action
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE FILE SYSTEM: $create_cmd" >> "$log_file"
     
     echo ""
@@ -26368,7 +26373,7 @@ fss_update_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE FILE SYSTEM: $update_cmd" >> "$log_file"
     
     local result
@@ -26419,7 +26424,7 @@ fss_delete_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE FILE SYSTEM: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -26750,7 +26755,7 @@ fss_create_mount_target() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE MOUNT TARGET: $create_cmd" >> "$log_file"
     
     echo ""
@@ -26809,7 +26814,7 @@ fss_delete_mount_target() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE MOUNT TARGET: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -26988,7 +26993,7 @@ fss_create_export() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE EXPORT: $create_cmd" >> "$log_file"
     
     echo ""
@@ -27046,7 +27051,7 @@ fss_delete_export() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE EXPORT: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -27219,7 +27224,7 @@ fss_create_snapshot() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE SNAPSHOT: $create_cmd" >> "$log_file"
     
     echo ""
@@ -27276,7 +27281,7 @@ fss_delete_snapshot() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/fss_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE SNAPSHOT: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -28365,7 +28370,7 @@ lfs_create_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-./logs}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE LUSTRE: $create_cmd" >> "$log_file"
     
@@ -28676,7 +28681,7 @@ lfs_update_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-./logs}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE LUSTRE: $update_cmd" >> "$log_file"
     
@@ -29010,7 +29015,7 @@ lfs_delete_file_system() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE LUSTRE: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -29174,7 +29179,7 @@ lfs_create_object_storage_link() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE OS LINK: $create_cmd" >> "$log_file"
     
     echo ""
@@ -29230,7 +29235,7 @@ lfs_start_import_from_object() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] START IMPORT: $import_cmd" >> "$log_file"
     
     echo ""
@@ -29279,7 +29284,7 @@ lfs_start_export_to_object() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] START EXPORT: $export_cmd" >> "$log_file"
     
     echo ""
@@ -29330,7 +29335,7 @@ lfs_delete_object_storage_link() {
         return
     fi
     
-    local log_file="${LOG_DIR:-/tmp}/lustre_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/lustre_actions_$(date +%Y%m%d).log"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE OS LINK: $delete_cmd" >> "$log_file"
     
     echo ""
@@ -31045,33 +31050,29 @@ create_instance_configuration_interactive() {
     
     echo -e "${YELLOW}Fetching compatible images for ${WHITE}${shape_name}${YELLOW}...${NC}"
     
-    # Fetch compatible platform images for the shape
-    local images_json
-    images_json=$(oci compute image list \
+    # Single query: fetch ALL images compatible with this shape (both platform and custom)
+    local all_compat_images
+    all_compat_images=$(oci compute image list \
         --compartment-id "$compartment_id" \
         --shape "$shape_name" \
         --lifecycle-state "AVAILABLE" \
         --sort-by "TIMECREATED" \
         --sort-order "DESC" \
-        --limit 15 \
+        --all \
         --output json 2>/dev/null)
     
-    # Fetch custom images from the compartment
-    echo -e "${GRAY}Fetching custom images...${NC}"
-    local custom_images_json
-    custom_images_json=$(oci compute image list \
-        --compartment-id "$compartment_id" \
-        --lifecycle-state "AVAILABLE" \
-        --sort-by "TIMECREATED" \
-        --sort-order "DESC" \
-        --limit 30 \
-        --output json 2>/dev/null)
-    
-    # Filter custom images (ones where compartment-id matches = custom, not Oracle platform)
-    local custom_only_json=""
-    if [[ -n "$custom_images_json" ]]; then
-        custom_only_json=$(echo "$custom_images_json" | jq --arg cid "$compartment_id" \
+    # Split into platform images vs custom images based on compartment-id
+    local images_json custom_only_json
+    if [[ -n "$all_compat_images" ]] && echo "$all_compat_images" | jq -e '.data' > /dev/null 2>&1; then
+        # Platform images: compartment-id does NOT match user's compartment (Oracle-owned)
+        images_json=$(echo "$all_compat_images" | jq --arg cid "$compartment_id" \
+            '{ data: [.data[] | select(.["compartment-id"] != $cid)] }' 2>/dev/null)
+        # Custom images: compartment-id matches user's compartment
+        custom_only_json=$(echo "$all_compat_images" | jq --arg cid "$compartment_id" \
             '{ data: [.data[] | select(.["compartment-id"] == $cid)] }' 2>/dev/null)
+    else
+        images_json='{"data":[]}'
+        custom_only_json='{"data":[]}'
     fi
     
     local images_count=0
@@ -31119,8 +31120,8 @@ create_instance_configuration_interactive() {
         declare -a IMAGE_LIST=()
         local img_idx=0
         
-        printf "  ${GRAY}%-4s %-70s %-20s${NC}\n" "#" "Image Name" "OS Version"
-        echo -e "  ${GRAY}────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        printf "  ${GRAY}%-4s %-105s %-20s${NC}\n" "#" "Image Name" "OS Version"
+        echo -e "  ${GRAY}$(printf '─%.0s' {1..135})${NC}"
         
         # Platform images
         if [[ $images_count -gt 0 ]]; then
@@ -31129,27 +31130,20 @@ create_instance_configuration_interactive() {
                 ((img_idx++))
                 IMAGE_LIST+=("$img_ocid")
                 
-                # Truncate name if too long
-                local display_name="${img_name:0:68}"
-                [[ ${#img_name} -gt 68 ]] && display_name="${display_name}..."
-                
-                printf "  ${YELLOW}%-4s${NC} ${WHITE}%-70s${NC} ${CYAN}%-20s${NC}\n" "${img_idx})" "$display_name" "$img_os_ver"
+                printf "  ${YELLOW}%-4s${NC} ${WHITE}%-105s${NC} ${CYAN}%-20s${NC}\n" "${img_idx})" "$img_name" "$img_os_ver"
             done < <(echo "$images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["operating-system"] // "N/A")|\(.["operating-system-version"] // "N/A")"' 2>/dev/null)
         fi
         
         # Custom images section
         if [[ $custom_count -gt 0 ]]; then
             echo ""
-            echo -e "  ${MAGENTA}── Custom Images ──${NC}"
+            echo -e "  ${MAGENTA}── Custom Images (${custom_count} compatible with ${shape_name}) ──${NC}"
             while IFS='|' read -r img_ocid img_name img_os img_os_ver; do
                 [[ -z "$img_ocid" ]] && continue
                 ((img_idx++))
                 IMAGE_LIST+=("$img_ocid")
                 
-                local display_name="${img_name:0:68}"
-                [[ ${#img_name} -gt 68 ]] && display_name="${display_name}..."
-                
-                printf "  ${YELLOW}%-4s${NC} ${MAGENTA}%-70s${NC} ${CYAN}%-20s${NC}\n" "${img_idx})" "$display_name" "$img_os_ver"
+                printf "  ${YELLOW}%-4s${NC} ${MAGENTA}%-105s${NC} ${CYAN}%-20s${NC}\n" "${img_idx})" "$img_name" "$img_os_ver"
             done < <(echo "$custom_only_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["operating-system"] // "N/A")|\(.["operating-system-version"] // "N/A")"' 2>/dev/null)
         fi
         
@@ -31268,17 +31262,41 @@ create_instance_configuration_interactive() {
     # Final fallback
     [[ -z "$oke_version" || "$oke_version" == "null" ]] && oke_version="unknown"
     
-    # Count existing instance configs with similar naming pattern
-    local base_pattern="${shape_name}-ic-oke-${network_type}"
-    local existing_count=0
-    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        existing_count=$(grep -c "${base_pattern}" "$INSTANCE_CONFIG_CACHE" 2>/dev/null) || existing_count=0
-        # Ensure we have a valid number
-        [[ ! "$existing_count" =~ ^[0-9]+$ ]] && existing_count=0
-    fi
-    local next_num=$((existing_count + 1))
+    # Count existing instance configs with similar naming pattern to auto-increment
+    # New format: ic-<shape>-oke-<version>-<networking>-#
+    local base_name="ic-${shape_name}-oke-${oke_version}-${network_type}"
+    local next_num=1
     
-    local display_name="${shape_name}-ic-oke-${oke_version}-${network_type}-${next_num}"
+    # Find the highest existing number for this base pattern
+    if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
+        local highest=0
+        while IFS='|' read -r _ ic_existing_name _; do
+            # Match pattern: ic-<shape>-oke-<version>-<networking>-<N>
+            if [[ "$ic_existing_name" =~ ^${base_name}-([0-9]+)$ ]]; then
+                local found_num="${BASH_REMATCH[1]}"
+                (( found_num > highest )) && highest=$found_num
+            fi
+        done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+        next_num=$((highest + 1))
+    fi
+    
+    # Also check via live OCI API in case cache is stale
+    local live_ics
+    live_ics=$(oci compute-management instance-configuration list \
+        --compartment-id "$compartment_id" \
+        --all --output json 2>/dev/null)
+    
+    if [[ -n "$live_ics" ]] && echo "$live_ics" | jq -e '.data[0]' &>/dev/null; then
+        while read -r ic_existing_name; do
+            [[ -z "$ic_existing_name" ]] && continue
+            if [[ "$ic_existing_name" =~ ^${base_name}-([0-9]+)$ ]]; then
+                local found_num="${BASH_REMATCH[1]}"
+                (( found_num >= next_num )) && next_num=$((found_num + 1))
+            fi
+        done < <(echo "$live_ics" | jq -r '.data[]["display-name"] // empty' 2>/dev/null)
+    fi
+    
+    local display_name="${base_name}-${next_num}"
     
     echo -e "${WHITE}Auto-generated display name: ${CYAN}${display_name}${NC}"
     echo -n -e "${CYAN}Accept or enter custom name [${display_name}]: ${NC}"
@@ -31865,7 +31883,10 @@ EOF
 # Delete Instance Configuration interactively
 #--------------------------------------------------------------------------------
 delete_instance_configuration_interactive() {
+    local delete_args="$1"
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local log_file="${LOGS_DIR}/instance_config_actions.log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     echo ""
     echo -e "${BOLD}${RED}═══ Delete Instance Configuration ═══${NC}"
@@ -31895,11 +31916,11 @@ delete_instance_configuration_interactive() {
     # Display Instance Configurations
     echo -e "${WHITE}Available Instance Configurations:${NC}"
     echo ""
-    printf "${BOLD}%-6s %-60s %-90s${NC}\n" \
-        "ID" "Instance Configuration Name" "OCID"
+    printf "${BOLD}%-6s %-60s %-20s %s${NC}\n" \
+        "ID" "Instance Configuration Name" "Created" "OCID"
     print_separator 160
     
-    # Sort and display instance configs
+    # Sort and display instance configs, build display map
     local ic_output_temp
     ic_output_temp=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
     
@@ -31908,129 +31929,224 @@ delete_instance_configuration_interactive() {
         local ic_ocid="${IC_INDEX_MAP[$iid]}"
         [[ -z "$ic_ocid" ]] && continue
         
-        local ic_line ic_name
+        local ic_line ic_name ic_time_created
         ic_line=$(grep "^${ic_ocid}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -1)
         if [[ -n "$ic_line" ]]; then
-            IFS='|' read -r _ ic_name <<< "$ic_line"
+            IFS='|' read -r _ ic_name ic_time_created <<< "$ic_line"
         else
             ic_name="N/A"
+            ic_time_created="N/A"
+        fi
+        
+        local time_display="N/A"
+        if [[ -n "$ic_time_created" && "$ic_time_created" != "N/A" ]]; then
+            time_display="${ic_time_created:0:16}"
+            time_display="${time_display/T/ }"
         fi
         
         local iid_num="${iid#i}"
-        echo "${iid_num}|${iid}|${ic_name}|${ic_ocid}" >> "$ic_output_temp"
+        echo "${iid_num}|${iid}|${ic_name}|${time_display}|${ic_ocid}" >> "$ic_output_temp"
     done
     
-    sort -t'|' -k1 -n "$ic_output_temp" | while IFS='|' read -r _ iid ic_name ic_ocid; do
-        printf "${YELLOW}%-6s${NC} ${GREEN}%-60s${NC} ${GRAY}%-90s${NC}\n" \
-            "$iid" "$ic_name" "$ic_ocid"
+    sort -t'|' -k1 -n "$ic_output_temp" | while IFS='|' read -r _ iid ic_name time_display ic_ocid; do
+        printf "${YELLOW}%-6s${NC} ${GREEN}%-60s${NC} ${GRAY}%-20s${NC} ${CYAN}%s${NC}\n" \
+            "$iid" "$ic_name" "$time_display" "$ic_ocid"
     done
     
     rm -f "$ic_output_temp"
     echo ""
     
-    # Select Instance Configuration to delete
-    echo -n -e "${CYAN}Select Instance Configuration to delete (i#) or 'cancel': ${NC}"
-    local ic_input
-    read -r ic_input
+    # If no args provided, prompt interactively
+    if [[ -z "$delete_args" ]]; then
+        echo -e "${WHITE}Usage: Enter one of the following:${NC}"
+        echo -e "  ${YELLOW}i#${NC}          - Delete a single config (e.g., ${CYAN}i1${NC})"
+        echo -e "  ${YELLOW}i#,i#,i#${NC}   - Delete multiple configs (e.g., ${CYAN}i1,i3,i5${NC})"
+        echo -e "  ${YELLOW}all${NC}         - Delete ALL instance configurations"
+        echo -e "  ${YELLOW}cancel${NC}      - Cancel"
+        echo ""
+        echo -n -e "${CYAN}Select Instance Configuration(s) to delete: ${NC}"
+        read -r delete_args
+    fi
     
     # Check for cancel
-    if [[ "$ic_input" == "cancel" || "$ic_input" == "c" || -z "$ic_input" ]]; then
+    if [[ -z "$delete_args" || "$delete_args" == "cancel" || "$delete_args" == "c" ]]; then
         echo -e "${YELLOW}Delete cancelled${NC}"
         return 0
     fi
     
-    local ic_ocid="${IC_INDEX_MAP[$ic_input]:-}"
-    if [[ -z "$ic_ocid" ]]; then
-        echo -e "${RED}Invalid instance configuration selection: $ic_input${NC}"
+    # Build list of ICs to delete
+    declare -a DELETE_IDS=()
+    declare -a DELETE_OCIDS=()
+    declare -a DELETE_NAMES=()
+    
+    if [[ "${delete_args,,}" == "all" ]]; then
+        # Delete all
+        for iid in "${!IC_INDEX_MAP[@]}"; do
+            local ic_ocid="${IC_INDEX_MAP[$iid]}"
+            [[ -z "$ic_ocid" ]] && continue
+            DELETE_IDS+=("$iid")
+            DELETE_OCIDS+=("$ic_ocid")
+            
+            local ic_line ic_name
+            ic_line=$(grep "^${ic_ocid}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -1)
+            if [[ -n "$ic_line" ]]; then
+                IFS='|' read -r _ ic_name _ <<< "$ic_line"
+            else
+                ic_name="Unknown"
+            fi
+            DELETE_NAMES+=("$ic_name")
+        done
+    else
+        # Parse comma-separated list: i1,i3,i5 or i1
+        local IFS_SAVE="$IFS"
+        IFS=',' read -ra INPUT_IDS <<< "$delete_args"
+        IFS="$IFS_SAVE"
+        
+        for raw_id in "${INPUT_IDS[@]}"; do
+            # Trim whitespace
+            local clean_id
+            clean_id=$(echo "$raw_id" | tr -d ' ')
+            
+            # Ensure it starts with 'i'
+            [[ "$clean_id" =~ ^[0-9]+$ ]] && clean_id="i${clean_id}"
+            
+            local ic_ocid="${IC_INDEX_MAP[$clean_id]:-}"
+            if [[ -z "$ic_ocid" ]]; then
+                echo -e "${RED}Invalid ID: ${clean_id} - skipping${NC}"
+                continue
+            fi
+            
+            DELETE_IDS+=("$clean_id")
+            DELETE_OCIDS+=("$ic_ocid")
+            
+            local ic_line ic_name
+            ic_line=$(grep "^${ic_ocid}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -1)
+            if [[ -n "$ic_line" ]]; then
+                IFS='|' read -r _ ic_name _ <<< "$ic_line"
+            else
+                ic_name="Unknown"
+            fi
+            DELETE_NAMES+=("$ic_name")
+        done
+    fi
+    
+    # Validate we have something to delete
+    if [[ ${#DELETE_OCIDS[@]} -eq 0 ]]; then
+        echo -e "${RED}No valid instance configurations selected for deletion${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
         return 1
     fi
     
-    # Get instance configuration details
-    local ic_json ic_name ic_time_created
-    ic_json=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ic_ocid" \
-        --output json 2>/dev/null)
-    
-    if [[ -n "$ic_json" ]]; then
-        ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
-        ic_time_created=$(echo "$ic_json" | jq -r '.data["time-created"] // "N/A"')
-    else
-        ic_name="Unknown"
-        ic_time_created="Unknown"
-    fi
-    
-    # Check if instance configuration is in use by any GPU memory clusters
-    echo ""
-    echo -e "${YELLOW}Checking if instance configuration is in use...${NC}"
-    
-    local clusters_using_ic=""
-    if [[ -f "$CLUSTER_CACHE" ]]; then
-        while IFS='|' read -r cluster_ocid cluster_name cluster_state _ cluster_ic_id _; do
-            [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
-            [[ -z "$cluster_ocid" ]] && continue
-            [[ "$cluster_state" == "DELETED" ]] && continue
-            
-            if [[ "$cluster_ic_id" == "$ic_ocid" ]]; then
-                clusters_using_ic="${clusters_using_ic}${cluster_name} (${cluster_state})\n"
-            fi
-        done < "$CLUSTER_CACHE"
-    fi
-    
+    # Show what will be deleted
     echo ""
     echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║                    ⚠️  WARNING: DELETE INSTANCE CONFIGURATION  ⚠️               ║${NC}"
+    echo -e "${RED}║              ⚠️  WARNING: DELETE INSTANCE CONFIGURATION(S)  ⚠️                  ║${NC}"
     echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${WHITE}Instance Configuration:${NC} ${GREEN}$ic_name${NC}"
-    echo -e "${WHITE}OCID:${NC}                   ${YELLOW}$ic_ocid${NC}"
-    echo -e "${WHITE}Created:${NC}                $ic_time_created"
+    echo -e "${WHITE}The following ${RED}${#DELETE_OCIDS[@]}${WHITE} instance configuration(s) will be deleted:${NC}"
     echo ""
     
-    if [[ -n "$clusters_using_ic" ]]; then
-        echo -e "${RED}⚠️  WARNING: This instance configuration is used by the following GPU Memory Clusters:${NC}"
-        echo -e "${YELLOW}$(echo -e "$clusters_using_ic")${NC}"
-        echo -e "${RED}Deleting this configuration may affect future cluster operations!${NC}"
-        echo ""
-    fi
+    local clusters_warning=""
+    for i in "${!DELETE_OCIDS[@]}"; do
+        local ic_ocid="${DELETE_OCIDS[$i]}"
+        local ic_name="${DELETE_NAMES[$i]}"
+        local iid="${DELETE_IDS[$i]}"
+        
+        printf "  ${YELLOW}%-5s${NC} ${WHITE}%-60s${NC} ${GRAY}%s${NC}\n" "$iid" "$ic_name" "$ic_ocid"
+        
+        # Check if this IC is in use by any GPU memory clusters
+        if [[ -f "$CLUSTER_CACHE" ]]; then
+            while IFS='|' read -r cluster_ocid cluster_name cluster_state _ cluster_ic_id _; do
+                [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
+                [[ -z "$cluster_ocid" ]] && continue
+                [[ "$cluster_state" == "DELETED" ]] && continue
+                
+                if [[ "$cluster_ic_id" == "$ic_ocid" ]]; then
+                    clusters_warning+="        ↳ ${RED}IN USE by cluster: ${YELLOW}${cluster_name}${NC} ${GRAY}(${cluster_state})${NC}\n"
+                fi
+            done < "$CLUSTER_CACHE"
+        fi
+        
+        if [[ -n "$clusters_warning" ]]; then
+            echo -e "$clusters_warning"
+            clusters_warning=""
+        fi
+    done
     
+    echo ""
     echo -e "${RED}This action cannot be undone!${NC}"
     echo ""
     
-    echo -n -e "${RED}Type 'DELETE' to confirm deletion: ${NC}"
-    local confirm
-    read -r confirm
-    
-    if [[ "$confirm" != "DELETE" ]]; then
-        echo -e "${YELLOW}Delete cancelled${NC}"
-        return 0
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}Deleting Instance Configuration...${NC}"
-    
-    local result
-    result=$(oci compute-management instance-configuration delete \
-        --instance-configuration-id "$ic_ocid" \
-        --force 2>&1)
-    local exit_code=$?
-    
-    if [[ $exit_code -eq 0 ]]; then
-        echo -e "${GREEN}✓ Instance Configuration deleted successfully${NC}"
-        
-        # Invalidate cache
-        rm -f "$INSTANCE_CONFIG_CACHE"
-        
-        echo ""
-        echo -e "Press Enter to continue..."
-        read -r
+    # Confirmation
+    if [[ ${#DELETE_OCIDS[@]} -gt 1 ]]; then
+        echo -n -e "${RED}Type 'DELETE ${#DELETE_OCIDS[@]}' to confirm deletion of ${#DELETE_OCIDS[@]} configs: ${NC}"
+        local confirm
+        read -r confirm
+        if [[ "$confirm" != "DELETE ${#DELETE_OCIDS[@]}" ]]; then
+            echo -e "${YELLOW}Delete cancelled${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return 0
+        fi
     else
-        echo -e "${RED}✗ Failed to delete Instance Configuration:${NC}"
-        echo "$result"
-        echo ""
-        echo -e "Press Enter to continue..."
-        read -r
-        return 1
+        echo -n -e "${RED}Type 'DELETE' to confirm deletion: ${NC}"
+        local confirm
+        read -r confirm
+        if [[ "$confirm" != "DELETE" ]]; then
+            echo -e "${YELLOW}Delete cancelled${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return 0
+        fi
     fi
+    
+    # Execute deletions
+    echo ""
+    local success_count=0
+    local fail_count=0
+    
+    for i in "${!DELETE_OCIDS[@]}"; do
+        local ic_ocid="${DELETE_OCIDS[$i]}"
+        local ic_name="${DELETE_NAMES[$i]}"
+        local iid="${DELETE_IDS[$i]}"
+        
+        local cmd="oci compute-management instance-configuration delete --instance-configuration-id \"${ic_ocid}\" --force"
+        
+        echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+        echo -e "${GRAY}$ ${cmd}${NC}"
+        
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $cmd" >> "$log_file"
+        
+        local result
+        result=$(eval "$cmd" 2>&1)
+        local exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            echo -e "${GREEN}✓ Deleted: ${WHITE}${ic_name}${NC} ${GRAY}(${iid})${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted IC '${ic_name}' (${ic_ocid})" >> "$log_file"
+            ((success_count++))
+        else
+            echo -e "${RED}✗ Failed: ${WHITE}${ic_name}${NC} ${GRAY}(${iid})${NC}"
+            echo -e "  ${RED}${result}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Delete IC '${ic_name}' (${ic_ocid}): ${result}" >> "$log_file"
+            ((fail_count++))
+        fi
+        echo ""
+    done
+    
+    # Summary
+    echo -e "${BOLD}${WHITE}─── Delete Summary ───${NC}"
+    echo -e "  ${GREEN}Succeeded:${NC} ${success_count}"
+    [[ $fail_count -gt 0 ]] && echo -e "  ${RED}Failed:${NC}    ${fail_count}"
+    echo -e "  ${GRAY}Log file:  ${log_file}${NC}"
+    echo ""
+    
+    # Invalidate cache
+    rm -f "$INSTANCE_CONFIG_CACHE"
+    
+    echo -e "Press Enter to continue..."
+    read -r
 }
 
 #===============================================================================
@@ -33596,7 +33712,7 @@ EOF
         
         if [[ "$confirm_exec" != "n" && "$confirm_exec" != "N" ]]; then
             # Log the action
-            local log_file="${LOG_DIR:-./logs}/object_storage_actions_$(date +%Y%m%d).log"
+            local log_file="${LOGS_DIR}/object_storage_actions_$(date +%Y%m%d).log"
             mkdir -p "$(dirname "$log_file")" 2>/dev/null
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE SECURITY LIST: oci network security-list update --security-list-id \"$sl_id\" --ingress-security-rules '...' " >> "$log_file"
             
@@ -33874,7 +33990,7 @@ pe_add_nsg_rules_wizard() {
         
         if [[ "$confirm_exec" != "n" && "$confirm_exec" != "N" ]]; then
             # Log the action
-            local log_file="${LOG_DIR:-./logs}/object_storage_actions_$(date +%Y%m%d).log"
+            local log_file="${LOGS_DIR}/object_storage_actions_$(date +%Y%m%d).log"
             mkdir -p "$(dirname "$log_file")" 2>/dev/null
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ADD NSG RULES: oci network nsg rules add --nsg-id \"$nsg_id\" --security-rules '...' " >> "$log_file"
             
@@ -34229,7 +34345,7 @@ EOF
     fi
     
     # Log the action
-    local log_file="${LOG_DIR:-./logs}/object_storage_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/object_storage_actions_$(date +%Y%m%d).log"
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CREATE PRIVATE ENDPOINT: $create_cmd" >> "$log_file"
     
@@ -34386,7 +34502,7 @@ os_delete_private_endpoint() {
     fi
     
     # Log the action
-    local log_file="${LOG_DIR:-./logs}/object_storage_actions_$(date +%Y%m%d).log"
+    local log_file="${LOGS_DIR}/object_storage_actions_$(date +%Y%m%d).log"
     mkdir -p "$(dirname "$log_file")" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE PRIVATE ENDPOINT: $delete_cmd" >> "$log_file"
     
@@ -34429,13 +34545,12 @@ manage_custom_images() {
         echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
         echo ""
         
-        # Fetch and display custom images
+        # Fetch and display custom images (all states, not just AVAILABLE)
         echo -e "${GRAY}Fetching custom images...${NC}"
         
         local images_json
         images_json=$(oci compute image list \
             --compartment-id "$compartment_id" \
-            --lifecycle-state AVAILABLE \
             --sort-by TIMECREATED \
             --sort-order DESC \
             --all \
@@ -34456,9 +34571,33 @@ manage_custom_images() {
         fi
         [[ -z "$image_count" || "$image_count" == "null" ]] && image_count=0
         
+        # Count by lifecycle state
+        local count_available count_importing count_provisioning count_disabled count_other
+        count_available=$(echo "$custom_images_json" | jq '[.data[] | select(.["lifecycle-state"] == "AVAILABLE")] | length' 2>/dev/null || echo "0")
+        count_importing=$(echo "$custom_images_json" | jq '[.data[] | select(.["lifecycle-state"] == "IMPORTING")] | length' 2>/dev/null || echo "0")
+        count_provisioning=$(echo "$custom_images_json" | jq '[.data[] | select(.["lifecycle-state"] == "PROVISIONING")] | length' 2>/dev/null || echo "0")
+        count_disabled=$(echo "$custom_images_json" | jq '[.data[] | select(.["lifecycle-state"] == "DISABLED")] | length' 2>/dev/null || echo "0")
+        count_other=$(( image_count - count_available - count_importing - count_provisioning - count_disabled ))
+        [[ "$count_other" -lt 0 ]] && count_other=0
+        
         echo ""
         echo -e "${BOLD}${WHITE}═══ Custom Images Summary ═══${NC}"
-        echo -e "  ${CYAN}Custom Images:${NC} ${WHITE}${image_count}${NC}"
+        echo -e "  ${CYAN}Total Custom Images:${NC} ${WHITE}${image_count}${NC}"
+        if [[ "$count_available" -gt 0 ]]; then
+            echo -e "  ${GREEN}Available:${NC}           ${WHITE}${count_available}${NC}"
+        fi
+        if [[ "$count_importing" -gt 0 ]]; then
+            echo -e "  ${YELLOW}Importing:${NC}           ${WHITE}${count_importing}${NC}"
+        fi
+        if [[ "$count_provisioning" -gt 0 ]]; then
+            echo -e "  ${YELLOW}Provisioning:${NC}        ${WHITE}${count_provisioning}${NC}"
+        fi
+        if [[ "$count_disabled" -gt 0 ]]; then
+            echo -e "  ${RED}Disabled:${NC}            ${WHITE}${count_disabled}${NC}"
+        fi
+        if [[ "$count_other" -gt 0 ]]; then
+            echo -e "  ${GRAY}Other:${NC}               ${WHITE}${count_other}${NC}"
+        fi
         echo -e "  ${GRAY}(Filtered to show only images created in this compartment)${NC}"
         echo ""
         
@@ -34469,10 +34608,10 @@ manage_custom_images() {
         
         if [[ "$image_count" -gt 0 ]]; then
             echo -e "${BOLD}${WHITE}─── Custom Images ───${NC}"
-            printf "  ${BOLD}%-3s %-105s %-20s %-12s %-12s${NC}\n" "#" "Image Name" "OS" "Billable GB" "Created"
-            print_separator 160
+            printf "  ${BOLD}%-3s %-105s %-20s %-14s %-12s %-12s${NC}\n" "#" "Image Name" "OS" "Status" "Billable GB" "Created"
+            print_separator 175
             
-            while IFS='|' read -r img_id img_name img_os img_billable_gb img_created launch_mode; do
+            while IFS='|' read -r img_id img_name img_os img_billable_gb img_created img_state; do
                 [[ -z "$img_id" ]] && continue
                 ((idx++))
                 
@@ -34490,10 +34629,19 @@ manage_custom_images() {
                     created_display="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[1]}"
                 fi
                 
-                printf "  ${YELLOW}%-3s${NC} %-105s %-20s %-12s %-12s\n" \
-                    "$idx" "$img_name" "$img_os" "$size_gb" "$created_display"
+                # Color-code status
+                local state_color="${WHITE}"
+                case "$img_state" in
+                    AVAILABLE)    state_color="${GREEN}" ;;
+                    IMPORTING|PROVISIONING|EXPORTING) state_color="${YELLOW}" ;;
+                    DISABLED|DELETED) state_color="${RED}" ;;
+                    *)            state_color="${GRAY}" ;;
+                esac
+                
+                printf "  ${YELLOW}%-3s${NC} %-105s %-20s ${state_color}%-14s${NC} %-12s %-12s\n" \
+                    "$idx" "$img_name" "$img_os" "$img_state" "$size_gb" "$created_display"
                     
-            done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["billable-size-in-gbs"] // "null")|\(.["time-created"] // "N/A")|\(.["launch-mode"] // "N/A")"' 2>/dev/null)
+            done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["billable-size-in-gbs"] // "null")|\(.["time-created"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' 2>/dev/null)
             echo ""
         else
             echo -e "  ${GRAY}No custom images found in this compartment${NC}"
@@ -35117,26 +35265,30 @@ custom_image_export() {
     
     echo ""
     echo -e "${BOLD}${WHITE}─── Select Image to Export ───${NC}"
-    printf "  ${BOLD}%-4s %-55s %-18s %-10s %-12s${NC}\n" "#" "Image Name" "OS" "Size (GB)" "Created"
-    print_separator 110
+    printf "  ${BOLD}%-4s %-105s %-18s %-10s %-12s${NC}\n" "#" "Image Name" "OS" "Size (GB)" "Created"
+    print_separator 160
     
     declare -A EXPORT_IMAGE_MAP=()
     local idx=0
     
-    while IFS='|' read -r img_id img_name img_os img_size img_created; do
+    while IFS='|' read -r img_id img_name img_os img_billable_gb img_created; do
         [[ -z "$img_id" ]] && continue
         ((idx++))
         EXPORT_IMAGE_MAP[$idx]="$img_id|$img_name"
         
         local size_gb="N/A"
-        if [[ -n "$img_size" && "$img_size" != "null" && "$img_size" != "0" ]]; then
-            size_gb=$(awk "BEGIN {printf \"%.1f\", $img_size / 1024}")
+        if [[ -n "$img_billable_gb" && "$img_billable_gb" != "null" && "$img_billable_gb" != "0" ]]; then
+            size_gb="${img_billable_gb}"
         fi
+        # Format date: YYYY-MM-DD → MM-DD-YYYY
         local created_display="${img_created:0:10}"
+        if [[ "$created_display" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+            created_display="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[1]}"
+        fi
         
-        printf "  ${YELLOW}%-4s${NC} %-55s %-18s %-10s %-12s\n" \
+        printf "  ${YELLOW}%-4s${NC} %-105s %-18s %-10s %-12s\n" \
             "$idx" "$img_name" "$img_os" "$size_gb" "$created_display"
-    done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["size-in-mbs"] // "null")|\(.["time-created"] // "N/A")"' 2>/dev/null)
+    done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["billable-size-in-gbs"] // "null")|\(.["time-created"] // "N/A")"' 2>/dev/null)
     
     echo ""
     echo -n -e "${CYAN}Select image #: ${NC}"
@@ -35310,8 +35462,8 @@ custom_image_shape_compatibility() {
     
     echo ""
     echo -e "${BOLD}${WHITE}─── Select Image ───${NC}"
-    printf "  ${BOLD}%-4s %-55s %-18s %-12s${NC}\n" "#" "Image Name" "OS" "Created"
-    print_separator 95
+    printf "  ${BOLD}%-4s %-105s %-18s %-12s${NC}\n" "#" "Image Name" "OS" "Created"
+    print_separator 145
     
     declare -A SC_IMAGE_MAP=()
     local idx=0
@@ -35320,8 +35472,13 @@ custom_image_shape_compatibility() {
         [[ -z "$img_id" ]] && continue
         ((idx++))
         SC_IMAGE_MAP[$idx]="$img_id"
-        printf "  ${YELLOW}%-4s${NC} %-55s %-18s %-12s\n" \
-            "$idx" "$img_name" "$img_os" "${img_created:0:10}"
+        # Format date: YYYY-MM-DD → MM-DD-YYYY
+        local created_display="${img_created:0:10}"
+        if [[ "$created_display" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+            created_display="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[1]}"
+        fi
+        printf "  ${YELLOW}%-4s${NC} %-105s %-18s %-12s\n" \
+            "$idx" "$img_name" "$img_os" "$created_display"
     done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["time-created"] // "N/A")"' 2>/dev/null)
     
     echo ""
@@ -35393,26 +35550,29 @@ custom_image_shape_compatibility() {
             shapes_json=$(oci compute shape list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
             
             if [[ -n "$shapes_json" ]] && echo "$shapes_json" | jq -e '.data[0]' &>/dev/null; then
-                # Get unique shape names, mark already-compatible ones
+                # Only show shapes NOT already in the compatibility list
                 declare -A SHAPE_MAP=()
                 local sidx=0
+                local skipped=0
                 
                 echo ""
-                printf "  ${BOLD}%-4s %-35s %-8s %-8s %-6s %s${NC}\n" "#" "Shape" "OCPUs" "Mem(GB)" "GPUs" "Status"
-                print_separator 85
+                printf "  ${BOLD}%-4s %-35s %-8s %-8s %-6s${NC}\n" "#" "Shape" "OCPUs" "Mem(GB)" "GPUs"
+                print_separator 70
                 
                 while IFS='|' read -r shape_name shape_ocpus shape_mem shape_gpus; do
                     [[ -z "$shape_name" ]] && continue
+                    
+                    # Skip shapes already in compatibility list
+                    if [[ -n "${COMPAT_SHAPES[$shape_name]}" ]]; then
+                        ((skipped++))
+                        continue
+                    fi
+                    
                     ((sidx++))
                     SHAPE_MAP[$sidx]="$shape_name"
                     
-                    local status_text="${GREEN}compatible${NC}"
-                    if [[ -z "${COMPAT_SHAPES[$shape_name]}" ]]; then
-                        status_text="${YELLOW}not added${NC}"
-                    fi
-                    
-                    printf "  ${YELLOW}%-4s${NC} %-35s %-8s %-8s %-6s %b\n" \
-                        "$sidx" "$shape_name" "${shape_ocpus:-N/A}" "${shape_mem:-N/A}" "${shape_gpus:-0}" "$status_text"
+                    printf "  ${YELLOW}%-4s${NC} %-35s %-8s %-8s %-6s\n" \
+                        "$sidx" "$shape_name" "${shape_ocpus:-N/A}" "${shape_mem:-N/A}" "${shape_gpus:-0}"
                 done < <(echo "$shapes_json" | jq -r '
                     [.data[] | {shape: .shape, ocpus: (.ocpus // "flex"), mem: (."memory-in-gbs" // "flex"), gpus: (.gpus // 0)}] | 
                     unique_by(.shape) | sort_by(.shape)[] |
@@ -35420,14 +35580,29 @@ custom_image_shape_compatibility() {
                 ' 2>/dev/null)
                 
                 echo ""
-                echo -e "${GRAY}Enter shape # to add, or type a shape name directly (e.g., BM.GPU.H100.8)${NC}"
-                echo -n -e "${CYAN}Add shape: ${NC}"
+                echo -e "  ${GRAY}(${skipped} shape(s) already compatible - hidden)${NC}"
+                
+                if [[ "$sidx" -eq 0 ]]; then
+                    echo -e "  ${GREEN}All available shapes are already compatible${NC}"
+                    echo ""
+                fi
+                
+                echo ""
+                echo -e "  ${GREEN}c${NC})  Enter custom shape name (for shapes not listed above)"
+                echo ""
+                echo -n -e "${CYAN}Select shape # or 'c' for custom: ${NC}"
                 read -r shape_input
                 
                 local shape_to_add=""
-                if [[ "$shape_input" =~ ^[0-9]+$ && -n "${SHAPE_MAP[$shape_input]}" ]]; then
+                if [[ "$shape_input" == "c" || "$shape_input" == "C" ]]; then
+                    echo ""
+                    echo -e "${GRAY}Enter the exact shape name (e.g., BM.GPU.H100.8, BM.GPU.A100-v2.8, VM.GPU.A10.1)${NC}"
+                    echo -n -e "${CYAN}Custom shape name: ${NC}"
+                    read -r shape_to_add
+                elif [[ "$shape_input" =~ ^[0-9]+$ && -n "${SHAPE_MAP[$shape_input]}" ]]; then
                     shape_to_add="${SHAPE_MAP[$shape_input]}"
                 elif [[ -n "$shape_input" ]]; then
+                    # Allow direct shape name entry too
                     shape_to_add="$shape_input"
                 fi
                 
@@ -35473,17 +35648,26 @@ custom_image_shape_compatibility() {
                     echo -e "${YELLOW}Cancelled${NC}"
                 fi
             else
-                echo -e "${GRAY}Could not fetch shapes. Enter shape name manually:${NC}"
-                echo -n -e "${CYAN}Shape name (e.g., BM.GPU.H100.8): ${NC}"
+                echo -e "${GRAY}Could not fetch shapes from region. Enter shape name manually:${NC}"
+                echo -e "${GRAY}Examples: BM.GPU.H100.8, BM.GPU.A100-v2.8, VM.GPU.A10.1, BM.Standard.E5.192${NC}"
+                echo -n -e "${CYAN}Custom shape name: ${NC}"
                 read -r manual_shape
                 
                 if [[ -n "$manual_shape" ]]; then
+                    # Check if already compatible
+                    if [[ -n "${COMPAT_SHAPES[$manual_shape]}" ]]; then
+                        echo -e "${YELLOW}Shape '$manual_shape' is already compatible with this image${NC}"
+                        echo -e "Press Enter to continue..."
+                        read -r
+                        return
+                    fi
+                    
                     local cmd="oci compute image-shape-compatibility-entry add --image-id \"$selected_image\" --shape-name \"$manual_shape\""
                     echo ""
                     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
                     echo -e "${GRAY}$cmd${NC}"
                     echo ""
-                    echo -n -e "${YELLOW}Add shape compatibility? (y/N): ${NC}"
+                    echo -n -e "${YELLOW}Add shape compatibility for '$manual_shape'? (y/N): ${NC}"
                     read -r confirm
                     
                     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
@@ -35580,12 +35764,14 @@ custom_image_delete() {
     echo -e "${BOLD}${RED}═══ Delete Custom Image ═══${NC}"
     echo ""
     
-    # List images
+    # List images (all states - user may want to delete IMPORTING/DISABLED images too)
     echo -e "${GRAY}Fetching custom images...${NC}"
     local images_json
     images_json=$(oci compute image list \
         --compartment-id "$compartment_id" \
-        --lifecycle-state AVAILABLE \
+        --sort-by TIMECREATED \
+        --sort-order DESC \
+        --all \
         --output json 2>/dev/null)
     
     # Filter to only show custom images (images where compartment-id matches user's compartment)
@@ -35605,18 +35791,28 @@ custom_image_delete() {
     
     echo ""
     echo -e "${BOLD}${WHITE}─── Select Image to Delete ───${NC}"
-    printf "  ${BOLD}%-3s %-50s %-15s${NC}\n" "#" "Image Name" "OS"
-    print_separator 75
+    printf "  ${BOLD}%-3s %-105s %-20s %-14s${NC}\n" "#" "Image Name" "OS" "Status"
+    print_separator 150
     
     declare -A IMAGE_MAP
     local idx=0
     
-    while IFS='|' read -r img_id img_name img_os; do
+    while IFS='|' read -r img_id img_name img_os img_state; do
         [[ -z "$img_id" ]] && continue
         ((idx++))
         IMAGE_MAP[$idx]="$img_id|$img_name"
-        printf "  ${YELLOW}%-3s${NC} %-50s %-15s\n" "$idx" "${img_name:0:48}" "${img_os:0:13}"
-    done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")"' 2>/dev/null)
+        
+        # Color-code status
+        local state_color="${WHITE}"
+        case "$img_state" in
+            AVAILABLE)    state_color="${GREEN}" ;;
+            IMPORTING|PROVISIONING|EXPORTING) state_color="${YELLOW}" ;;
+            DISABLED|DELETED) state_color="${RED}" ;;
+            *)            state_color="${GRAY}" ;;
+        esac
+        
+        printf "  ${YELLOW}%-3s${NC} %-105s %-20s ${state_color}%-14s${NC}\n" "$idx" "$img_name" "$img_os" "$img_state"
+    done < <(echo "$custom_images_json" | jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' 2>/dev/null)
     
     echo ""
     echo -n -e "${CYAN}Select image # to delete: ${NC}"
