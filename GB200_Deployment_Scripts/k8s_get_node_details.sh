@@ -72,6 +72,7 @@ readonly NETWORK_RESOURCES_CACHE="${CACHE_DIR}/network_resources.txt"
 readonly BOOT_VOLUME_CACHE="${CACHE_DIR}/boot_volumes.txt"
 readonly IMAGE_CACHE="${CACHE_DIR}/images.txt"
 readonly INSTANCE_CLUSTER_MAP_CACHE="${CACHE_DIR}/instance_cluster_map.txt"
+readonly INSTANCE_LIST_CACHE="${CACHE_DIR}/instance_list.json"
 
 # Network gateway cache files
 readonly IGW_CACHE="${CACHE_DIR}/internet_gateways.txt"
@@ -89,6 +90,12 @@ readonly XR_CACHE_TTL=180  # 3 minutes for cross-region DRG map
 readonly MAINT_EVENTS_CACHE="${CACHE_DIR}/maintenance_events.json"
 readonly MAINT_EVENTS_CACHE_TTL=3600  # 1 hour TTL for maintenance events
 readonly FAULT_DETAILS_CACHE="${CACHE_DIR}/fault_details.txt"
+readonly OS_PE_CACHE="${CACHE_DIR}/os_private_endpoints.txt"
+
+# FSS (File Storage Service) cache files
+readonly FSS_FS_CACHE="${CACHE_DIR}/fss_file_systems.json"
+readonly FSS_MT_CACHE="${CACHE_DIR}/fss_mount_targets.json"
+readonly FSS_EXPORT_CACHE="${CACHE_DIR}/fss_exports.json"
 
 # Known shortnames for subnets and NSGs
 readonly NETWORK_SHORTNAMES=("bastion" "cp" "operator" "int_lb" "pub_lb" "pods" "workers" "fss" "lustre")
@@ -207,7 +214,68 @@ is_cache_fresh() {
     [[ $cache_age -lt $CACHE_MAX_AGE ]]
 }
 
-# Safely create a temp file and echo its path
+# Display a compact one-liner showing which caches are in use on the current page
+# Args: pairs of "cache_file|label|type_filter" where type_filter is optional
+#   - Text caches: lines counted (excluding #comments and blank lines)
+#   - Text caches with type_filter: only count lines starting with that prefix
+#   - JSON caches (*.json): count via jq .data.items or .data length
+#   - If cache missing: "-- cached, --"
+# Output: single gray info line like:
+#   ℹ Subnets (8, 3m) │ NSGs (12, 3m) │ OS PEs (2, 0m)
+_display_cache_info() {
+    local parts=()
+    
+    for spec in "$@"; do
+        local cache_file label type_filter
+        IFS='|' read -r cache_file label type_filter <<< "$spec"
+        
+        [[ -z "$cache_file" || -z "$label" ]] && continue
+        
+        if [[ ! -f "$cache_file" || ! -s "$cache_file" ]]; then
+            parts+=("${label} (0, --)")
+            continue
+        fi
+        
+        # Count items
+        local count=0
+        local ext="${cache_file##*.}"
+        if [[ "$ext" == "json" ]]; then
+            # JSON: try .data.items[] first, then .data[]
+            count=$(jq -r '(.data.items // .data // []) | length' "$cache_file" 2>/dev/null || echo 0)
+        elif [[ -n "$type_filter" ]]; then
+            # Text with prefix filter (e.g. SUBNET, NSG)
+            count=$(grep -c "^${type_filter}|" "$cache_file" 2>/dev/null || true)
+        else
+            # Text: count non-comment non-blank lines
+            count=$(grep -cvE '^#|^$' "$cache_file" 2>/dev/null || true)
+        fi
+        count=${count:-0}
+        count=$(echo "$count" | tr -d '[:space:]')
+        
+        # Age in minutes
+        local mtime age_mins age_str
+        mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        age_mins=$(( ($(date +%s) - mtime) / 60 ))
+        if [[ $age_mins -lt 1 ]]; then
+            age_str="<1m"
+        elif [[ $age_mins -ge 60 ]]; then
+            age_str="$((age_mins / 60))h$((age_mins % 60))m"
+        else
+            age_str="${age_mins}m"
+        fi
+        
+        parts+=("${label} (${count}, ${age_str})")
+    done
+    
+    if [[ ${#parts[@]} -gt 0 ]]; then
+        local line=""
+        for ((i=0; i<${#parts[@]}; i++)); do
+            [[ $i -gt 0 ]] && line+=" │ "
+            line+="${parts[$i]}"
+        done
+        echo -e "  ${GRAY}ℹ ${line}${NC}"
+    fi
+}
 # Uses trap to ensure cleanup on script exit
 create_temp_file() {
     local tmp
@@ -418,6 +486,11 @@ refresh_all_caches() {
         "$SL_CACHE"
         "$MAINT_EVENTS_CACHE"
         "$FAULT_DETAILS_CACHE"
+        "$OS_PE_CACHE"
+        "$INSTANCE_LIST_CACHE"
+        "$FSS_FS_CACHE"
+        "$FSS_MT_CACHE"
+        "$FSS_EXPORT_CACHE"
     )
     
     local removed_count=0
@@ -1515,6 +1588,30 @@ get_oke_env_value() {
     grep "^${key}|" "$OKE_ENV_CACHE" 2>/dev/null | cut -d'|' -f2
 }
 
+# Resolve subnet display name from cache, fallback to API
+# Cache format: SUBNET|NAME|CIDR|ACCESS|STATE|OCID|...
+# Args: $1 = subnet OCID
+# Output: subnet name to stdout
+resolve_subnet_name_cached() {
+    local subnet_ocid="$1"
+    [[ -z "$subnet_ocid" || "$subnet_ocid" == "N/A" ]] && echo "N/A" && return
+    
+    # Try network resources cache first (SUBNET|NAME|...|OCID is field 6)
+    if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
+        local cached_name
+        cached_name=$(awk -F'|' -v ocid="$subnet_ocid" '$1=="SUBNET" && $6==ocid {print $2; exit}' "$NETWORK_RESOURCES_CACHE" 2>/dev/null)
+        if [[ -n "$cached_name" ]]; then
+            echo "$cached_name"
+            return
+        fi
+    fi
+    
+    # Fallback to API
+    local api_name
+    api_name=$(oci network subnet get --subnet-id "$subnet_ocid" --query 'data."display-name"' --raw-output 2>/dev/null) || api_name="N/A"
+    echo "${api_name:-N/A}"
+}
+
 # Fetch and cache all network resources (subnets and NSGs)
 fetch_network_resources() {
     local compartment_id="$1"
@@ -2194,6 +2291,82 @@ fetch_all_network_gateways() {
     fetch_security_lists "$compartment_id" "$vcn_ocid"
 }
 
+#--------------------------------------------------------------------------------
+# Fetch Object Storage Private Endpoints and cache them
+# Accepts one or two compartment IDs (main + optional network compartment)
+# Cache format: name|namespace|state|prefix|subnet-id|private-ip|pe-ocid|nsg-ids|compartment-id|time-created
+#--------------------------------------------------------------------------------
+fetch_os_private_endpoints() {
+    local comp1="$1"
+    local comp2="${2:-}"
+    
+    [[ -z "$comp1" ]] && return 1
+    
+    # Check cache TTL (reuse CACHE_MAX_AGE)
+    if [[ -f "$OS_PE_CACHE" ]]; then
+        local cache_mtime cache_age
+        cache_mtime=$(stat -c %Y "$OS_PE_CACHE" 2>/dev/null || echo 0)
+        cache_age=$(( $(date +%s) - cache_mtime ))
+        if [[ $cache_age -lt ${CACHE_MAX_AGE:-3600} ]]; then
+            return 0
+        fi
+    fi
+    
+    # Build unique compartment list
+    local -a comp_list=("$comp1")
+    [[ -n "$comp2" && "$comp2" != "$comp1" ]] && comp_list+=("$comp2")
+    
+    # Write cache header
+    echo "# OS Private Endpoints - $(date)" > "$OS_PE_CACHE"
+    
+    local total_found=0
+    
+    for cid in "${comp_list[@]}"; do
+        [[ -z "$cid" ]] && continue
+        
+        # List all private endpoints in this compartment
+        local pe_list_json
+        pe_list_json=$(oci os private-endpoint list --compartment-id "$cid" --output json 2>/dev/null)
+        
+        if [[ -z "$pe_list_json" ]] || ! echo "$pe_list_json" | jq -e '.data[0]' > /dev/null 2>&1; then
+            continue
+        fi
+        
+        # The list endpoint returns name, namespace, state, prefix, compartment-id
+        # but NOT private-endpoint-ip or subnet-id - we need 'get' for those
+        while IFS='|' read -r pe_name pe_namespace pe_state pe_prefix pe_comp; do
+            [[ -z "$pe_name" ]] && continue
+            
+            # Fetch full details for each PE (typically 1-2 per compartment)
+            local pe_detail
+            pe_detail=$(oci os private-endpoint get \
+                --pe-name "$pe_name" \
+                --namespace-name "$pe_namespace" \
+                --output json 2>/dev/null)
+            
+            local subnet_id="N/A" private_ip="N/A" pe_ocid="N/A" nsg_ids="" time_created="N/A"
+            
+            if [[ -n "$pe_detail" ]] && echo "$pe_detail" | jq -e '.data' > /dev/null 2>&1; then
+                subnet_id=$(echo "$pe_detail" | jq -r '.data["subnet-id"] // "N/A"')
+                private_ip=$(echo "$pe_detail" | jq -r '.data["private-endpoint-ip"] // "N/A"')
+                pe_ocid=$(echo "$pe_detail" | jq -r '.data.id // "N/A"')
+                time_created=$(echo "$pe_detail" | jq -r '.data["time-created"] // "N/A"')
+                # Comma-separated NSG IDs
+                nsg_ids=$(echo "$pe_detail" | jq -r '.data["nsg-ids"] // [] | join(",")' 2>/dev/null)
+            fi
+            
+            echo "${pe_name}|${pe_namespace}|${pe_state}|${pe_prefix}|${subnet_id}|${private_ip}|${pe_ocid}|${nsg_ids}|${pe_comp}|${time_created}" >> "$OS_PE_CACHE"
+            ((total_found++))
+            
+        done < <(echo "$pe_list_json" | jq -r '.data[] | "\(.name)|\(.namespace)|\(.["lifecycle-state"] // "N/A")|\(.prefix // "N/A")|\(.["compartment-id"] // "N/A")"' 2>/dev/null)
+    done
+    
+    # Update header with count
+    sed -i "1s/.*/# OS Private Endpoints - $(date) - ${total_found} found/" "$OS_PE_CACHE"
+    
+    return 0
+}
+
 # Check if VCN has an Internet Gateway
 has_internet_gateway() {
     local vcn_id="$1"
@@ -2349,9 +2522,31 @@ display_network_resources() {
     fetch_network_resources "$compartment_id" "$vcn_ocid"
     fetch_all_network_gateways "$compartment_id" "$vcn_ocid"
     
+    # Fetch OS Private Endpoints (pass compartment + network compartment if set)
+    fetch_os_private_endpoints "$compartment_id" "${NETWORK_COMPARTMENT_ID:-}"
+    
+    # Build subnet OCID → PE name lookup from OS PE cache
+    declare -A PE_SUBNET_MAP
+    if [[ -f "$OS_PE_CACHE" ]]; then
+        while IFS='|' read -r _pe_name _pe_ns _pe_state _pe_prefix _pe_subnet _pe_ip _pe_ocid _pe_nsgs _pe_comp _pe_ts; do
+            [[ "$_pe_name" =~ ^#.*$ ]] && continue
+            [[ -z "$_pe_name" || -z "$_pe_subnet" || "$_pe_subnet" == "N/A" ]] && continue
+            PE_SUBNET_MAP["$_pe_subnet"]="$_pe_name"
+        done < "$OS_PE_CACHE"
+    fi
+    
     [[ ! -f "$NETWORK_RESOURCES_CACHE" ]] && return 1
     
     echo -e "${BOLD}${WHITE}Network Resources:${NC}"
+    _display_cache_info \
+        "${NETWORK_RESOURCES_CACHE}|Subnets|SUBNET" \
+        "${NETWORK_RESOURCES_CACHE}|NSGs|NSG" \
+        "${RT_CACHE}|Routes" \
+        "${IGW_CACHE}|IGW" \
+        "${NAT_CACHE}|NAT" \
+        "${SGW_CACHE}|SGW" \
+        "${DRG_CACHE}|DRG" \
+        "${OS_PE_CACHE}|OS PEs"
     
     # Build gateway indicators for VCN
     local has_igw has_sgw has_nat has_drg has_lpg has_rpc has_rt
@@ -2458,8 +2653,14 @@ display_network_resources() {
         fi
         
         # Subnet line with route table and DNS label
-        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} ${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-            "$name" "$cidr" "$access" "$dns_display" "$rt_display" "$ocid"
+        # OS PE indicator - check if this subnet has a private endpoint
+        local pe_indicator=""
+        if [[ -n "${PE_SUBNET_MAP[$ocid]:-}" ]]; then
+            pe_indicator="OS PE ${GREEN}[X]${NC} "
+        fi
+        
+        printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} %b${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+            "$name" "$cidr" "$access" "$dns_display" "$pe_indicator" "$rt_display" "$ocid"
         
         # Count total items for tree display (SL + NSGs)
         local nsg_list="${nsgs_by_shortname[$shortname]:-}"
@@ -2544,8 +2745,14 @@ display_network_resources() {
                 [[ -n "$sl_names" ]] && sl_display="${sl_names}"
             fi
             
-            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} ${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
-                "$name" "$cidr" "$access" "$dns_display" "$rt_display" "$ocid"
+            # OS PE indicator - check if this subnet has a private endpoint
+            local pe_indicator=""
+            if [[ -n "${PE_SUBNET_MAP[$ocid]:-}" ]]; then
+                pe_indicator="OS PE ${GREEN}[X]${NC} "
+            fi
+            
+            printf "  ${BOLD}${WHITE}Subnet:${NC} ${GREEN}%-30s${NC} ${WHITE}[${CYAN}%-15s${WHITE}]${NC} ${WHITE}[${access_color}%-7s${WHITE}]${NC} ${MAGENTA}%-17s${NC} %b${WHITE}RT:${NC} ${CYAN}%-25s${NC} ${WHITE}(${YELLOW}%s${WHITE})${NC}\n" \
+                "$name" "$cidr" "$access" "$dns_display" "$pe_indicator" "$rt_display" "$ocid"
             
             # Display security lists if any
             if [[ -n "$sl_display" ]]; then
@@ -3026,6 +3233,12 @@ display_oke_environment_header() {
     
     # Bottom border
     echo -e "${BOLD}${BLUE}╚${h_line}╝${NC}"
+    _display_cache_info \
+        "${OKE_ENV_CACHE}|OKE Env" \
+        "${FABRIC_CACHE}|Fabrics" \
+        "${CLUSTER_CACHE}|GPU Clusters" \
+        "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map" \
+        "${COMPUTE_CLUSTER_CACHE}|Compute Clusters"
     echo ""
     
     # Display network resources (subnets and NSGs grouped by shortname)
@@ -3982,6 +4195,10 @@ list_maintenance_events() {
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${CYAN}                                                         INSTANCE MAINTENANCE EVENTS                                                                                    ${NC}"
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${MAINT_EVENTS_CACHE}|Maint Events" \
+        "${FAULT_DETAILS_CACHE}|Fault Details" \
+        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
     echo ""
     echo -e "${GRAY}Region: ${WHITE}$region${NC}  ${GRAY}Compartment: ${WHITE}$(resolve_compartment_name "$compartment_id")${NC} ${GRAY}($compartment_id)${NC}"
     echo -e "${GRAY}Source: oci compute instance-maintenance-event list${NC}  ${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)${NC}"
@@ -4740,27 +4957,27 @@ list_maintenance_events() {
         echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
         echo -e "  ${BOLD}Maintenance Events:${NC}"
         echo -e "    ${YELLOW}#${NC}                      - View event details (e.g., '1', '3')"
-        echo -e "    ${GREEN}resched #${NC}              - Reschedule event (e.g., 'resched 1' or 'resched 1,3,5' or 'resched 1-5' or 'resched all')"
-        echo -e "    ${YELLOW}cordon #${NC}               - Cordon K8s node for event (e.g., 'cordon 1' or 'cordon 1,3,5' or 'cordon all')"
-        echo -e "    ${YELLOW}drain #${NC}                - Drain K8s node for event (e.g., 'drain 1' or 'drain 1,3,5' or 'drain all')"
-        echo -e "    ${YELLOW}cordon-drain #${NC}         - Cordon then drain K8s node (e.g., 'cordon-drain 1' or 'cordon-drain all')"
+        echo -e "    ${YELLOW}resched #${NC}              - Reschedule event (e.g., 'resched 1' or 'resched 1,3,5' or 'resched 1-5' or 'resched all')"
+        echo -e "    ${ORANGE}cordon #${NC}               - Cordon K8s node for event (e.g., 'cordon 1' or 'cordon 1,3,5' or 'cordon all')"
+        echo -e "    ${ORANGE}drain #${NC}                - Drain K8s node for event (e.g., 'drain 1' or 'drain 1,3,5' or 'drain all')"
+        echo -e "    ${ORANGE}cordon-drain #${NC}         - Cordon then drain K8s node (e.g., 'cordon-drain 1' or 'cordon-drain all')"
         echo -e "  ${BOLD}Maintenance Instances:${NC}"
         echo -e "    ${YELLOW}m#${NC}                     - Manage instance (e.g., 'm1' for cordon/drain/uncordon/terminate/details)"
         echo -e "    ${YELLOW}a#${NC}                     - View announcement details (e.g., 'a1')"
-        echo -e "    ${YELLOW}pods m1,m2${NC}             - View pods on nodes (or 'pods all')"
-        echo -e "    ${YELLOW}cordon m1,m2${NC}           - Cordon multiple nodes (or 'drain m1,m2' / 'cordon-drain m1,m2' / 'uncordon m1,m2' / 'terminate m1,m2')"
+        echo -e "    ${CYAN}pods m1,m2${NC}             - View pods on nodes (or 'pods all')"
+        echo -e "    ${ORANGE}cordon m1,m2${NC}           - Cordon multiple nodes (or 'drain m1,m2' / 'cordon-drain m1,m2' / 'uncordon m1,m2' / 'terminate m1,m2')"
         echo -e "  ${BOLD}General:${NC}"
         if [[ "$me_view_mode" == "compact" ]]; then
-            echo -e "    ${WHITE}view${NC}                   - Switch to detail view (fault sub-lines)"
+            echo -e "    ${CYAN}view${NC}                   - Switch to detail view (fault sub-lines)"
         else
-            echo -e "    ${WHITE}view${NC}                   - Switch to compact view (single-line)"
+            echo -e "    ${CYAN}view${NC}                   - Switch to compact view (single-line)"
         fi
-        echo -e "    ${WHITE}named${NC}                  - Show only events with matching instance name"
-        echo -e "    ${WHITE}list${NC}                   - Show announcement details again"
+        echo -e "    ${CYAN}named${NC}                  - Show only events with matching instance name"
+        echo -e "    ${CYAN}list${NC}                   - Show announcement details again"
         echo -e "    ${MAGENTA}r${NC}                      - Force refresh from OCI (invalidate cache)"
         echo -e "    ${CYAN}q${NC}                      - Back"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Maintenance] Selection: ${NC}"
         read -r me_selection
         
         [[ -z "$me_selection" || "$me_selection" == "q" || "$me_selection" == "Q" || "$me_selection" == "back" ]] && break
@@ -5405,10 +5622,10 @@ list_maintenance_events() {
             echo -e "  ${YELLOW}1${NC}) Cordon node"
             echo -e "  ${YELLOW}2${NC}) Drain node"
             echo -e "  ${YELLOW}3${NC}) Uncordon node"
-            echo -e "  ${YELLOW}4${NC}) Terminate instance"
-            echo -e "  ${YELLOW}5${NC}) View instance details"
+            echo -e "  ${RED}4${NC}) Terminate instance"
+            echo -e "  ${CYAN}5${NC}) View instance details"
             echo -e "  ${YELLOW}6${NC}) Cordon & Drain node"
-            echo -e "  ${YELLOW}b${NC}) Back"
+            echo -e "  ${CYAN}b${NC}) Back"
             echo ""
             echo -n -e "${CYAN}Action: ${NC}"
             read -r mi_action
@@ -5961,7 +6178,7 @@ list_maintenance_events() {
             # Quick action from detail view
             if [[ "$d_can_resched" == "true" ]]; then
                 echo ""
-                echo -e "  ${GREEN}resched${NC}) Reschedule this event     ${WHITE}b${NC}) Back"
+                echo -e "  ${YELLOW}resched${NC}) Reschedule this event     ${CYAN}b${NC}) Back"
                 echo ""
                 echo -n -e "${CYAN}Action [resched/b]: ${NC}"
                 read -r detail_action
@@ -5998,12 +6215,18 @@ list_all_announcements() {
         return 1
     fi
     
-    # Display header
-    display_oke_environment_header "$compartment_id" "$region"
+    # Display simple header (no OKE cluster or network details)
+    echo ""
+    echo -e "${BOLD}${WHITE}Environment:${NC}"
+    echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+    echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
+    echo ""
     
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${CYAN}                                         ALL ANNOUNCEMENTS                                                       ${NC}"
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
     echo ""
     
     # Fetch announcements
@@ -6217,9 +6440,9 @@ list_all_announcements() {
     while true; do
         echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
         echo -e "  Enter ${YELLOW}a#${NC} (e.g., a1) to view full announcement details and affected resources"
-        echo -e "  Enter ${YELLOW}q${NC} to quit"
+        echo -e "  Enter ${CYAN}q${NC} to quit"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Announcements] Selection: ${NC}"
         read -r selection
         
         [[ -z "$selection" || "$selection" == "q" || "$selection" == "Q" ]] && break
@@ -6448,9 +6671,11 @@ display_clique_summary() {
     fi
     
     echo -e "${BOLD}${BLUE}=== Summary by GPU Memory Cluster ===${NC}"
+    _display_cache_info \
+        "${CLUSTER_CACHE}|GPU Clusters" \
+        "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map" \
+        "${CAPACITY_TOPOLOGY_CACHE}|Capacity Hosts"
     echo ""
-    
-    local summary_temp
     summary_temp=$(create_temp_file) || { rm -f "$joined_temp"; return 1; }
     
     # Get unique GPU Memory Clusters (field 5)
@@ -7520,9 +7745,13 @@ display_gpu_management_menu() {
     echo -e "  ${CYAN}Availability Domain:${NC} ${WHITE}${availability_domain}${NC}"
     echo -e "  ${CYAN}Compartment:${NC}         ${WHITE}${compartment_name}${NC}"
     echo -e "                       ${YELLOW}${compartment_id}${NC}"
+    _display_cache_info \
+        "${FABRIC_CACHE}|Fabrics" \
+        "${CLUSTER_CACHE}|GPU Clusters" \
+        "${INSTANCE_CONFIG_CACHE}|Instance Configs" \
+        "${COMPUTE_CLUSTER_CACHE}|Compute Clusters" \
+        "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map"
     echo ""
-    
-    # ========== GPU MEMORY FABRICS WITH LINKED CLUSTERS ==========
     echo -e "${BOLD}${ORANGE}═══ GPU Memory Fabrics & Clusters ═══${NC}"
     echo ""
     
@@ -7732,39 +7961,43 @@ interactive_management_main_menu() {
         
         echo -e "${BOLD}${WHITE}═══ Select a Resource to Manage ═══${NC}"
         echo ""
+        echo -e "${BOLD}${BLUE}─── Overview ───${NC}"
+        echo -e "  ${YELLOW}o${NC})  ${WHITE}Environment Overview${NC}           - Full environment view (same as running script without options)"
+        echo ""
         echo -e "${BOLD}${BLUE}─── Kubernetes ───${NC}"
-        echo -e "  ${GREEN}1${NC})  ${WHITE}OKE Cluster Environment${NC}       - View OKE cluster details, VCN, and compute cluster"
-        echo -e "  ${GREEN}2${NC})  ${WHITE}NVIDIA GPU Stack Health${NC}       - Check GPU Operator & DRA components per node"
+        echo -e "  ${YELLOW}1${NC})  ${WHITE}OKE Cluster Environment${NC}       - View OKE cluster details, VCN, and compute cluster"
+        echo -e "  ${YELLOW}2${NC})  ${WHITE}NVIDIA GPU Stack Health${NC}       - Check GPU Operator & DRA components per node"
+        echo -e "  ${YELLOW}3${NC})  ${WHITE}Kubernetes Management${NC}         - Node deregister, kubelet troubleshooting"
         echo ""
         echo -e "${BOLD}${BLUE}─── Networking ───${NC}"
-        echo -e "  ${GREEN}3${NC})  ${WHITE}Network Resources${NC}             - View subnets and NSGs grouped by function"
+        echo -e "  ${YELLOW}4${NC})  ${WHITE}Network Resources${NC}             - View subnets and NSGs grouped by function"
         echo ""
         echo -e "${BOLD}${BLUE}─── Compute & GPU ───${NC}"
-        echo -e "  ${GREEN}4${NC})  ${WHITE}GPU Memory Fabrics & Clusters${NC} - Manage GPU memory fabrics and clusters"
-        echo -e "  ${GREEN}5${NC})  ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
-        echo -e "  ${GREEN}6${NC})  ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
-        echo -e "  ${GREEN}7${NC})  ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
-        echo -e "  ${GREEN}8${NC})  ${WHITE}GPU Instance Tagging${NC}          - Manage ComputeInstanceHostActions namespace and tags"
-        echo -e "  ${GREEN}9${NC})  ${WHITE}Capacity Topology${NC}             - View host lifecycle states and details summary"
-        echo -e "  ${GREEN}10${NC}) ${WHITE}Custom Images${NC}                 - List, import, create, and export custom images"
+        echo -e "  ${YELLOW}5${NC})  ${WHITE}GPU Memory Fabrics & Clusters${NC} - Manage GPU memory fabrics and clusters"
+        echo -e "  ${YELLOW}6${NC})  ${WHITE}Compute Instances${NC}             - View instance details, IPs, and volumes"
+        echo -e "  ${YELLOW}7${NC})  ${WHITE}Instance Configurations${NC}       - Create, view, compare, and delete instance configs"
+        echo -e "  ${YELLOW}8${NC})  ${WHITE}Compute Clusters${NC}              - Create, view, and delete compute clusters"
+        echo -e "  ${YELLOW}9${NC})  ${WHITE}GPU Instance Tagging${NC}          - Manage ComputeInstanceHostActions namespace and tags"
+        echo -e "  ${YELLOW}10${NC}) ${WHITE}Capacity Topology${NC}             - View host lifecycle states and details summary"
+        echo -e "  ${YELLOW}11${NC}) ${WHITE}Custom Images${NC}                 - List, import, create, and export custom images"
         echo ""
         echo -e "${BOLD}${BLUE}─── Storage ───${NC}"
-        echo -e "  ${GREEN}11${NC}) ${WHITE}File Storage (FSS)${NC}            - Manage file systems, mount targets, and exports"
-        echo -e "  ${GREEN}12${NC}) ${WHITE}Lustre File Systems${NC}           - Manage Lustre file systems and Object Storage links"
-        echo -e "  ${GREEN}13${NC}) ${WHITE}Object Storage${NC}                - Manage buckets, private endpoints, and settings"
+        echo -e "  ${YELLOW}12${NC}) ${WHITE}File Storage (FSS)${NC}            - Manage file systems, mount targets, and exports"
+        echo -e "  ${YELLOW}13${NC}) ${WHITE}Lustre File Systems${NC}           - Manage Lustre file systems and Object Storage links"
+        echo -e "  ${YELLOW}14${NC}) ${WHITE}Object Storage${NC}                - Manage buckets, private endpoints, and settings"
         echo ""
         echo -e "${BOLD}${BLUE}─── Infrastructure ───${NC}"
-        echo -e "  ${GREEN}14${NC}) ${WHITE}Resource Manager Stacks${NC}       - View stacks, jobs, logs, outputs, and state"
-        echo -e "  ${GREEN}15${NC}) ${WHITE}Work Requests${NC}                 - View work requests, status, errors, and logs"
-        echo -e "  ${GREEN}16${NC}) ${WHITE}Compartments${NC}                  - List compartments and create sub-compartments"
-        echo -e "  ${GREEN}17${NC}) ${WHITE}Maintenance${NC}                   - Maintenance instances + maintenance events (view/reschedule)"
-        echo -e "  ${GREEN}18${NC}) ${WHITE}Announcements${NC}                 - Show all announcements with affected resource details"
+        echo -e "  ${YELLOW}15${NC}) ${WHITE}Resource Manager Stacks${NC}       - View stacks, jobs, logs, outputs, and state"
+        echo -e "  ${YELLOW}16${NC}) ${WHITE}Work Requests${NC}                 - View work requests, status, errors, and logs"
+        echo -e "  ${YELLOW}17${NC}) ${WHITE}Compartments${NC}                  - List compartments and create sub-compartments"
+        echo -e "  ${YELLOW}18${NC}) ${WHITE}Maintenance${NC}                   - Maintenance instances + maintenance events (view/reschedule)"
+        echo -e "  ${YELLOW}19${NC}) ${WHITE}Announcements${NC}                 - Show all announcements with affected resource details"
         echo ""
         echo -e "${BOLD}${BLUE}─── Utilities ───${NC}"
         echo -e "  ${CYAN}c${NC})  ${WHITE}Cache Stats${NC}                   - View cache status, age, and refresh options"
         echo -e "  ${RED}q${NC})  ${WHITE}Quit${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-18, c, q]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [o, 1-19, c, q]: ${NC}"
         
         local choice
         read -r choice
@@ -7776,6 +8009,12 @@ interactive_management_main_menu() {
         fi
         
         case "$choice" in
+            o|O|overview)
+                list_all_instances "$compartment_id" "$region"
+                echo ""
+                echo -e "Press Enter to return to menu..."
+                read -r
+                ;;
             1)
                 manage_oke_cluster
                 ;;
@@ -7783,51 +8022,54 @@ interactive_management_main_menu() {
                 manage_nvidia_gpu_stack_health
                 ;;
             3)
-                manage_network_resources
+                manage_kubernetes
                 ;;
             4)
-                interactive_gpu_management
+                manage_network_resources
                 ;;
             5)
-                manage_compute_instances
+                interactive_gpu_management
                 ;;
             6)
-                manage_instance_configurations
+                manage_compute_instances
                 ;;
             7)
-                manage_compute_clusters
+                manage_instance_configurations
                 ;;
             8)
-                manage_gpu_instance_tagging
+                manage_compute_clusters
                 ;;
             9)
-                manage_capacity_topology
+                manage_gpu_instance_tagging
                 ;;
             10)
-                manage_custom_images
+                manage_capacity_topology
                 ;;
             11)
-                manage_file_storage
+                manage_custom_images
                 ;;
             12)
-                manage_lustre_file_systems
+                manage_file_storage
                 ;;
             13)
-                manage_object_storage
+                manage_lustre_file_systems
                 ;;
             14)
-                manage_resource_manager_stacks
+                manage_object_storage
                 ;;
             15)
-                manage_work_requests
+                manage_resource_manager_stacks
                 ;;
             16)
-                manage_compartments
+                manage_work_requests
                 ;;
             17)
-                list_maintenance_events "$compartment_id" "$region"
+                manage_compartments
                 ;;
             18)
+                list_maintenance_events "$compartment_id" "$region"
+                ;;
+            19)
                 list_all_announcements "$compartment_id" "$region"
                 ;;
             c|C|cache|CACHE)
@@ -7839,7 +8081,7 @@ interactive_management_main_menu() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid selection. Please enter 1-18, c, or q.${NC}"
+                echo -e "${RED}Invalid selection. Please enter o, 1-19, c, or q.${NC}"
                 ;;
         esac
     done
@@ -7905,9 +8147,9 @@ display_compartment_selector() {
     echo -e "${BOLD}${WHITE}═══ Compartment Hierarchy (${comp_count} compartments) ═══${NC}"
     echo ""
     
-    # Column headers - combined Name (OCID) format
-    printf "  ${BOLD}%-6s %-10s %-5s %s${NC}\n" "#" "State" "Child" "Name (OCID)"
-    print_separator 140
+    # Column headers - Name and OCID in separate columns
+    printf "  ${BOLD}%-6s %-10s %-5s %-55s %s${NC}\n" "#" "State" "Child" "Name" "OCID"
+    print_separator 160
     
     # Print tenancy as root (not selectable, shown as reference)
     local tenancy_children_count=0
@@ -7915,8 +8157,8 @@ display_compartment_selector() {
         [[ -n "$child" ]] && ((tenancy_children_count++))
     done
     
-    printf "  ${MAGENTA}[T]   ${NC}${GREEN}%-10s${NC} ${CYAN}[%-2s]${NC} ${MAGENTA}┌─ %s${NC} ${YELLOW}(%s)${NC}\n" \
-        "ACTIVE" "$tenancy_children_count" "$tenancy_name (ROOT)" "$tenancy_id"
+    printf "  ${MAGENTA}[T]   ${NC}${GREEN}%-10s${NC} ${CYAN}[%-2s]${NC} ${MAGENTA}%-55s${NC} ${YELLOW}%s${NC}\n" \
+        "ACTIVE" "$tenancy_children_count" "┌─ $tenancy_name (ROOT)" "$tenancy_id"
     
     # Recursive function to print compartment tree with proper indentation
     local display_idx=0
@@ -7969,16 +8211,17 @@ display_compartment_selector() {
             # Current compartment marker - arrow printed separately before number
             local arrow_char="  "
             if [[ "$child_id" == "$current_compartment" ]]; then
-                arrow_char="${BOLD}${CYAN}◄ ${NC}"
+                arrow_char="${BOLD}${CYAN}► ${NC}"
             fi
             
             # Children indicator
             local children_str="[-]"
             [[ $grandchildren_count -gt 0 ]] && children_str="[$grandchildren_count]"
             
-            # Print row: # State Child Name (OCID)
-            printf "${arrow_char}${YELLOW}%-3s${NC}   ${state_color}%-10s${NC} ${CYAN}%-5s${NC} ${prefix}${branch_char} ${WHITE}%s${NC} ${YELLOW}(%s)${NC}\n" \
-                "$display_idx" "$comp_state" "$children_str" "$comp_name" "$child_id"
+            # Print row: # State Child TreeName     OCID (right-aligned)
+            local tree_name="${prefix}${branch_char} ${comp_name}"
+            printf "${arrow_char}${YELLOW}%-3s${NC}   ${state_color}%-10s${NC} ${CYAN}%-5s${NC} ${WHITE}%-55s${NC} ${YELLOW}%s${NC}\n" \
+                "$display_idx" "$comp_state" "$children_str" "${tree_name:0:55}" "$child_id"
             
             # Recursively print children
             if [[ $grandchildren_count -gt 0 ]]; then
@@ -8189,11 +8432,10 @@ manage_compartments() {
         echo ""
         echo -e "  ${YELLOW}#${NC})       Select compartment (view details, add sub-compartment)"
         echo -e "  ${GREEN}c${NC})       Create new compartment (will prompt for parent)"
-        echo -e "  ${GREEN}s${NC})       Switch current working compartment"
-        echo -e "  ${WHITE}r${NC})       Refresh"
-        echo -e "  ${WHITE}b${NC})       Back to main menu"
+        echo -e "  ${MAGENTA}r${NC})       Refresh"
+        echo -e "  ${CYAN}b${NC})       Back to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Compartments] Enter selection: ${NC}"
         
         local selection
         read -r selection
@@ -8210,9 +8452,6 @@ manage_compartments() {
                 ;;
             c|C)
                 create_subcompartment_enhanced "$tenancy_id" COMP_MAP COMP_CHILDREN COMP_IDX $display_idx
-                ;;
-            s|S)
-                switch_compartment_enhanced "$tenancy_id" COMP_MAP COMP_IDX $display_idx
                 ;;
             r|R)
                 continue
@@ -8354,11 +8593,11 @@ compartment_submenu() {
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo ""
         echo -e "  ${GREEN}a${NC}) Add sub-compartment under '${WHITE}$name${NC}'"
-        echo -e "  ${GREEN}s${NC}) Switch to this compartment"
+        echo -e "  ${CYAN}s${NC}) Switch to this compartment"
         echo -e "  ${RED}d${NC}) Delete this compartment"
-        echo -e "  ${WHITE}b${NC}) Back"
+        echo -e "  ${CYAN}b${NC}) Back"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Compartments > ${name}] Enter selection: ${NC}"
         
         local action
         read -r action
@@ -8923,6 +9162,7 @@ display_cache_stats() {
     
     echo ""
     echo -e "${BOLD}${WHITE}=== Compute Resources ===${NC}"
+    _get_cache_status_line "$INSTANCE_LIST_CACHE" "Instance List" 300
     _get_cache_status_line "$INSTANCE_CONFIG_CACHE" "Instance Configurations" 3600
     _get_cache_status_line "$BOOT_VOLUME_CACHE" "Boot Volumes" 3600
     _get_cache_status_line "$IMAGE_CACHE" "Images" 3600
@@ -8947,6 +9187,13 @@ display_cache_stats() {
     _get_cache_status_line "$SL_CACHE" "Security Lists" 3600
     _get_dir_cache_status_line "$NSG_RULES_DETAIL_DIR" "NSG Rules Detail" 3600
     _get_dir_cache_status_line "$XR_CACHE_DIR" "Cross-Region DRG Map" 180
+    _get_cache_status_line "$OS_PE_CACHE" "OS Private Endpoints" 3600
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}=== Storage ===${NC}"
+    _get_cache_status_line "$FSS_FS_CACHE" "FSS File Systems" 600
+    _get_cache_status_line "$FSS_MT_CACHE" "FSS Mount Targets" 600
+    _get_cache_status_line "$FSS_EXPORT_CACHE" "FSS Exports" 600
     
     echo ""
     echo -e "${BOLD}${WHITE}=== Other ===${NC}"
@@ -8978,10 +9225,11 @@ display_cache_stats() {
     echo -e "  ${YELLOW}2${NC} - Clear Compute caches (instances, boot volumes, images)"
     echo -e "  ${YELLOW}3${NC} - Clear Network caches"
     echo -e "  ${YELLOW}4${NC} - Clear OKE caches"
+    echo -e "  ${YELLOW}5${NC} - Clear Storage caches (FSS)"
     echo -e "  ${RED}a${NC} - Clear ALL caches"
     echo -e "  ${CYAN}Enter${NC} - Return to menu"
     echo ""
-    echo -n -e "${CYAN}Action [1-4/a/Enter]: ${NC}"
+    echo -n -e "${CYAN}Action [1-5/a/Enter]: ${NC}"
     
     local action
     read -r action
@@ -8996,7 +9244,7 @@ display_cache_stats() {
             ;;
         2)
             echo -e "${YELLOW}Clearing Compute caches...${NC}"
-            rm -f "$INSTANCE_CONFIG_CACHE" "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE" "$CAPACITY_TOPOLOGY_CACHE"
+            rm -f "$INSTANCE_LIST_CACHE" "$INSTANCE_CONFIG_CACHE" "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE" "$CAPACITY_TOPOLOGY_CACHE"
             echo -e "${GREEN}✓ Compute caches cleared${NC}"
             sleep 1
             display_cache_stats
@@ -9004,7 +9252,7 @@ display_cache_stats() {
         3)
             echo -e "${YELLOW}Clearing Network caches...${NC}"
             rm -f "$NETWORK_RESOURCES_CACHE" "$IGW_CACHE" "$SGW_CACHE" "$NAT_CACHE" "$DRG_CACHE" \
-                  "$LPG_CACHE" "$RPC_CACHE" "$RT_CACHE" "$NSG_RULES_CACHE" "$SL_CACHE"
+                  "$LPG_CACHE" "$RPC_CACHE" "$RT_CACHE" "$NSG_RULES_CACHE" "$SL_CACHE" "$OS_PE_CACHE"
             rm -rf "$NSG_RULES_DETAIL_DIR" 2>/dev/null
             echo -e "${GREEN}✓ Network caches cleared${NC}"
             sleep 1
@@ -9014,6 +9262,13 @@ display_cache_stats() {
             echo -e "${YELLOW}Clearing OKE caches...${NC}"
             rm -f "$OKE_ENV_CACHE" "$NODE_STATE_CACHE"
             echo -e "${GREEN}✓ OKE caches cleared${NC}"
+            sleep 1
+            display_cache_stats
+            ;;
+        5)
+            echo -e "${YELLOW}Clearing Storage caches...${NC}"
+            rm -f "$FSS_FS_CACHE" "$FSS_MT_CACHE" "$FSS_EXPORT_CACHE"
+            echo -e "${GREEN}✓ Storage caches cleared${NC}"
             sleep 1
             display_cache_stats
             ;;
@@ -9043,6 +9298,8 @@ manage_oke_cluster() {
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${GREEN}                                                         OKE CLUSTER MANAGEMENT                                                                        ${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${OKE_ENV_CACHE}|OKE Env"
     
     # Fetch/refresh cache
     fetch_oke_environment "$compartment_id" "$region"
@@ -9125,23 +9382,23 @@ manage_oke_cluster() {
     services_cidr=$(echo "$cluster_json" | jq -r '.data.options["kubernetes-network-config"]["services-cidr"] // "N/A"')
     cni_type=$(echo "$cluster_json" | jq -r '.data["cluster-pod-network-options"][0]["cni-type"] // "N/A"')
     
-    # Resolve VCN name
+    # Resolve VCN name (from OKE env cache)
     local vcn_name="N/A"
     if [[ "$vcn_id" != "N/A" && -n "$vcn_id" ]]; then
-        vcn_name=$(oci network vcn get --vcn-id "$vcn_id" --query 'data."display-name"' --raw-output 2>/dev/null) || vcn_name="N/A"
+        vcn_name=$(get_oke_env_value "VCN_NAME")
+        # Fallback to API if not in cache
+        if [[ -z "$vcn_name" || "$vcn_name" == "N/A" ]]; then
+            vcn_name=$(oci network vcn get --vcn-id "$vcn_id" --query 'data."display-name"' --raw-output 2>/dev/null) || vcn_name="N/A"
+        fi
     fi
     
-    # Resolve Endpoint Subnet name
-    local endpoint_subnet_name="N/A"
-    if [[ "$endpoint_subnet_id" != "N/A" && -n "$endpoint_subnet_id" ]]; then
-        endpoint_subnet_name=$(oci network subnet get --subnet-id "$endpoint_subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || endpoint_subnet_name="N/A"
-    fi
+    # Resolve Endpoint Subnet name (from network resources cache, fallback to API)
+    local endpoint_subnet_name
+    endpoint_subnet_name=$(resolve_subnet_name_cached "$endpoint_subnet_id")
     
-    # Resolve Service LB Subnet name
-    local svc_lb_subnet_name="N/A"
-    if [[ "$svc_lb_subnet_id" != "N/A" && -n "$svc_lb_subnet_id" ]]; then
-        svc_lb_subnet_name=$(oci network subnet get --subnet-id "$svc_lb_subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || svc_lb_subnet_name="N/A"
-    fi
+    # Resolve Service LB Subnet name (from network resources cache, fallback to API)
+    local svc_lb_subnet_name
+    svc_lb_subnet_name=$(resolve_subnet_name_cached "$svc_lb_subnet_id")
     
     # Display with names (OCIDs) and drill-down labels
     echo -e "${CYAN}[vcn]${NC}      VCN:                 ${GREEN}$vcn_name${NC} ${YELLOW}($vcn_id)${NC}"
@@ -9278,41 +9535,61 @@ manage_oke_cluster() {
     local nodepools_json
     nodepools_json=$(oci ce node-pool list --compartment-id "$compartment_id" --cluster-id "$cluster_ocid" --output json 2>/dev/null)
     
+    # Build node pool map for selection (global)
+    declare -gA NP_MAP      # idx -> node_pool_ocid
+    declare -gA NP_NAME_MAP  # idx -> node_pool_name
+    NP_MAP=()
+    NP_NAME_MAP=()
+    local np_idx=0
+    
     if [[ -n "$nodepools_json" ]] && echo "$nodepools_json" | jq -e '.data' >/dev/null 2>&1; then
         local nodepool_count
         nodepool_count=$(echo "$nodepools_json" | jq '(.data // []) | length')
         
         if [[ "$nodepool_count" -gt 0 ]]; then
-            printf "${BOLD}%-30s %-12s %-8s %-25s %s${NC}\n" "Node Pool Name" "State" "Size" "Shape" "K8s Version"
-            printf "${WHITE}%-30s %-12s %-8s %-25s %s${NC}\n" "------------------------------" "------------" "--------" "-------------------------" "---------------"
+            printf "${BOLD}%-5s %-30s %-12s %-8s %-25s %s${NC}\n" "#" "Node Pool Name" "State" "Size" "Shape" "K8s Version"
+            printf "${WHITE}%-5s %-30s %-12s %-8s %-25s %s${NC}\n" "-----" "------------------------------" "------------" "--------" "-------------------------" "---------------"
             
-            echo "$nodepools_json" | jq -r '
+            while IFS=$'\t' read -r np_name np_state np_size np_shape np_version np_id; do
+                [[ -z "$np_name" ]] && continue
+                ((np_idx++))
+                NP_MAP[$np_idx]="$np_id"
+                NP_NAME_MAP[$np_idx]="$np_name"
+                
+                local state_color="$GREEN"
+                [[ "$np_state" != "ACTIVE" ]] && state_color="$YELLOW"
+                [[ "$np_state" == "FAILED" || "$np_state" == "DELETED" ]] && state_color="$RED"
+                printf "${YELLOW}%-5s${NC} %-30s ${state_color}%-12s${NC} %-8s %-25s %s\n" "np${np_idx}" "${np_name:0:30}" "$np_state" "$np_size" "${np_shape:0:25}" "$np_version"
+            done < <(echo "$nodepools_json" | jq -r '
                 (.data // [])[] |
                 [
                     (.name // "N/A"),
                     (.["lifecycle-state"] // "N/A"),
                     ((.["node-config-details"]["size"] // .["node-pool-size"]) // "N/A" | tostring),
                     (.["node-shape"] // "N/A"),
-                    (.["kubernetes-version"] // "N/A")
+                    (.["kubernetes-version"] // "N/A"),
+                    (.id // "N/A")
                 ] | @tsv
-            ' 2>/dev/null | while IFS=$'\t' read -r name state size shape version; do
-                local state_color="$GREEN"
-                [[ "$state" != "ACTIVE" ]] && state_color="$YELLOW"
-                [[ "$state" == "FAILED" || "$state" == "DELETED" ]] && state_color="$RED"
-                printf "%-30s ${state_color}%-12s${NC} %-8s %-25s %s\n" "${name:0:30}" "$state" "$size" "${shape:0:25}" "$version"
-            done
+            ' 2>/dev/null)
             
             # Show node pool details with resolved subnet names
             echo ""
             echo -e "${BOLD}${WHITE}── Node Pool Details ──${NC}"
             
             # Process each node pool
-            echo "$nodepools_json" | jq -r '
-                (.data // [])[] |
-                "\(.name // "Unknown")|\(.id // "N/A")|\(((.["node-config-details"]["placement-configs"] // []) | map(.["subnet-id"] // "N/A") | unique | join(",")))"
-            ' 2>/dev/null | while IFS='|' read -r np_name np_id np_subnet_ids; do
+            for i in $(seq 1 $np_idx); do
+                local np_id="${NP_MAP[$i]}"
+                local np_name="${NP_NAME_MAP[$i]}"
+                
+                # Get subnet IDs from nodepools_json
+                local np_subnet_ids
+                np_subnet_ids=$(echo "$nodepools_json" | jq -r --arg npid "$np_id" '
+                    (.data // [])[] | select(.id == $npid) |
+                    ((.["node-config-details"]["placement-configs"] // []) | map(.["subnet-id"] // "N/A") | unique | join(","))
+                ' 2>/dev/null)
+                
                 echo ""
-                echo -e "  ${CYAN}$np_name${NC}"
+                echo -e "  ${YELLOW}[np${i}]${NC} ${CYAN}$np_name${NC}"
                 
                 # Show → Subnet(s) with resolved names
                 if [[ -n "$np_subnet_ids" && "$np_subnet_ids" != "N/A" ]]; then
@@ -9321,14 +9598,14 @@ manage_oke_cluster() {
                         [[ -z "$subnet_id" || "$subnet_id" == "N/A" ]] && continue
                         local subnet_name
                         subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
-                        echo -e "    ${GRAY}→ Subnet:${NC}    ${GREEN}$subnet_name${NC} ${YELLOW}($subnet_id)${NC}"
+                        echo -e "       ${GRAY}→ Subnet:${NC}    ${GREEN}$subnet_name${NC} ${YELLOW}($subnet_id)${NC}"
                     done
                 else
-                    echo -e "    ${GRAY}→ Subnet:${NC}    N/A"
+                    echo -e "       ${GRAY}→ Subnet:${NC}    N/A"
                 fi
                 
                 # Show → Node Pool OCID
-                echo -e "    ${GRAY}→ Node Pool:${NC} ${YELLOW}($np_id)${NC}"
+                echo -e "       ${GRAY}→ Node Pool:${NC} ${YELLOW}($np_id)${NC}"
             done
         else
             echo -e "${YELLOW}No node pools configured${NC}"
@@ -9417,21 +9694,29 @@ manage_oke_cluster() {
     echo -e "  ${CYAN}endpoint${NC}   - View endpoint subnet details (CIDR, route table, security lists)"
     echo -e "  ${CYAN}svc-lb${NC}     - View service LB subnet details (CIDR, route table, security lists)"
     echo ""
+    if [[ $np_idx -gt 0 ]]; then
+        echo -e "  ${BOLD}${WHITE}Node Pools:${NC}"
+        echo -e "  ${YELLOW}np#${NC}        - View node pool instances (e.g., 'np1') → select instance for detail view"
+    fi
+    echo ""
     echo -e "  ${BOLD}${WHITE}Addons:${NC}"
     if [[ $addon_idx -gt 0 ]]; then
-        echo -e "  ${YELLOW}1-${addon_idx}${NC}       - Addon numbers for 'info' command"
+        echo -e "  ${YELLOW}1-${addon_idx}${NC} / ${CYAN}info #${NC} - Show addon details and install instructions (e.g., 'info 3')"
+    else
+        echo -e "  ${CYAN}info #${NC}    - Show addon details and install instructions (e.g., 'info 3')"
     fi
-    echo -e "  ${CYAN}info #${NC}    - Show addon details and install instructions (e.g., 'info 3')"
     echo ""
     echo -e "  ${BOLD}${WHITE}General:${NC}"
-    echo -e "  ${CYAN}refresh${NC}   - Refresh OKE cluster data"
+    echo -e "  ${MAGENTA}r${NC}         - Refresh OKE cluster data"
     echo -e "  ${CYAN}back${NC}      - Return to main menu"
     echo ""
     
     while true; do
         local prompt_range=""
         [[ $addon_idx -gt 0 ]] && prompt_range="1-${addon_idx}, "
-        echo -n -e "${BOLD}${CYAN}Enter # or command [${prompt_range}vcn/endpoint/svc-lb/info/refresh/back]: ${NC}"
+        local np_hint=""
+        [[ $np_idx -gt 0 ]] && np_hint="np#, "
+        echo -n -e "${BOLD}${CYAN}[OKE Cluster] Enter # or command [${np_hint}${prompt_range}vcn/endpoint/svc-lb/info/r/back]: ${NC}"
         local input
         read -r input
         
@@ -9467,6 +9752,121 @@ manage_oke_cluster() {
                 continue
                 ;;
         esac
+        
+        # Node pool instance drill-down: np#
+        if [[ "$input" =~ ^np([0-9]+)$ ]]; then
+            local np_num="${BASH_REMATCH[1]}"
+            if [[ -n "${NP_MAP[$np_num]:-}" ]]; then
+                local sel_np_id="${NP_MAP[$np_num]}"
+                local sel_np_name="${NP_NAME_MAP[$np_num]:-Node Pool}"
+                
+                echo ""
+                echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${BOLD}${CYAN}  Node Pool: ${WHITE}${sel_np_name}${NC}"
+                echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -e "${CYAN}Fetching node pool instances...${NC}"
+                
+                local np_detail_json
+                np_detail_json=$(oci ce node-pool get --node-pool-id "$sel_np_id" --output json 2>/dev/null)
+                
+                if [[ -z "$np_detail_json" ]] || ! echo "$np_detail_json" | jq -e '.data' >/dev/null 2>&1; then
+                    echo -e "${RED}Failed to fetch node pool details${NC}"
+                    continue
+                fi
+                
+                # Extract nodes array
+                local nodes_json
+                nodes_json=$(echo "$np_detail_json" | jq '.data.nodes // []' 2>/dev/null)
+                local node_count
+                node_count=$(echo "$nodes_json" | jq 'length' 2>/dev/null) || node_count=0
+                
+                if [[ "$node_count" -eq 0 ]]; then
+                    echo -e "${YELLOW}No nodes found in this node pool${NC}"
+                    echo ""
+                    echo -e "${GRAY}The node pool may be scaling or nodes haven't been provisioned yet.${NC}"
+                    continue
+                fi
+                
+                # Display node pool summary
+                local np_shape np_size np_k8s
+                np_shape=$(echo "$np_detail_json" | jq -r '.data["node-shape"] // "N/A"')
+                np_size=$(echo "$np_detail_json" | jq -r '.data["node-config-details"]["size"] // .data["node-pool-size"] // "N/A"')
+                np_k8s=$(echo "$np_detail_json" | jq -r '.data["kubernetes-version"] // "N/A"')
+                
+                echo -e "  ${CYAN}Shape:${NC}    ${WHITE}${np_shape}${NC}    ${CYAN}Target Size:${NC} ${WHITE}${np_size}${NC}    ${CYAN}K8s:${NC} ${WHITE}${np_k8s}${NC}"
+                echo -e "  ${CYAN}Nodes:${NC}    ${WHITE}${node_count}${NC}"
+                echo ""
+                
+                printf "${BOLD}%-5s %-35s %-12s %-16s %-20s %s${NC}\n" \
+                    "#" "Instance Name" "State" "Private IP" "Fault Domain" "Availability Domain"
+                printf "${WHITE}%-5s %-35s %-12s %-16s %-20s %s${NC}\n" \
+                    "-----" "-----------------------------------" "------------" "----------------" "--------------------" "--------------------"
+                
+                # Build instance map for selection
+                declare -A NP_INSTANCE_MAP
+                NP_INSTANCE_MAP=()
+                local inst_idx=0
+                
+                while IFS=$'\t' read -r inst_name inst_id inst_state inst_ip inst_fd inst_ad; do
+                    [[ -z "$inst_id" || "$inst_id" == "null" ]] && continue
+                    ((inst_idx++))
+                    NP_INSTANCE_MAP[$inst_idx]="$inst_id"
+                    
+                    local state_color="$GREEN"
+                    case "$inst_state" in
+                        ACTIVE) state_color="$GREEN" ;;
+                        CREATING|UPDATING|ACCEPTED) state_color="$YELLOW" ;;
+                        DELETED|DELETING|FAILED) state_color="$RED" ;;
+                        *) state_color="$GRAY" ;;
+                    esac
+                    
+                    [[ "$inst_ip" == "null" || -z "$inst_ip" ]] && inst_ip="(pending)"
+                    local fd_short="${inst_fd##*-}"
+                    [[ "$inst_fd" == "null" || -z "$inst_fd" ]] && fd_short="N/A"
+                    local ad_short="${inst_ad##*:}"
+                    [[ "$inst_ad" == "null" || -z "$inst_ad" ]] && ad_short="N/A"
+                    local name_trunc="${inst_name:0:33}"
+                    [[ ${#inst_name} -gt 33 ]] && name_trunc="${name_trunc}.."
+                    
+                    printf "${YELLOW}%-5s${NC} %-35s ${state_color}%-12s${NC} %-16s %-20s %s\n" \
+                        "$inst_idx" "$name_trunc" "$inst_state" "$inst_ip" "FD-${fd_short}" "$ad_short"
+                done < <(echo "$nodes_json" | jq -r '.[] | [
+                    (.name // "N/A"),
+                    (.id // ""),
+                    (.["lifecycle-state"] // "UNKNOWN"),
+                    (.["private-ip"] // "null"),
+                    (.["fault-domain"] // "null"),
+                    (.["availability-domain"] // "null")
+                ] | @tsv' 2>/dev/null)
+                
+                echo ""
+                
+                if [[ $inst_idx -eq 0 ]]; then
+                    echo -e "${YELLOW}No instance details available yet${NC}"
+                    continue
+                fi
+                
+                # Instance selection loop
+                while true; do
+                    echo -n -e "${CYAN}Select instance # for detail view (1-${inst_idx}), or Enter to go back: ${NC}"
+                    local inst_input
+                    read -r inst_input
+                    
+                    [[ -z "$inst_input" ]] && break
+                    
+                    if [[ "$inst_input" =~ ^[0-9]+$ ]] && [[ -n "${NP_INSTANCE_MAP[$inst_input]:-}" ]]; then
+                        local sel_instance_id="${NP_INSTANCE_MAP[$inst_input]}"
+                        display_instance_details "$sel_instance_id"
+                    else
+                        echo -e "${RED}Invalid selection: ${inst_input} (valid: 1-${inst_idx})${NC}"
+                    fi
+                done
+            else
+                echo -e "${RED}Invalid node pool number: np${np_num} (valid: np1-np${np_idx})${NC}"
+            fi
+            continue
+        fi
         
         case "$input" in
             [0-9]|[0-9][0-9]|[0-9][0-9][0-9])
@@ -9578,7 +9978,7 @@ manage_oke_cluster() {
                 echo -e "${YELLOW}Addon enable/disable is not available via OCI CLI.${NC}"
                 echo -e "${WHITE}Use 'info #' to see installation instructions for OCI Console or Terraform.${NC}"
                 ;;
-            refresh|REFRESH)
+            r|R|refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing OKE cluster data...${NC}"
                 rm -f "$OKE_ENV_CACHE"
                 manage_oke_cluster
@@ -9588,7 +9988,7 @@ manage_oke_cluster() {
                 return
                 ;;
             *)
-                echo -e "${RED}Unknown command. Enter a number (1-${addon_idx}), 'info #', 'refresh', or 'back'.${NC}"
+                echo -e "${RED}Unknown command. Enter a number (1-${addon_idx}), 'info #', 'r', or 'back'.${NC}"
                 ;;
         esac
     done
@@ -9654,6 +10054,331 @@ resolve_drg_details() {
 }
 
 #--------------------------------------------------------------------------------
+# Port Search - Search all NSGs and Security Lists for rules matching a port
+#--------------------------------------------------------------------------------
+search_port_in_rules() {
+    local search_port="$1"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    local network_compartment_id="${NETWORK_COMPARTMENT_ID:-$compartment_id}"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}                                       PORT SEARCH: ${WHITE}${search_port}${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Auto-fetch NSG rules detail if not cached
+    local vcn_ocid
+    vcn_ocid=$(get_oke_env_value "VCN_OCID" 2>/dev/null)
+    
+    if [[ -z "$vcn_ocid" || "$vcn_ocid" == "N/A" ]]; then
+        echo -e "${YELLOW}Cannot determine VCN OCID - NSG/SL search may be limited${NC}"
+        echo ""
+    else
+        # Ensure network resources are cached (gets NSG names + SLs)
+        if [[ ! -f "$NETWORK_RESOURCES_CACHE" ]] || ! is_cache_fresh "$NETWORK_RESOURCES_CACHE" 2>/dev/null; then
+            echo -e "${GRAY}Fetching network resources...${NC}"
+            local vcn_comp_id
+            vcn_comp_id=$(oci network vcn get --vcn-id "$vcn_ocid" --query 'data."compartment-id"' --raw-output 2>/dev/null)
+            [[ -z "$vcn_comp_id" ]] && vcn_comp_id="$network_compartment_id"
+            fetch_network_resources "$vcn_comp_id" "$vcn_ocid" 2>/dev/null
+            fetch_security_lists "$vcn_comp_id" "$vcn_ocid" 2>/dev/null
+        fi
+        
+        # Ensure NSG rules detail cache is populated
+        if [[ ! -d "$NSG_RULES_DETAIL_DIR" ]] || [[ -z "$(ls -A "$NSG_RULES_DETAIL_DIR" 2>/dev/null)" ]]; then
+            echo -e "${GRAY}Fetching NSG rules (this may take a moment)...${NC}"
+            # Collect all NSG OCIDs from network resources cache
+            local nsg_ids=""
+            if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
+                nsg_ids=$(grep "^NSG|" "$NETWORK_RESOURCES_CACHE" | while IFS='|' read -r type name _ state ocid; do
+                    echo "$ocid"
+                done)
+            fi
+            if [[ -n "$nsg_ids" ]]; then
+                fetch_nsg_rules_detail_parallel "$nsg_ids"
+            fi
+        fi
+        
+        # Ensure security lists are cached
+        if [[ ! -f "$SL_CACHE" ]] || ! is_cache_fresh "$SL_CACHE" 2>/dev/null; then
+            echo -e "${GRAY}Fetching security lists...${NC}"
+            local vcn_comp_id
+            vcn_comp_id=$(oci network vcn get --vcn-id "$vcn_ocid" --query 'data."compartment-id"' --raw-output 2>/dev/null)
+            [[ -z "$vcn_comp_id" ]] && vcn_comp_id="$network_compartment_id"
+            fetch_security_lists "$vcn_comp_id" "$vcn_ocid" 2>/dev/null
+        fi
+    fi
+    
+    local found_count=0
+    
+    # Build NSG name lookup
+    declare -A _PS_NSG_NAMES
+    if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
+        while IFS='|' read -r type name _ state ocid; do
+            [[ "$type" == "NSG" && -n "$ocid" ]] && _PS_NSG_NAMES["$ocid"]="$name"
+        done < "$NETWORK_RESOURCES_CACHE"
+    fi
+    
+    # ========== SEARCH NSGs ==========
+    echo -e "${BOLD}${WHITE}═══ NSG Rules Matching Port ${search_port} ═══${NC}"
+    echo ""
+    
+    local nsg_header_printed=0
+    
+    if [[ -d "$NSG_RULES_DETAIL_DIR" ]]; then
+        for cache_file in "$NSG_RULES_DETAIL_DIR"/*.json; do
+            [[ ! -f "$cache_file" ]] && continue
+            
+            local nsg_short=$(basename "$cache_file" .json)
+            
+            # Find the full NSG OCID and name
+            local nsg_full_id="" nsg_name=""
+            for nid in "${!_PS_NSG_NAMES[@]}"; do
+                if [[ "$nid" == *"$nsg_short" ]]; then
+                    nsg_full_id="$nid"
+                    nsg_name="${_PS_NSG_NAMES[$nid]}"
+                    break
+                fi
+            done
+            [[ -z "$nsg_name" ]] && nsg_name="NSG ...$nsg_short"
+            
+            # Search for matching rules using jq
+            local matching_rules
+            matching_rules=$(jq -r --argjson port "$search_port" '
+                (.rules // [])[] |
+                select(
+                    # ALL protocol matches everything
+                    .protocol == "all" or
+                    # TCP port match
+                    (.protocol == "6" and .["tcp-options"]["destination-port-range"] and
+                        (.["tcp-options"]["destination-port-range"]["min"] <= $port) and
+                        (.["tcp-options"]["destination-port-range"]["max"] >= $port)) or
+                    # TCP source port match
+                    (.protocol == "6" and .["tcp-options"]["source-port-range"] and
+                        (.["tcp-options"]["source-port-range"]["min"] <= $port) and
+                        (.["tcp-options"]["source-port-range"]["max"] >= $port)) or
+                    # UDP port match
+                    (.protocol == "17" and .["udp-options"]["destination-port-range"] and
+                        (.["udp-options"]["destination-port-range"]["min"] <= $port) and
+                        (.["udp-options"]["destination-port-range"]["max"] >= $port)) or
+                    # UDP source port match
+                    (.protocol == "17" and .["udp-options"]["source-port-range"] and
+                        (.["udp-options"]["source-port-range"]["min"] <= $port) and
+                        (.["udp-options"]["source-port-range"]["max"] >= $port)) or
+                    # TCP with no port range = all ports
+                    (.protocol == "6" and (.["tcp-options"]["destination-port-range"] | not) and (.["tcp-options"]["source-port-range"] | not)) or
+                    # UDP with no port range = all ports
+                    (.protocol == "17" and (.["udp-options"]["destination-port-range"] | not) and (.["udp-options"]["source-port-range"] | not))
+                ) |
+                [
+                    .direction,
+                    (if .protocol == "6" then "TCP"
+                     elif .protocol == "17" then "UDP"
+                     elif .protocol == "1" then "ICMP"
+                     elif .protocol == "all" then "ALL"
+                     else .protocol end),
+                    (if .direction == "INGRESS" then (.source // "N/A") else (.destination // "N/A") end),
+                    (if .["tcp-options"]["destination-port-range"] then
+                        (if .["tcp-options"]["destination-port-range"]["min"] == .["tcp-options"]["destination-port-range"]["max"] then
+                            "\(.["tcp-options"]["destination-port-range"]["min"])"
+                        else
+                            "\(.["tcp-options"]["destination-port-range"]["min"])-\(.["tcp-options"]["destination-port-range"]["max"])"
+                        end)
+                     elif .["udp-options"]["destination-port-range"] then
+                        (if .["udp-options"]["destination-port-range"]["min"] == .["udp-options"]["destination-port-range"]["max"] then
+                            "\(.["udp-options"]["destination-port-range"]["min"])"
+                        else
+                            "\(.["udp-options"]["destination-port-range"]["min"])-\(.["udp-options"]["destination-port-range"]["max"])"
+                        end)
+                     else "ALL" end),
+                    (.description // "-"),
+                    (if .protocol == "all" then "ALL-PROTO" else "" end)
+                ] | @tsv
+            ' "$cache_file" 2>/dev/null)
+            
+            if [[ -n "$matching_rules" ]]; then
+                if [[ $nsg_header_printed -eq 0 ]]; then
+                    printf "${BOLD}%-9s | %-8s | %-35s | %-11s | %-10s | %s${NC}\n" \
+                        "Direction" "Protocol" "Source/Destination" "Dst Ports" "Match Type" "Description"
+                    printf "${WHITE}%-9s-+-%-8s-+-%-35s-+-%-11s-+-%-10s-+-%s${NC}\n" \
+                        "---------" "--------" "-----------------------------------" "-----------" "----------" "-------------------------------------------"
+                    nsg_header_printed=1
+                fi
+                
+                echo ""
+                echo -e "  ${BOLD}${CYAN}NSG: ${GREEN}${nsg_name}${NC}"
+                
+                while IFS=$'\t' read -r direction proto src_dst dst_ports desc match_type; do
+                    ((found_count++))
+                    local dir_color="$GREEN"
+                    [[ "$direction" == "EGRESS" ]] && dir_color="$RED"
+                    
+                    local match_label="${CYAN}EXACT${NC}"
+                    if [[ "$proto" == "ALL" || "$match_type" == "ALL-PROTO" ]]; then
+                        match_label="${YELLOW}ALL-PROTO${NC}"
+                    elif [[ "$dst_ports" == "ALL" ]]; then
+                        match_label="${YELLOW}ALL-PORTS${NC}"
+                    fi
+                    
+                    # Resolve NSG OCID to name
+                    if [[ "$src_dst" == ocid1.networksecuritygroup.* ]]; then
+                        local resolved="${_PS_NSG_NAMES[$src_dst]:-}"
+                        [[ -n "$resolved" ]] && src_dst="NSG: $resolved"
+                    fi
+                    
+                    printf "  ${dir_color}%-9s${NC} | ${WHITE}%-8s${NC} | %-35s | %-11s | ${match_label}%-1s${NC} | ${GRAY}%s${NC}\n" \
+                        "$direction" "$proto" "${src_dst:0:35}" "$dst_ports" "" "${desc:0:43}"
+                done <<< "$matching_rules"
+            fi
+        done
+    fi
+    
+    if [[ $nsg_header_printed -eq 0 ]]; then
+        echo -e "  ${GRAY}(No matching NSG rules found)${NC}"
+    fi
+    
+    echo ""
+    
+    # ========== SEARCH SECURITY LISTS ==========
+    echo -e "${BOLD}${WHITE}═══ Security List Rules Matching Port ${search_port} ═══${NC}"
+    echo ""
+    
+    local sl_header_printed=0
+    local sl_found=0
+    
+    if [[ -f "$SL_CACHE" ]]; then
+        while IFS='|' read -r sl_id sl_vcn sl_name sl_state sl_in_count sl_eg_count; do
+            [[ -z "$sl_id" || "$sl_id" =~ ^# ]] && continue
+            [[ "$sl_state" != "AVAILABLE" ]] && continue
+            
+            # Fetch full security list rules
+            local sl_json
+            sl_json=$(oci network security-list get --security-list-id "$sl_id" --output json 2>/dev/null)
+            [[ -z "$sl_json" ]] && continue
+            
+            # Search ingress rules
+            local sl_matching
+            sl_matching=$(echo "$sl_json" | jq -r --argjson port "$search_port" '
+                ((.data["ingress-security-rules"] // [])[] |
+                    select(
+                        .protocol == "all" or
+                        (.protocol == "6" and .["tcp-options"]["destination-port-range"] and
+                            (.["tcp-options"]["destination-port-range"]["min"] <= $port) and
+                            (.["tcp-options"]["destination-port-range"]["max"] >= $port)) or
+                        (.protocol == "17" and .["udp-options"]["destination-port-range"] and
+                            (.["udp-options"]["destination-port-range"]["min"] <= $port) and
+                            (.["udp-options"]["destination-port-range"]["max"] >= $port)) or
+                        (.protocol == "6" and (.["tcp-options"] | not or .["tcp-options"]["destination-port-range"] | not)) or
+                        (.protocol == "17" and (.["udp-options"] | not or .["udp-options"]["destination-port-range"] | not))
+                    ) |
+                    [
+                        "INGRESS",
+                        (if .protocol == "6" then "TCP"
+                         elif .protocol == "17" then "UDP"
+                         elif .protocol == "1" then "ICMP"
+                         elif .protocol == "all" then "ALL"
+                         else .protocol end),
+                        (.source // "N/A"),
+                        (if .["tcp-options"]["destination-port-range"] then
+                            (if .["tcp-options"]["destination-port-range"]["min"] == .["tcp-options"]["destination-port-range"]["max"] then
+                                "\(.["tcp-options"]["destination-port-range"]["min"])"
+                            else
+                                "\(.["tcp-options"]["destination-port-range"]["min"])-\(.["tcp-options"]["destination-port-range"]["max"])"
+                            end)
+                         elif .["udp-options"]["destination-port-range"] then
+                            (if .["udp-options"]["destination-port-range"]["min"] == .["udp-options"]["destination-port-range"]["max"] then
+                                "\(.["udp-options"]["destination-port-range"]["min"])"
+                            else
+                                "\(.["udp-options"]["destination-port-range"]["min"])-\(.["udp-options"]["destination-port-range"]["max"])"
+                            end)
+                         else "ALL" end),
+                        (.description // "-"),
+                        (if .protocol == "all" then "ALL-PROTO" else "" end)
+                    ] | @tsv),
+                ((.data["egress-security-rules"] // [])[] |
+                    select(
+                        .protocol == "all" or
+                        (.protocol == "6" and .["tcp-options"]["destination-port-range"] and
+                            (.["tcp-options"]["destination-port-range"]["min"] <= $port) and
+                            (.["tcp-options"]["destination-port-range"]["max"] >= $port)) or
+                        (.protocol == "17" and .["udp-options"]["destination-port-range"] and
+                            (.["udp-options"]["destination-port-range"]["min"] <= $port) and
+                            (.["udp-options"]["destination-port-range"]["max"] >= $port)) or
+                        (.protocol == "6" and (.["tcp-options"] | not or .["tcp-options"]["destination-port-range"] | not)) or
+                        (.protocol == "17" and (.["udp-options"] | not or .["udp-options"]["destination-port-range"] | not))
+                    ) |
+                    [
+                        "EGRESS",
+                        (if .protocol == "6" then "TCP"
+                         elif .protocol == "17" then "UDP"
+                         elif .protocol == "1" then "ICMP"
+                         elif .protocol == "all" then "ALL"
+                         else .protocol end),
+                        (.destination // "N/A"),
+                        (if .["tcp-options"]["destination-port-range"] then
+                            (if .["tcp-options"]["destination-port-range"]["min"] == .["tcp-options"]["destination-port-range"]["max"] then
+                                "\(.["tcp-options"]["destination-port-range"]["min"])"
+                            else
+                                "\(.["tcp-options"]["destination-port-range"]["min"])-\(.["tcp-options"]["destination-port-range"]["max"])"
+                            end)
+                         elif .["udp-options"]["destination-port-range"] then
+                            (if .["udp-options"]["destination-port-range"]["min"] == .["udp-options"]["destination-port-range"]["max"] then
+                                "\(.["udp-options"]["destination-port-range"]["min"])"
+                            else
+                                "\(.["udp-options"]["destination-port-range"]["min"])-\(.["udp-options"]["destination-port-range"]["max"])"
+                            end)
+                         else "ALL" end),
+                        (.description // "-"),
+                        (if .protocol == "all" then "ALL-PROTO" else "" end)
+                    ] | @tsv)
+            ' 2>/dev/null)
+            
+            if [[ -n "$sl_matching" ]]; then
+                if [[ $sl_header_printed -eq 0 ]]; then
+                    printf "${BOLD}%-9s | %-8s | %-35s | %-11s | %-10s | %s${NC}\n" \
+                        "Direction" "Protocol" "Source/Destination" "Dst Ports" "Match Type" "Description"
+                    printf "${WHITE}%-9s-+-%-8s-+-%-35s-+-%-11s-+-%-10s-+-%s${NC}\n" \
+                        "---------" "--------" "-----------------------------------" "-----------" "----------" "-------------------------------------------"
+                    sl_header_printed=1
+                fi
+                
+                echo ""
+                echo -e "  ${BOLD}${CYAN}SL: ${GREEN}${sl_name}${NC}"
+                
+                while IFS=$'\t' read -r direction proto src_dst dst_ports desc match_type; do
+                    [[ -z "$direction" ]] && continue
+                    ((found_count++))
+                    ((sl_found++))
+                    local dir_color="$GREEN"
+                    [[ "$direction" == "EGRESS" ]] && dir_color="$RED"
+                    
+                    local match_label="${CYAN}EXACT${NC}"
+                    if [[ "$proto" == "ALL" || "$match_type" == "ALL-PROTO" ]]; then
+                        match_label="${YELLOW}ALL-PROTO${NC}"
+                    elif [[ "$dst_ports" == "ALL" ]]; then
+                        match_label="${YELLOW}ALL-PORTS${NC}"
+                    fi
+                    
+                    printf "  ${dir_color}%-9s${NC} | ${WHITE}%-8s${NC} | %-35s | %-11s | ${match_label}%-1s${NC} | ${GRAY}%s${NC}\n" \
+                        "$direction" "$proto" "${src_dst:0:35}" "$dst_ports" "" "${desc:0:43}"
+                done <<< "$sl_matching"
+            fi
+        done < "$SL_CACHE"
+    fi
+    
+    if [[ $sl_header_printed -eq 0 ]]; then
+        echo -e "  ${GRAY}(No matching security list rules found)${NC}"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Summary:${NC} Found ${GREEN}${found_count}${NC} rule(s) matching port ${CYAN}${search_port}${NC}"
+    echo -e "${GRAY}Match types: ${CYAN}EXACT${NC}=port explicitly listed  ${YELLOW}ALL-PORTS${NC}=protocol allows all ports  ${YELLOW}ALL-PROTO${NC}=all traffic allowed${NC}"
+    echo ""
+}
+
+#--------------------------------------------------------------------------------
 # Manage Network Resources - Display subnets and NSGs with numbered selections
 #--------------------------------------------------------------------------------
 manage_network_resources() {
@@ -9683,9 +10408,19 @@ manage_network_resources() {
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${CYAN}                                                       NETWORK RESOURCES MANAGEMENT                                                                     ${NC}"
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${NETWORK_RESOURCES_CACHE}|Subnets|SUBNET" \
+        "${NETWORK_RESOURCES_CACHE}|NSGs|NSG" \
+        "${RT_CACHE}|Routes" \
+        "${NSG_RULES_CACHE}|NSG Rules" \
+        "${SL_CACHE}|Security Lists" \
+        "${IGW_CACHE}|IGW" \
+        "${NAT_CACHE}|NAT" \
+        "${SGW_CACHE}|SGW" \
+        "${DRG_CACHE}|DRG" \
+        "${LPG_CACHE}|LPG" \
+        "${OS_PE_CACHE}|OS PEs"
     echo ""
-    
-    # Check if NETWORK_COMPARTMENT_ID is stored in variables.sh (not just environment)
     local stored_in_file=0
     if [[ -f "$variables_file" ]] && grep -q "^NETWORK_COMPARTMENT_ID=" "$variables_file" 2>/dev/null; then
         stored_in_file=1
@@ -9893,8 +10628,6 @@ manage_network_resources() {
         fi
     fi
     
-    echo -e "${BOLD}${WHITE}═══ Selectable Resources (enter # for details) ═══${NC}"
-    [[ -n "$_cache_age_display" ]] && echo -e "    ${GRAY}Cache: loaded ${_cache_age_display} | TTL: ${CACHE_MAX_AGE}s | Use 'refresh' to reload${NC}"
     echo ""
     
     # 1. VCN
@@ -10192,6 +10925,79 @@ manage_network_resources() {
             echo ""
         done < "$DRG_CACHE"
     fi
+    
+    # ========== OBJECT STORAGE PRIVATE ENDPOINTS ==========
+    echo ""
+    echo -e "  ${BOLD}${WHITE}── Object Storage Private Endpoints ──${NC}"
+    
+    # Fetch and cache OS Private Endpoints (pass both compartments in one call)
+    echo -ne "  ${GRAY}Checking Object Storage Private Endpoints...${NC}"
+    fetch_os_private_endpoints "$compartment_id" "$network_compartment_id"
+    echo -ne "\r                                                                              \r"
+    
+    local os_pe_found=0
+    declare -A SHOWN_PE_NAMES
+    
+    if [[ -f "$OS_PE_CACHE" ]]; then
+        while IFS='|' read -r pe_name pe_namespace pe_state pe_prefix pe_subnet_id pe_private_ip pe_ocid pe_nsg_ids pe_comp pe_time_created; do
+            [[ "$pe_name" =~ ^#.*$ ]] && continue
+            [[ -z "$pe_name" ]] && continue
+            # Deduplicate by name+namespace
+            [[ -n "${SHOWN_PE_NAMES[${pe_name}|${pe_namespace}]:-}" ]] && continue
+            SHOWN_PE_NAMES["${pe_name}|${pe_namespace}"]=1
+            
+            ((os_pe_found++))
+            ((resource_idx++))
+            # Store name|namespace for detail view lookup
+            NET_RESOURCE_MAP[$resource_idx]="OS_PE|${pe_name}|${pe_namespace}"
+            
+            # State coloring
+            local pe_state_color="$GREEN"
+            case "$pe_state" in
+                ACTIVE) pe_state_color="$GREEN" ;;
+                CREATING|UPDATING) pe_state_color="$YELLOW" ;;
+                DELETING|DELETED|FAILED) pe_state_color="$RED" ;;
+                *) pe_state_color="$GRAY" ;;
+            esac
+            
+            # Resolve subnet name
+            local pe_subnet_name="N/A"
+            if [[ -n "$pe_subnet_id" && "$pe_subnet_id" != "N/A" && "$pe_subnet_id" != "null" ]]; then
+                # Try to get from NETWORK_RESOURCES_CACHE first (already fetched)
+                if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
+                    pe_subnet_name=$(grep "^SUBNET|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null | awk -F'|' -v id="$pe_subnet_id" '$6 == id { print $2; exit }')
+                fi
+                # Fallback to OCI API if not in cache
+                if [[ -z "$pe_subnet_name" || "$pe_subnet_name" == "N/A" ]]; then
+                    pe_subnet_name=$(oci network subnet get --subnet-id "$pe_subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null || echo "N/A")
+                fi
+            fi
+            
+            # Count NSGs
+            local nsg_count=0
+            if [[ -n "$pe_nsg_ids" && "$pe_nsg_ids" != "null" ]]; then
+                nsg_count=$(echo "$pe_nsg_ids" | tr ',' '\n' | grep -c '.' 2>/dev/null || echo 0)
+            fi
+            
+            # Prefix display
+            local prefix_display=""
+            [[ -n "$pe_prefix" && "$pe_prefix" != "N/A" && "$pe_prefix" != "null" ]] && prefix_display=" Pfx:${pe_prefix}"
+            
+            # NSG count display
+            local nsg_display=""
+            [[ "$nsg_count" -gt 0 ]] && nsg_display=" [${nsg_count} NSG]"
+            
+            printf "  ${YELLOW}%2d${NC}) ${WHITE}OS-PE:${NC} ${GREEN}%-25s${NC} ${WHITE}[${pe_state_color}%-8s${WHITE}]${NC} ${WHITE}IP:${NC} ${CYAN}%-15s${NC} ${WHITE}Sub:${NC} ${CYAN}%-20s${NC}${MAGENTA}%s${NC}${GRAY}%s${NC}\n" \
+                "$resource_idx" "${pe_name:0:25}" "$pe_state" "$pe_private_ip" "${pe_subnet_name:0:20}" "$prefix_display" "$nsg_display"
+            printf "      ${GRAY}Namespace: ${WHITE}%s${NC}  ${GRAY}OCID: ${YELLOW}%s${NC}\n" "$pe_namespace" "$pe_ocid"
+            
+        done < <(grep -v '^#' "$OS_PE_CACHE" 2>/dev/null)
+    fi
+    
+    if [[ $os_pe_found -eq 0 ]]; then
+        echo -e "  ${GRAY}(No Object Storage Private Endpoints found)${NC}"
+    fi
+    
     local max_idx=$resource_idx
     
     echo ""
@@ -10199,15 +11005,16 @@ manage_network_resources() {
     if [[ $max_idx -gt 0 ]]; then
         echo -e "  ${YELLOW}1-${max_idx}${NC}       - View resource details"
     fi
-    echo -e "  ${GREEN}drg${NC}       - DRG & Connectivity (Remote Peering, FastConnect, VPN)"
-    echo -e "  ${CYAN}refresh${NC}   - Refresh network resources data"
+    echo -e "  ${CYAN}search${NC}    - Search NSGs and Security Lists for a specific port"
+    echo -e "  ${CYAN}drg${NC}       - DRG & Connectivity (Remote Peering, FastConnect, VPN)"
+    echo -e "  ${MAGENTA}r${NC}         - Refresh network resources data"
     echo -e "  ${CYAN}back${NC}      - Return to main menu"
     echo ""
     
     while true; do
         local prompt_range=""
         [[ $max_idx -gt 0 ]] && prompt_range="1-${max_idx}, "
-        echo -n -e "${BOLD}${CYAN}Enter # or command [${prompt_range}drg/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Network Resources] Enter # or command [${prompt_range}search/drg/r/back]: ${NC}"
         local input
         read -r input
         
@@ -10226,12 +11033,27 @@ manage_network_resources() {
             fi
         else
             case "$input" in
+                search|SEARCH|search\ *|SEARCH\ *)
+                    local port_num=""
+                    if [[ "$input" == search\ * || "$input" == SEARCH\ * ]]; then
+                        port_num="${input#* }"
+                    fi
+                    if [[ -z "$port_num" ]]; then
+                        echo -n -e "${CYAN}Enter port number to search for: ${NC}"
+                        read -r port_num
+                    fi
+                    if [[ "$port_num" =~ ^[0-9]+$ ]] && [[ "$port_num" -ge 1 && "$port_num" -le 65535 ]]; then
+                        search_port_in_rules "$port_num"
+                    else
+                        echo -e "${RED}Invalid port number: ${port_num} (valid: 1-65535)${NC}"
+                    fi
+                    ;;
                 drg|DRG|d|D)
                     manage_drg_connectivity "$vcn_ocid" "$vcn_compartment_id" "$network_compartment_id"
                     ;;
-                refresh|REFRESH)
+                r|R|refresh|REFRESH)
                     echo -e "${YELLOW}Refreshing network resources cache...${NC}"
-                    rm -f "$NETWORK_RESOURCES_CACHE" "$RT_CACHE" "$IGW_CACHE" "$NAT_CACHE" "$SGW_CACHE" "$DRG_CACHE" "$LPG_CACHE" "$NSG_RULES_CACHE" "$SL_CACHE"
+                    rm -f "$NETWORK_RESOURCES_CACHE" "$RT_CACHE" "$IGW_CACHE" "$NAT_CACHE" "$SGW_CACHE" "$DRG_CACHE" "$LPG_CACHE" "$NSG_RULES_CACHE" "$SL_CACHE" "$OS_PE_CACHE"
                     rm -rf "$NSG_RULES_DETAIL_DIR"
                     manage_network_resources
                     return
@@ -10240,7 +11062,7 @@ manage_network_resources() {
                     return
                     ;;
                 *)
-                    echo -e "${RED}Unknown command. Enter a number (1-${max_idx}), 'drg', 'refresh', or 'back'.${NC}"
+                    echo -e "${RED}Unknown command. Enter a number (1-${max_idx}), 'drg', 'r', or 'back'.${NC}"
                     ;;
             esac
         fi
@@ -10952,7 +11774,8 @@ xr_cache_age_display() {
             echo -e "  ${GRAY}Cache: ${RED}EXPIRED${NC}"
         fi
     else
-        echo -e "  ${GRAY}Cache: ${YELLOW}EMPTY${NC} ${GRAY}(will be built on first display)${NC}"
+        # Don't show anything when cache is empty
+        :
     fi
 }
 
@@ -12152,6 +12975,8 @@ manage_drg_connectivity() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                         DRG & NETWORK CONNECTIVITY                                               ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        _display_cache_info \
+            "${DRG_CACHE}|DRG Attachments"
         echo ""
         
         # Pre-cache compartment names to avoid "Unknown" throughout
@@ -12379,16 +13204,14 @@ manage_drg_connectivity() {
         echo ""
         echo -e "  ${YELLOW}#${NC})    View DRG details (enter number)"
         echo ""
-        echo -e "  ${GREEN}xr${NC})   Refresh cross-region map (force re-query)"
-        echo -e "  ${GREEN}rc${NC})   Clear cross-region cache"
-        echo -e "  ${GREEN}vm${NC})   View per-DRG connectivity maps (legacy view)"
+        echo -e "  ${CYAN}vm${NC})   View per-DRG connectivity maps (legacy view)"
         echo ""
-        echo -e "  ${WHITE}r${NC})    Refresh DRG list"
-        echo -e "  ${WHITE}b${NC})    Back to network menu"
+        echo -e "  ${MAGENTA}r${NC})    Refresh (re-query cross-region map & clear cache)"
+        echo -e "  ${CYAN}b${NC})    Back to network menu"
         echo ""
         xr_cache_age_display
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Network > DRG] Enter selection: ${NC}"
         read -r selection
         
         case "$selection" in
@@ -12401,29 +13224,17 @@ manage_drg_connectivity() {
                 fi
                 ;;
             xr|XR)
-                if [[ "$total_drgs" -gt 0 ]]; then
-                    local xr_drg_id=""
-                    if [[ "$total_drgs" -eq 1 ]]; then
-                        xr_drg_id="${DRG_MAP[1]}"
-                    else
-                        echo -n -e "${CYAN}Select DRG # for cross-region map (or Enter for first): ${NC}"
-                        read -r xr_sel
-                        if [[ -n "$xr_sel" && -n "${DRG_MAP[$xr_sel]}" ]]; then
-                            xr_drg_id="${DRG_MAP[$xr_sel]}"
-                        else
-                            xr_drg_id="${DRG_MAP[1]}"
-                        fi
-                    fi
-                    display_cross_region_drg_map "$xr_drg_id" "$region" "1" "${SEARCH_COMPARTMENTS[@]}"
-                    echo ""
-                    echo -e "Press Enter to continue..."
-                    read -r
-                else
-                    echo -e "${YELLOW}No DRGs found to map${NC}"
-                    sleep 1
-                fi
+                # Legacy xr command - clear cache and re-display
+                xr_cache_clear
+                continue
+                ;;
+            r|R)
+                # Clear cross-region cache and refresh
+                xr_cache_clear
+                continue
                 ;;
             rc|RC)
+                # Legacy rc command - same as r
                 xr_cache_clear
                 sleep 1
                 ;;
@@ -12443,7 +13254,6 @@ manage_drg_connectivity() {
                     read -r
                 fi
                 ;;
-            r|R) continue ;;
             b|B|back|BACK|"") return ;;
             *)
                 echo -e "${RED}Invalid selection${NC}"
@@ -15668,6 +16478,12 @@ view_network_resource_detail() {
             fi
             ;;
             
+        OS_PE)
+            # resource_ocid = pe_name, extra_info = pe_namespace
+            local pe_ref="${resource_ocid}|${extra_info}"
+            os_view_private_endpoint_details "$pe_ref"
+            ;;
+            
         *)
             echo -e "${RED}Unknown resource type: $resource_type${NC}"
             ;;
@@ -15769,6 +16585,8 @@ manage_compute_instances() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                                         COMPUTE INSTANCE MANAGEMENT                                                                    ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        _display_cache_info \
+            "${INSTANCE_LIST_CACHE}|Instances"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -15776,14 +16594,23 @@ manage_compute_instances() {
         echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
         echo ""
         
-        # Fetch instances
-        log_info "Fetching instances from OCI..."
+        # Fetch instances (with caching - 5 minute TTL)
         local instances_json
-        instances_json=$(oci compute instance list \
-            --compartment-id "$compartment_id" \
-            --region "$region" \
-            --all \
-            --output json 2>/dev/null)
+        local instance_cache_ttl=300
+        if is_cache_fresh "$INSTANCE_LIST_CACHE" "$instance_cache_ttl"; then
+            log_info "Using cached instance list..."
+            instances_json=$(cat "$INSTANCE_LIST_CACHE")
+        else
+            log_info "Fetching instances from OCI..."
+            instances_json=$(oci compute instance list \
+                --compartment-id "$compartment_id" \
+                --region "$region" \
+                --all \
+                --output json 2>/dev/null)
+            if [[ -n "$instances_json" ]] && echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+                echo "$instances_json" > "$INSTANCE_LIST_CACHE"
+            fi
+        fi
         
         if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
             echo -e "${RED}Failed to fetch instances${NC}"
@@ -15935,15 +16762,15 @@ manage_compute_instances() {
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo -e "  ${YELLOW}i#${NC}         - View instance details (e.g., 'i1', 'i5')"
         echo -e "  ${YELLOW}ocid1...${NC}   - View instance by OCID directly"
-        echo -e "  ${CYAN}taint${NC}      - Apply newNode=true:NoSchedule taint (e.g., 'taint i1', 'taint i1,i3', 'taint all')"
-        echo -e "  ${CYAN}untaint${NC}    - Remove newNode=true:NoSchedule taint (e.g., 'untaint i1', 'untaint i1-i5')"
-        echo -e "  ${YELLOW}cordon${NC}     - Cordon K8s node(s) (e.g., 'cordon i1', 'cordon i1,i3')"
-        echo -e "  ${GREEN}uncordon${NC}   - Uncordon K8s node(s) (e.g., 'uncordon i1', 'uncordon all')"
+        echo -e "  ${YELLOW}p${NC}          - View all instances with OCI properties (shape, mem, boot vol, cloud-init)"
+        echo -e "  ${ORANGE}taint${NC}      - Apply newNode=true:NoSchedule taint (e.g., 'taint i1', 'taint i1,i3', 'taint all')"
+        echo -e "  ${ORANGE}untaint${NC}    - Remove newNode=true:NoSchedule taint (e.g., 'untaint i1', 'untaint i1-i5')"
+        echo -e "  ${ORANGE}cordon${NC}     - Cordon K8s node(s) (e.g., 'cordon i1', 'cordon i1,i3')"
+        echo -e "  ${ORANGE}uncordon${NC}   - Uncordon K8s node(s) (e.g., 'uncordon i1', 'uncordon all')"
         echo -e "  ${RED}cdt${NC}        - Cordon → Drain → Tag → Terminate (e.g., 'cdt i1', 'cdt i1-i5', 'cdt all')"
         echo -e "  ${RED}terminate${NC}  - Terminate instances (e.g., 'terminate i1,i3' or 'terminate i1-i5' or 'terminate all')"
-        echo -e "  ${GREEN}p${NC}          - View all instances with OCI properties (shape, mem, boot vol, cloud-init)"
         echo -e "  ${GREEN}bvr${NC}        - Boot Volume Replacement (upgrade OKE nodes without reboot)"
-        echo -e "  ${MAGENTA}refresh${NC}    - Refresh instance list"
+        echo -e "  ${MAGENTA}r${NC}          - Refresh instance list"
         echo -e "  ${CYAN}back${NC}       - Return to main menu"
         echo ""
         echo -e "${GRAY}Tip: From command line, use:${NC}"
@@ -15951,7 +16778,7 @@ manage_compute_instances() {
         echo -e "${GRAY}  $0 <instance-ocid> --details        # Full details (network, volumes)${NC}"
         echo -e "${GRAY}  $0 <instance-ocid> --console-history # Boot logs (debug cloud-init)${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [i#/taint/untaint/cordon/uncordon/cdt/terminate/p/bvr/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Compute Instances] Enter selection [i#/taint/untaint/cordon/uncordon/cdt/terminate/p/bvr/r/back]: ${NC}"
         
         local input
         read -r input
@@ -16662,6 +17489,7 @@ manage_compute_instances() {
             echo -e "  ${GREEN}Success:${NC} ${cdt_success}  ${RED}Failed/Skipped:${NC} ${cdt_fail}  ${WHITE}Total:${NC} ${#CDT_VALID[@]}"
             echo -e "  ${GRAY}Log: ${cdt_log_file}${NC}"
             echo ""
+            rm -f "$INSTANCE_LIST_CACHE"
             echo -e "Press Enter to refresh..."
             read -r
             continue
@@ -16853,6 +17681,7 @@ manage_compute_instances() {
             echo -e "  ${GREEN}Success:${NC} $term_success  ${RED}Failed:${NC} $term_fail  ${WHITE}Total:${NC} ${#term_valid[@]}"
             echo -e "  ${GRAY}Log:${NC} $term_log_file"
             echo ""
+            rm -f "$INSTANCE_LIST_CACHE"
             echo -n -e "${CYAN}Press Enter to refresh instance list...${NC}"
             read -r
             continue
@@ -16865,8 +17694,9 @@ manage_compute_instances() {
             bvr|BVR)
                 compute_boot_volume_replacement
                 ;;
-            refresh|REFRESH)
-                echo -e "${YELLOW}Refreshing...${NC}"
+            r|R|refresh|REFRESH)
+                rm -f "$INSTANCE_LIST_CACHE"
+                echo -e "${YELLOW}Cache cleared, refreshing...${NC}"
                 ;;
             quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
                 return
@@ -17633,12 +18463,13 @@ display_instances_properties_view() {
     local max_parallel=10  # Max parallel API calls
     
     echo ""
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}                                                                                    INSTANCE PROPERTIES VIEW                                                                                                                          ${NC}"
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                                                                                    INSTANCE PROPERTIES VIEW                                                                                          ${NC}"
+    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${BOOT_VOLUME_CACHE}|Boot Volumes" \
+        "${IMAGE_CACHE}|Images"
     echo ""
-    
-    # Check cache freshness (1 hour = 3600 seconds)
     local cache_max_age=3600
     local bv_cache_valid=false
     local img_cache_valid=false
@@ -17913,7 +18744,7 @@ display_instances_properties_view() {
     echo ""
     printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s${NC}\n" \
         "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "LaunchMode" "CreatedBy" "CreatedOn" "CI"
-    print_separator 345
+    print_separator 325
     
     # Display data sorted by name
     sort -t'|' -k1,1 "$tmp_data" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp; do
@@ -17957,47 +18788,40 @@ display_instances_properties_view() {
     rm -f "$tmp_data"
     
     echo ""
-    print_separator 345
-    echo ""
-    echo -e "${BOLD}${WHITE}Column Legend:${NC}"
-    echo -e "  ${WHITE}OCPUs${NC}      - Number of OCPUs (shape-config.ocpus)"
-    echo -e "  ${WHITE}Mem${NC}        - Memory in GB (shape-config.memory-in-gbs)"
-    echo -e "  ${WHITE}GPU${NC}        - Number of GPUs (shape-config.gpus)"
-    echo -e "  ${WHITE}NetBW${NC}      - Network bandwidth in Gbps (shape-config.networking-bandwidth-in-gbps)"
-    echo -e "  ${WHITE}VNIC${NC}       - Max VNIC attachments (shape-config.max-vnic-attachments)"
-    echo -e "  ${WHITE}BV GB${NC}      - Boot Volume size in GB (boot-volume.size-in-gbs)"
-    echo -e "  ${WHITE}VPUs${NC}       - Boot Volume VPUs/GB (boot-volume.vpus-per-gb) [10=Balanced, 20=Higher, 30+=Ultra]"
-    echo -e "  ${WHITE}LaunchMode${NC} - NATIVE, EMULATED, PARAVIRTUALIZED, or CUSTOM (instance.launch-mode)"
-    echo -e "  ${BLUE}CreatedBy${NC}  - Oracle-Tags CreatedBy (defined-tags.Oracle-Tags.CreatedBy)"
-    echo -e "  ${GRAY}CreatedOn${NC}  - Oracle-Tags CreatedOn date (defined-tags.Oracle-Tags.CreatedOn)"
-    echo -e "  ${WHITE}CI${NC}         - Cloud-Init fingerprint (last 7 chars of metadata.user_data)"
-    echo ""
-    echo -e "${GRAY}Instances with matching CI fingerprints have identical cloud-init configurations${NC}"
+    print_separator 325
     echo ""
     
-    # Show cache info
-    echo -e "${BOLD}${WHITE}Cache Info:${NC}"
-    if [[ -f "$BOOT_VOLUME_CACHE" ]]; then
-        local bv_cache_age=$(($(date +%s) - $(stat -c %Y "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)))
-        local bv_cache_count=$(wc -l < "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)
-        echo -e "  ${WHITE}Boot Volumes:${NC} ${bv_cache_count} cached, age: $((bv_cache_age / 60)) min"
-    fi
-    if [[ -f "$IMAGE_CACHE" ]]; then
-        local img_cache_age=$(($(date +%s) - $(stat -c %Y "$IMAGE_CACHE" 2>/dev/null || echo 0)))
-        local img_cache_count=$(wc -l < "$IMAGE_CACHE" 2>/dev/null || echo 0)
-        echo -e "  ${WHITE}Images:${NC}       ${img_cache_count} cached, age: $((img_cache_age / 60)) min"
-    fi
-    echo ""
     echo -e "${BOLD}${WHITE}Options:${NC}"
-    echo -e "  ${MAGENTA}refresh${NC} - Clear cache and re-fetch all data"
+    echo -e "  ${CYAN}legend${NC}  - Show column legend"
+    echo -e "  ${MAGENTA}r${NC}       - Clear cache and re-fetch all data"
     echo -e "  ${CYAN}Enter${NC}   - Return to menu"
     echo ""
-    echo -n -e "${CYAN}Action [refresh/Enter]: ${NC}"
+    echo -n -e "${CYAN}Action [legend/r/Enter]: ${NC}"
     
     local action
     read -r action
     
     case "$action" in
+        legend|LEGEND|l|L)
+            echo ""
+            echo -e "${BOLD}${WHITE}Column Legend:${NC}"
+            echo -e "  ${WHITE}OCPUs${NC}      - Number of OCPUs (shape-config.ocpus)"
+            echo -e "  ${WHITE}Mem${NC}        - Memory in GB (shape-config.memory-in-gbs)"
+            echo -e "  ${WHITE}GPU${NC}        - Number of GPUs (shape-config.gpus)"
+            echo -e "  ${WHITE}NetBW${NC}      - Network bandwidth in Gbps (shape-config.networking-bandwidth-in-gbps)"
+            echo -e "  ${WHITE}VNIC${NC}       - Max VNIC attachments (shape-config.max-vnic-attachments)"
+            echo -e "  ${WHITE}BV GB${NC}      - Boot Volume size in GB (boot-volume.size-in-gbs)"
+            echo -e "  ${WHITE}VPUs${NC}       - Boot Volume VPUs/GB (boot-volume.vpus-per-gb) [10=Balanced, 20=Higher, 30+=Ultra]"
+            echo -e "  ${WHITE}LaunchMode${NC} - NATIVE, EMULATED, PARAVIRTUALIZED, or CUSTOM (instance.launch-mode)"
+            echo -e "  ${BLUE}CreatedBy${NC}  - Oracle-Tags CreatedBy (defined-tags.Oracle-Tags.CreatedBy)"
+            echo -e "  ${GRAY}CreatedOn${NC}  - Oracle-Tags CreatedOn date (defined-tags.Oracle-Tags.CreatedOn)"
+            echo -e "  ${WHITE}CI${NC}         - Cloud-Init fingerprint (last 7 chars of metadata.user_data)"
+            echo ""
+            echo -e "${GRAY}Instances with matching CI fingerprints have identical cloud-init configurations${NC}"
+            echo ""
+            echo -e "Press Enter to return..."
+            read -r
+            ;;
         refresh|REFRESH|r|R)
             echo -e "${YELLOW}Clearing cache...${NC}"
             rm -f "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE"
@@ -18039,10 +18863,10 @@ instance_actions_menu() {
         echo -e "  K8s Node: ${YELLOW}Not in cluster${NC}"
     fi
     echo ""
-    echo -e "  ${YELLOW}1${NC}) ${WHITE}Reboot Instance${NC}        - Graceful reboot (ACPI shutdown + start)"
-    echo -e "  ${YELLOW}2${NC}) ${WHITE}Force Reboot Instance${NC}  - Hard reset (immediate power cycle)"
-    echo -e "  ${YELLOW}3${NC}) ${WHITE}Stop Instance${NC}          - Graceful shutdown"
-    echo -e "  ${YELLOW}4${NC}) ${WHITE}Start Instance${NC}         - Power on (if stopped)"
+    echo -e "  ${RED}1${NC}) ${WHITE}Reboot Instance${NC}        - Graceful reboot (ACPI shutdown + start)"
+    echo -e "  ${RED}2${NC}) ${WHITE}Force Reboot Instance${NC}  - Hard reset (immediate power cycle)"
+    echo -e "  ${RED}3${NC}) ${WHITE}Stop Instance${NC}          - Graceful shutdown"
+    echo -e "  ${GREEN}4${NC}) ${WHITE}Start Instance${NC}         - Power on (if stopped)"
     if [[ -n "$k8s_node_name" ]]; then
         echo -e "  ${YELLOW}6${NC}) ${WHITE}Drain K8s Node${NC}         - Safely evict pods before maintenance"
         echo -e "  ${YELLOW}7${NC}) ${WHITE}Cordon K8s Node${NC}        - Mark node as unschedulable"
@@ -18051,7 +18875,7 @@ instance_actions_menu() {
     fi
     echo -e "  ${RED}5${NC}) ${WHITE}Terminate Instance${NC}     - ${RED}PERMANENTLY DELETE${NC} instance"
     echo ""
-    echo -e "  ${MAGENTA}9${NC}) ${WHITE}View Console History${NC}   - Boot logs (debug cloud-init issues)"
+    echo -e "  ${CYAN}9${NC}) ${WHITE}View Console History${NC}   - Boot logs (debug cloud-init issues)"
     echo ""
     echo -e "  ${CYAN}Enter${NC}) Return to instance list"
     echo ""
@@ -18942,29 +19766,29 @@ display_instance_details() {
         echo -e "${BOLD}${WHITE}─── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
         
         # Line 0: Refresh/view details
-        echo -e "  ${GREEN}r${NC}) Refresh instance details"
+        echo -e "  ${MAGENTA}r${NC}) Refresh instance details"
         
         # Line 1: Cloud-init + Console history
         if [[ "$has_cloud_init" == "true" ]]; then
-            echo -e "  ${MAGENTA}1${NC}) View cloud-init    ${MAGENTA}2${NC}) Save cloud-init    ${MAGENTA}3${NC}) Compare cloud-init    ${YELLOW}4${NC}) Console history"
+            echo -e "  ${CYAN}1${NC}) View cloud-init    ${CYAN}2${NC}) Save cloud-init    ${CYAN}3${NC}) Compare cloud-init    ${CYAN}4${NC}) Console history"
         else
-            echo -e "  ${GRAY}1) View cloud-init    2) Save cloud-init    3) Compare cloud-init${NC}    ${YELLOW}4${NC}) Console history"
+            echo -e "  ${GRAY}1) View cloud-init    2) Save cloud-init    3) Compare cloud-init${NC}    ${CYAN}4${NC}) Console history"
         fi
         
         # Line 2: Instance lifecycle actions
-        echo -e "  ${CYAN}5${NC}) Reboot             ${CYAN}6${NC}) Force reboot       ${CYAN}7${NC}) Stop instance         ${CYAN}8${NC}) Start instance     ${RED}9${NC}) ${RED}TERMINATE${NC}"
+        echo -e "  ${RED}5${NC}) Reboot             ${RED}6${NC}) Force reboot       ${RED}7${NC}) Stop instance         ${GREEN}8${NC}) Start instance     ${RED}9${NC}) ${RED}TERMINATE${NC}"
         
         # Line 3: Unhealthy tagging options
         echo -e "  ${YELLOW}t${NC}) Tag unhealthy (keep running)     ${GREEN}rt${NC}) Remove unhealthy tag     ${RED}x${NC}) ${RED}Tag unhealthy + TERMINATE${NC}"
         
         # Line 4: K8s node actions (only if in K8s)
         if [[ -n "$k8s_node_name" ]]; then
-            echo -e "  ${BLUE}d${NC}) Drain K8s node     ${BLUE}c${NC}) Cordon node        ${BLUE}u${NC}) Uncordon node      ${BLUE}cd${NC}) Cordon & Drain"
+            echo -e "  ${ORANGE}d${NC}) Drain K8s node     ${ORANGE}c${NC}) Cordon node        ${ORANGE}u${NC}) Uncordon node      ${ORANGE}cd${NC}) Cordon & Drain"
             echo -e "  ${GREEN}bvr${NC}) Boot Volume Replacement (upgrade node image/K8s version)"
         fi
         
         echo ""
-        echo -e "  ${WHITE}Enter${NC}) Return to list"
+        echo -e "  ${CYAN}Enter${NC}) Return to list"
         echo ""
         echo -n -e "${CYAN}Select [r/1-9/t/rt/x/d/c/u/cd/bvr/Enter]: ${NC}"
         
@@ -19854,7 +20678,7 @@ capture_console_history() {
         
         echo ""
         echo -e "  ${CYAN}n${NC}) Capture new console history"
-        echo -e "  ${WHITE}b${NC}) Back"
+        echo -e "  ${CYAN}b${NC}) Back"
         echo ""
         echo -n -e "${CYAN}Select existing capture [1-${idx}] or 'n' for new: ${NC}"
         local choice
@@ -20093,12 +20917,15 @@ compare_instance_to_instance() {
     echo ""
     echo -e "${YELLOW}Fetching instance details...${NC}"
     
-    # Get the other instance's user_data
-    local other_ud_b64
-    other_ud_b64=$(oci compute instance get \
+    # Get the other instance's user_data (fetch full JSON, extract with jq)
+    local other_json other_ud_b64
+    other_json=$(oci compute instance get \
         --instance-id "$other_ocid" \
-        --query 'data.metadata.user_data' \
-        --raw-output 2>/dev/null)
+        --output json 2>/dev/null)
+    
+    if [[ -n "$other_json" ]] && echo "$other_json" | jq -e '.data' > /dev/null 2>&1; then
+        other_ud_b64=$(echo "$other_json" | jq -r '.data.metadata.user_data // empty' 2>/dev/null)
+    fi
     
     if [[ -z "$other_ud_b64" || "$other_ud_b64" == "null" ]]; then
         echo -e "${YELLOW}The selected instance has no cloud-init user_data${NC}"
@@ -20229,12 +21056,15 @@ compare_instance_to_config() {
     echo ""
     echo -e "${YELLOW}Fetching instance configuration...${NC}"
     
-    # Get instance config user_data
-    local ic_ud_b64
-    ic_ud_b64=$(oci compute-management instance-configuration get \
+    # Get instance config user_data (fetch full JSON, extract with jq - same as detail view)
+    local ic_json ic_ud_b64
+    ic_json=$(oci compute-management instance-configuration get \
         --instance-configuration-id "$ic_ocid" \
-        --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
-        --raw-output 2>/dev/null)
+        --output json 2>/dev/null)
+    
+    if [[ -n "$ic_json" ]] && echo "$ic_json" | jq -e '.data' > /dev/null 2>&1; then
+        ic_ud_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    fi
     
     if [[ -z "$ic_ud_b64" || "$ic_ud_b64" == "null" ]]; then
         echo -e "${YELLOW}Instance configuration has no user_data${NC}"
@@ -20317,6 +21147,8 @@ manage_instance_configurations() {
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${GREEN}                                                    INSTANCE CONFIGURATION MANAGEMENT                                                                    ${NC}"
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        _display_cache_info \
+            "${INSTANCE_CONFIG_CACHE}|Instance Configs"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -20353,7 +21185,7 @@ manage_instance_configurations() {
                     time_display="${time_display/T/ }"
                 fi
                 
-                printf "${YELLOW}%-5s${NC} ${WHITE}%-55s${NC} ${GRAY}%-20s${NC} ${CYAN}%s${NC}\n" \
+                printf "${YELLOW}%-5s${NC} ${WHITE}%-55s${NC} ${GRAY}%-20s${NC} ${YELLOW}%s${NC}\n" \
                     "$iid" "${ic_name:0:55}" "$time_display" "$ic_ocid"
             done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
         fi
@@ -20368,16 +21200,15 @@ manage_instance_configurations() {
         
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo -e "  ${YELLOW}i#${NC}          - View instance configuration details and user-data (e.g., 'i1', 'i2')"
-        echo -e "  ${GREEN}create${NC}      - Create a new Instance Configuration"
-        echo -e "  ${YELLOW}rename${NC}      - Rename an Instance Configuration (with recommended name)"
-        echo -e "  ${RED}delete${NC}      - Delete Instance Configuration(s) (delete i1, delete i1,i3, delete all)"
-        echo -e "  ${BLUE}update-all${NC}  - Update ALL GPU Memory Clusters with a selected Instance Configuration"
-        echo -e "  ${MAGENTA}compare${NC}     - Compare full configuration between two instance configurations"
-        echo -e "  ${MAGENTA}diff${NC}        - Quick cloud-init diff (config vs config, or config vs local file)"
-        echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
+        echo -e "  ${GREEN}c${NC}           - Create a new Instance Configuration"
+        echo -e "  ${YELLOW}re${NC}          - Rename an Instance Configuration (with recommended name)"
+        echo -e "  ${RED}d${NC}           - Delete Instance Configuration(s) (d i1, d i1,i3, d all)"
+        echo -e "  ${CYAN}comp${NC}        - Compare full configuration between two instance configurations"
+        echo -e "  ${CYAN}diff${NC}        - Quick cloud-init diff (config vs config, or config vs local file)"
+        echo -e "  ${MAGENTA}r${NC}           - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [i#/create/rename/delete [i#|i#,i#|all]/update-all/compare/diff/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Instance Configs] Enter selection [i#/c/re/d/comp/diff/r/back]: ${NC}"
         
         local input
         read -r input
@@ -20388,29 +21219,29 @@ manage_instance_configurations() {
         fi
         
         case "$input" in
-            create|CREATE)
+            c|C|create|CREATE)
                 create_instance_configuration_interactive
                 ;;
-            rename|RENAME)
+            re|RE|rename|RENAME)
                 rename_instance_configuration_interactive
                 ;;
-            delete|DELETE)
+            d|D|delete|DELETE)
                 delete_instance_configuration_interactive
                 ;;
-            delete\ *|DELETE\ *)
+            d\ *|D\ *|delete\ *|DELETE\ *)
                 local delete_args="${input#* }"
                 delete_instance_configuration_interactive "$delete_args"
                 ;;
-            update-all|UPDATE-ALL)
+            ua|UA|update-all|UPDATE-ALL)
                 update_all_clusters_instance_config
                 ;;
-            compare|COMPARE)
+            comp|COMP|compare|COMPARE)
                 compare_instance_configurations
                 ;;
             diff|DIFF)
                 diff_instance_config_cloudinit
                 ;;
-            refresh|REFRESH)
+            r|R|refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
                 rm -f "$INSTANCE_CONFIG_CACHE"
                 ;;
@@ -21250,16 +22081,22 @@ _diff_config_vs_config() {
     echo ""
     echo -e "${YELLOW}Fetching cloud-init from both configurations...${NC}"
     
-    local ud1 ud2
-    ud1=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ocid1" \
-        --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
-        --raw-output 2>/dev/null)
+    # Fetch full JSON first then extract with jq (same method as detail view)
+    local ic_json1 ic_json2 ud1 ud2
     
-    ud2=$(oci compute-management instance-configuration get \
+    ic_json1=$(oci compute-management instance-configuration get \
+        --instance-configuration-id "$ocid1" \
+        --output json 2>/dev/null)
+    if [[ -n "$ic_json1" ]] && echo "$ic_json1" | jq -e '.data' > /dev/null 2>&1; then
+        ud1=$(echo "$ic_json1" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    fi
+    
+    ic_json2=$(oci compute-management instance-configuration get \
         --instance-configuration-id "$ocid2" \
-        --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
-        --raw-output 2>/dev/null)
+        --output json 2>/dev/null)
+    if [[ -n "$ic_json2" ]] && echo "$ic_json2" | jq -e '.data' > /dev/null 2>&1; then
+        ud2=$(echo "$ic_json2" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    fi
     
     # Create temp files
     local tmp1 tmp2
@@ -21336,9 +22173,35 @@ _diff_config_vs_file() {
     IFS='|' read -r ic_ocid ic_name <<< "${DIFF_IC_MAP[$choice]}"
     
     echo ""
-    echo -n -e "${CYAN}Enter path to local cloud-init file: ${NC}"
-    local local_file
-    read -r local_file
+    
+    # Search for cloud-init*.yml files in current directory
+    local ci_files=()
+    local ci_idx=0
+    while IFS= read -r -d '' ci_file; do
+        ((ci_idx++))
+        ci_files[$ci_idx]="$ci_file"
+    done < <(find . -maxdepth 1 \( -name 'cloud-init*.yml' -o -name 'cloud-init*.yaml' \) -print0 2>/dev/null | sort -z)
+    
+    local local_file=""
+    if [[ $ci_idx -gt 0 ]]; then
+        echo -e "${BOLD}${WHITE}Cloud-init files in current directory:${NC}"
+        for fi in $(seq 1 $ci_idx); do
+            printf "  ${YELLOW}%-3s${NC} %s\n" "$fi" "${ci_files[$fi]}"
+        done
+        echo ""
+        echo -n -e "${CYAN}Select file # or enter path manually: ${NC}"
+        local file_choice
+        read -r file_choice
+        
+        if [[ "$file_choice" =~ ^[0-9]+$ ]] && [[ -n "${ci_files[$file_choice]:-}" ]]; then
+            local_file="${ci_files[$file_choice]}"
+        else
+            local_file="$file_choice"
+        fi
+    else
+        echo -n -e "${CYAN}Enter path to local cloud-init file: ${NC}"
+        read -r local_file
+    fi
     
     # Expand ~ to home directory
     local_file="${local_file/#\~/$HOME}"
@@ -21353,11 +22216,16 @@ _diff_config_vs_file() {
     echo ""
     echo -e "${YELLOW}Fetching cloud-init from instance configuration...${NC}"
     
-    local ud_b64
-    ud_b64=$(oci compute-management instance-configuration get \
+    # Fetch full JSON first (same method as instance config detail view)
+    local ic_json
+    ic_json=$(oci compute-management instance-configuration get \
         --instance-configuration-id "$ic_ocid" \
-        --query 'data["instance-details"]["launch-details"]["metadata"]["user_data"]' \
-        --raw-output 2>/dev/null)
+        --output json 2>/dev/null)
+    
+    local ud_b64=""
+    if [[ -n "$ic_json" ]] && echo "$ic_json" | jq -e '.data' > /dev/null 2>&1; then
+        ud_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+    fi
     
     # Create temp file for decoded config cloud-init
     local tmp_config
@@ -21446,12 +22314,12 @@ _display_cloudinit_diff() {
     
     # Interactive post-diff actions
     echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
-    echo -e "  ${YELLOW}view-a${NC}   - View full cloud-init: ${GREEN}$name_a${NC}"
-    echo -e "  ${YELLOW}view-b${NC}   - View full cloud-init: ${BLUE}$name_b${NC}"
-    echo -e "  ${GREEN}save-a${NC}   - Save cloud-init A to file"
-    echo -e "  ${GREEN}save-b${NC}   - Save cloud-init B to file"
+    echo -e "  ${CYAN}view-a${NC}   - View full cloud-init: ${GREEN}$name_a${NC}"
+    echo -e "  ${CYAN}view-b${NC}   - View full cloud-init: ${BLUE}$name_b${NC}"
+    echo -e "  ${CYAN}save-a${NC}   - Save cloud-init A to file"
+    echo -e "  ${CYAN}save-b${NC}   - Save cloud-init B to file"
     echo -e "  ${CYAN}save${NC}     - Save both cloud-init files"
-    echo -e "  ${WHITE}Enter${NC}    - Return"
+    echo -e "  ${CYAN}Enter${NC}    - Return"
     echo ""
     
     while true; do
@@ -21937,11 +22805,11 @@ interactive_gpu_management() {
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo -e "  ${YELLOW}f#/g#/i#/c#${NC} - View resource details (e.g., 'f1', 'g2', 'i3', 'c1')"
         echo -e "  ${GREEN}create${NC}      - Create a new GPU Memory Cluster on a Fabric"
-        echo -e "  ${YELLOW}update${NC}      - Update an existing GPU Memory Cluster (size/instance config)"
-        echo -e "  ${MAGENTA}refresh${NC}     - Refresh data from OCI"
+        echo -e "  ${GREEN}update${NC}      - Update an existing GPU Memory Cluster (size/instance config)"
+        echo -e "  ${MAGENTA}r${NC}           - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter # or command [f#/g#/i#/c#/create/update/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[GPU Fabrics] Enter # or command [f#/g#/i#/c#/create/update/r/back]: ${NC}"
         
         local input
         read -r input
@@ -21958,7 +22826,7 @@ interactive_gpu_management() {
             update|UPDATE)
                 update_gpu_memory_cluster_interactive
                 ;;
-            refresh|REFRESH)
+            r|R|refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
                 rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
                 ;;
@@ -23341,6 +24209,8 @@ manage_compute_clusters() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                         COMPUTE CLUSTER MANAGEMENT                                              ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        _display_cache_info \
+            "${COMPUTE_CLUSTER_CACHE}|Compute Clusters"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -23404,10 +24274,10 @@ manage_compute_clusters() {
             echo -e "  ${RED}d${NC}) ${WHITE}Delete${NC}  - Delete an existing compute cluster"
             echo -e "  ${CYAN}v${NC}) ${WHITE}View${NC}    - View compute cluster details (enter number)"
         fi
-        echo -e "  ${CYAN}r${NC}) ${WHITE}Refresh${NC} - Refresh compute cluster list"
-        echo -e "  ${WHITE}b${NC}) ${WHITE}Back${NC}    - Return to main menu"
+        echo -e "  ${MAGENTA}r${NC}) ${WHITE}Refresh${NC} - Refresh compute cluster list"
+        echo -e "  ${CYAN}b${NC}) ${WHITE}Back${NC}    - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [c/d/v/r/b] or cluster number: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Compute Clusters] Enter selection [c/d/v/r/b] or cluster number: ${NC}"
         
         local choice
         read -r choice
@@ -24130,16 +25000,16 @@ rm_list_stacks_with_jobs() {
         echo -e "  ${YELLOW}s#t${NC}      - View stack state file (e.g., ${YELLOW}s1t${NC})"
         echo -e "  ${YELLOW}j#.#${NC}     - View job details (e.g., ${YELLOW}j1.2${NC})"
         echo -e "  ${YELLOW}j#.#l${NC}    - View job logs (e.g., ${YELLOW}j1.2l${NC})"
-        echo -e "  ${YELLOW}refresh${NC}  - Reload stacks and jobs"
-        echo -e "  ${YELLOW}b${NC}        - Back to Resource Manager menu"
+        echo -e "  ${MAGENTA}r${NC}        - Reload stacks and jobs"
+        echo -e "  ${CYAN}b${NC}        - Back to Resource Manager menu"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Resource Manager] Selection: ${NC}"
         read -r selection
         
         [[ -z "$selection" || "$selection" == "b" || "$selection" == "B" ]] && return 0
         
         # Refresh
-        if [[ "$selection" == "refresh" ]]; then
+        if [[ "$selection" == "r" || "$selection" == "R" || "$selection" == "refresh" ]]; then
             rm_list_stacks_with_jobs "$compartment_id"
             return $?
         fi
@@ -25357,9 +26227,26 @@ rm_list_stack_resources() {
 #--------------------------------------------------------------------------------
 manage_work_requests() {
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local _wr_filter=""
+    local _wr_filter_file="${TEMP_DIR}/.wr_next_filter_$$"
     
-    # Show work requests with interactive selection - this handles all interactions
-    wr_list_work_requests_interactive "$compartment_id"
+    # Loop: re-display with current filter until user exits
+    while true; do
+        # Write current filter to file so the function can update it
+        echo "$_wr_filter" > "$_wr_filter_file"
+        
+        wr_list_work_requests_interactive "$compartment_id" "$_wr_filter" "$_wr_filter_file"
+        local _wr_rc=$?
+        
+        # Check return: 0=back, 2=re-filter (new filter in temp file)
+        if [[ $_wr_rc -eq 2 ]]; then
+            _wr_filter=$(cat "$_wr_filter_file" 2>/dev/null)
+            continue
+        else
+            rm -f "$_wr_filter_file"
+            return 0
+        fi
+    done
 }
 
 #--------------------------------------------------------------------------------
@@ -25368,6 +26255,7 @@ manage_work_requests() {
 wr_list_work_requests_interactive() {
     local compartment_id="$1"
     local status_filter="${2:-}"
+    local filter_file="${3:-}"
     
     echo ""
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -25403,7 +26291,7 @@ wr_list_work_requests_interactive() {
         echo ""
         echo -e "${GRAY}Press Enter to go back...${NC}"
         read -r
-        return 1
+        return 0
     fi
     
     local wr_count
@@ -25418,9 +26306,19 @@ wr_list_work_requests_interactive() {
         echo -e "${YELLOW}No work requests found${NC}"
         [[ -n "$status_filter" ]] && echo -e "${CYAN}Filter: ${WHITE}$status_filter${NC}"
         echo ""
+        if [[ -n "$status_filter" ]]; then
+            echo -e "${GRAY}Press Enter to clear filter, or 'b' to go back...${NC}"
+            local _empty_choice
+            read -r _empty_choice
+            if [[ "$_empty_choice" == "b" || "$_empty_choice" == "B" ]]; then
+                return 0
+            fi
+            [[ -n "$filter_file" ]] && echo "" > "$filter_file"
+            return 2
+        fi
         echo -e "${GRAY}Press Enter to go back...${NC}"
         read -r
-        return 1
+        return 0
     fi
     
     echo -e "${GREEN}Found $wr_count work request(s)${NC}"
@@ -25484,40 +26382,37 @@ wr_list_work_requests_interactive() {
         echo -e "  ${YELLOW}w#e${NC}       - View work request errors (e.g., ${YELLOW}w1e${NC})"
         echo -e "  ${YELLOW}w#l${NC}       - View work request logs (e.g., ${YELLOW}w1l${NC})"
         echo -e "  ${YELLOW}w#r${NC}       - View affected resources (e.g., ${YELLOW}w1r${NC})"
-        echo -e "  ${YELLOW}failed${NC}    - Filter by FAILED status"
-        echo -e "  ${YELLOW}progress${NC}  - Filter by IN_PROGRESS status"
-        echo -e "  ${YELLOW}succeeded${NC} - Filter by SUCCEEDED status"
-        echo -e "  ${YELLOW}all${NC}       - Show all work requests (clear filter)"
-        echo -e "  ${YELLOW}refresh${NC}   - Reload work requests"
-        echo -e "  ${YELLOW}b${NC}         - Back to main menu"
+        echo -e "  ${CYAN}filter${NC}    - Filter by status: ${RED}f${NC}=FAILED  ${YELLOW}p${NC}=IN_PROGRESS  ${GREEN}s${NC}=SUCCEEDED  ${WHITE}a${NC}=ALL"
+        echo -e "  ${MAGENTA}r${NC}         - Reload work requests"
+        echo -e "  ${CYAN}b${NC}         - Back to main menu"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Work Requests] Selection: ${NC}"
         read -r selection
         
         [[ -z "$selection" || "$selection" == "b" || "$selection" == "B" ]] && return 0
         
-        # Refresh
-        if [[ "$selection" == "refresh" ]]; then
-            wr_list_work_requests_interactive "$compartment_id" "$status_filter"
-            return $?
+        # Refresh (with current filter)
+        if [[ "$selection" == "r" || "$selection" == "R" || "$selection" == "refresh" ]]; then
+            [[ -n "$filter_file" ]] && echo "$status_filter" > "$filter_file"
+            return 2
         fi
         
-        # Filter commands
-        if [[ "$selection" == "failed" ]]; then
-            wr_list_work_requests_interactive "$compartment_id" "FAILED"
-            return $?
+        # Filter commands (abbreviations and full names) - always re-query full list with new filter
+        if [[ "$selection" == "f" || "$selection" == "F" || "$selection" == "failed" ]]; then
+            [[ -n "$filter_file" ]] && echo "FAILED" > "$filter_file"
+            return 2
         fi
-        if [[ "$selection" == "progress" ]]; then
-            wr_list_work_requests_interactive "$compartment_id" "IN_PROGRESS"
-            return $?
+        if [[ "$selection" == "p" || "$selection" == "P" || "$selection" == "progress" ]]; then
+            [[ -n "$filter_file" ]] && echo "IN_PROGRESS" > "$filter_file"
+            return 2
         fi
-        if [[ "$selection" == "succeeded" ]]; then
-            wr_list_work_requests_interactive "$compartment_id" "SUCCEEDED"
-            return $?
+        if [[ "$selection" == "s" || "$selection" == "S" || "$selection" == "succeeded" ]]; then
+            [[ -n "$filter_file" ]] && echo "SUCCEEDED" > "$filter_file"
+            return 2
         fi
-        if [[ "$selection" == "all" ]]; then
-            wr_list_work_requests_interactive "$compartment_id" ""
-            return $?
+        if [[ "$selection" == "a" || "$selection" == "A" || "$selection" == "all" ]]; then
+            [[ -n "$filter_file" ]] && echo "" > "$filter_file"
+            return 2
         fi
         
         # Work request details: w#
@@ -26095,6 +26990,93 @@ wr_search_by_resource() {
 #================================================================================
 
 #--------------------------------------------------------------------------------
+# Fetch and cache FSS data (file systems, mount targets, exports)
+# Usage: fetch_fss_data <compartment_id> [force_refresh]
+# Populates: FSS_FS_CACHE, FSS_MT_CACHE, FSS_EXPORT_CACHE
+#--------------------------------------------------------------------------------
+fetch_fss_data() {
+    local compartment_id="$1"
+    local force="${2:-false}"
+    local cache_ttl=600  # 10 minutes
+    
+    # Check if all caches are fresh
+    if [[ "$force" != "true" ]] && \
+       is_cache_fresh "$FSS_FS_CACHE" "$cache_ttl" && \
+       is_cache_fresh "$FSS_MT_CACHE" "$cache_ttl" && \
+       is_cache_fresh "$FSS_EXPORT_CACHE" "$cache_ttl"; then
+        log_info "Using cached FSS data..."
+        return 0
+    fi
+    
+    # Get availability domains
+    local ads
+    ads=$(fss_get_availability_domains "$compartment_id")
+    if [[ -z "$ads" ]]; then
+        echo -e "${RED}Unable to get availability domains${NC}" >&2
+        return 1
+    fi
+    
+    # Fetch file systems across all ADs
+    echo -ne "  ${GRAY}Fetching file systems...${NC}"
+    local all_fs_json="[]"
+    while IFS= read -r ad; do
+        [[ -z "$ad" ]] && continue
+        local fs_json
+        fs_json=$(oci fs file-system list \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --all \
+            --output json 2>/dev/null)
+        if [[ $? -eq 0 ]]; then
+            local fs_data
+            fs_data=$(echo "$fs_json" | jq '.data // []' 2>/dev/null)
+            all_fs_json=$(echo "$all_fs_json" "$fs_data" | jq -s 'add' 2>/dev/null)
+        fi
+    done <<< "$ads"
+    echo "{\"data\":$(echo "$all_fs_json" | jq '.')}" > "$FSS_FS_CACHE"
+    local fs_count
+    fs_count=$(echo "$all_fs_json" | jq 'length' 2>/dev/null) || fs_count=0
+    echo -e "\r  ${GREEN}✓ File systems: ${fs_count} cached${NC}          "
+    
+    # Fetch mount targets across all ADs
+    echo -ne "  ${GRAY}Fetching mount targets...${NC}"
+    local all_mt_json="[]"
+    while IFS= read -r ad; do
+        [[ -z "$ad" ]] && continue
+        local mt_json
+        mt_json=$(oci fs mount-target list \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$ad" \
+            --all \
+            --output json 2>/dev/null)
+        if [[ $? -eq 0 ]]; then
+            local mt_data
+            mt_data=$(echo "$mt_json" | jq '.data // []' 2>/dev/null)
+            all_mt_json=$(echo "$all_mt_json" "$mt_data" | jq -s 'add' 2>/dev/null)
+        fi
+    done <<< "$ads"
+    echo "{\"data\":$(echo "$all_mt_json" | jq '.')}" > "$FSS_MT_CACHE"
+    local mt_count
+    mt_count=$(echo "$all_mt_json" | jq 'length' 2>/dev/null) || mt_count=0
+    echo -e "\r  ${GREEN}✓ Mount targets: ${mt_count} cached${NC}          "
+    
+    # Fetch exports
+    echo -ne "  ${GRAY}Fetching exports...${NC}"
+    local all_export_json
+    all_export_json=$(oci fs export list \
+        --compartment-id "$compartment_id" \
+        --all \
+        --output json 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
+        all_export_json='{"data":[]}'
+    fi
+    echo "$all_export_json" > "$FSS_EXPORT_CACHE"
+    local export_count
+    export_count=$(echo "$all_export_json" | jq '.data | length' 2>/dev/null) || export_count=0
+    echo -e "\r  ${GREEN}✓ Exports: ${export_count} cached${NC}          "
+}
+
+#--------------------------------------------------------------------------------
 # Get availability domains for compartment
 #--------------------------------------------------------------------------------
 fss_get_availability_domains() {
@@ -26109,6 +27091,663 @@ fss_get_availability_domains() {
     fi
     
     echo "$ad_json" | jq -r '.data[].name' 2>/dev/null
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Guided Setup (File System → Mount Target → Export)
+# Creates all three FSS components in sequence with a step-by-step wizard
+#--------------------------------------------------------------------------------
+fss_guided_setup() {
+    local compartment_id="$1"
+    local ad="$2"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
+    
+    echo ""
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                        FSS GUIDED SETUP WIZARD                                    ${NC}"
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}This wizard will guide you through creating:${NC}"
+    echo -e "  ${YELLOW}Step 1/3${NC} - File System"
+    echo -e "  ${YELLOW}Step 2/3${NC} - Mount Target"
+    echo -e "  ${YELLOW}Step 3/3${NC} - Export (links File System to Mount Target)"
+    echo ""
+    echo -e "${GRAY}You can cancel at any step. Previously created resources will remain.${NC}"
+    echo ""
+    echo -n -e "${CYAN}Press Enter to begin (or 'q' to cancel): ${NC}"
+    local start_confirm
+    read -r start_confirm
+    [[ "$start_confirm" == "q" || "$start_confirm" == "Q" ]] && return
+    
+    # ==================== STEP 1: Select Availability Domain ====================
+    echo ""
+    echo -e "${BOLD}${WHITE}─── Select Availability Domain ───${NC}"
+    echo ""
+    
+    local selected_ad="$ad"
+    if [[ -z "$selected_ad" ]]; then
+        echo -e "${CYAN}Available Availability Domains:${NC}"
+        local ads_json
+        ads_json=$(oci iam availability-domain list --compartment-id "$compartment_id" --output json 2>/dev/null)
+        
+        local idx=0
+        declare -A GUIDED_AD_MAP
+        while read -r ad_name; do
+            [[ -z "$ad_name" ]] && continue
+            ((idx++))
+            GUIDED_AD_MAP[$idx]="$ad_name"
+            echo -e "  ${YELLOW}$idx${NC}) $ad_name"
+        done < <(echo "$ads_json" | jq -r '.data[].name' 2>/dev/null)
+        
+        if [[ $idx -eq 0 ]]; then
+            echo -e "${RED}No availability domains found${NC}"
+            return
+        fi
+        
+        echo ""
+        echo -n -e "${CYAN}Select AD # (or 'q' to cancel): ${NC}"
+        local ad_selection
+        read -r ad_selection
+        [[ "$ad_selection" == "q" || "$ad_selection" == "Q" ]] && return
+        
+        selected_ad="${GUIDED_AD_MAP[$ad_selection]}"
+        if [[ -z "$selected_ad" ]]; then
+            echo -e "${RED}Invalid selection${NC}"
+            return
+        fi
+    fi
+    
+    local ad_short="${selected_ad##*:}"
+    echo -e "  ${GREEN}✓${NC} Using AD: ${WHITE}${ad_short}${NC}"
+    
+    # ==================== STEP 1: Create File System ====================
+    echo ""
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${YELLOW}  Step 1/3 │ Create File System                                                   ${NC}"
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    echo -n -e "${CYAN}Enter display name for file system: ${NC}"
+    local fs_name
+    read -r fs_name
+    
+    if [[ -z "$fs_name" ]]; then
+        echo -e "${RED}Display name is required. Wizard cancelled.${NC}"
+        return
+    fi
+    
+    echo ""
+    local fs_create_cmd="oci fs file-system create --compartment-id \"$compartment_id\" --availability-domain \"$selected_ad\" --display-name \"$fs_name\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$fs_create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Create file system '${fs_name}'? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Wizard cancelled at Step 1${NC}"
+        return
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] GUIDED SETUP - CREATE FILE SYSTEM: $fs_create_cmd" >> "$log_file"
+    echo ""
+    echo -e "${CYAN}Creating file system...${NC}"
+    
+    local fs_result
+    fs_result=$(oci fs file-system create \
+        --compartment-id "$compartment_id" \
+        --availability-domain "$selected_ad" \
+        --display-name "$fs_name" \
+        --output json 2>&1)
+    
+    local new_fs_id=""
+    if echo "$fs_result" | jq -e '.data.id' > /dev/null 2>&1; then
+        new_fs_id=$(echo "$fs_result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ File system created: ${WHITE}$fs_name${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${GRAY}$new_fs_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created file system $new_fs_id" >> "$log_file"
+    else
+        echo -e "${RED}✗ Failed to create file system${NC}"
+        echo "$fs_result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $fs_result" >> "$log_file"
+        echo ""
+        echo -e "${RED}Wizard stopped at Step 1. No resources were created.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # ==================== STEP 2: Create Mount Target ====================
+    echo ""
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${YELLOW}  Step 2/3 │ Create Mount Target                                                  ${NC}"
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Option: use existing mount target or create new
+    echo -e "${CYAN}Would you like to create a new mount target or use an existing one?${NC}"
+    echo -e "  ${YELLOW}1${NC}) Create new mount target"
+    echo -e "  ${YELLOW}2${NC}) Use existing mount target"
+    echo -e "  ${CYAN}q${NC}) Cancel (file system already created)"
+    echo ""
+    echo -n -e "${CYAN}Select [1/2/q]: ${NC}"
+    local mt_choice
+    read -r mt_choice
+    
+    local new_mt_id=""
+    local export_set_id=""
+    
+    if [[ "$mt_choice" == "2" ]]; then
+        # Use existing mount target
+        echo ""
+        echo -e "${CYAN}Select an existing mount target:${NC}"
+        FSS_SELECTED_MT=""
+        fss_list_mount_targets "$compartment_id" "$selected_ad" "select"
+        
+        if [[ -z "$FSS_SELECTED_MT" ]]; then
+            echo -e "${YELLOW}No mount target selected. Wizard stopped at Step 2.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+        
+        new_mt_id="$FSS_SELECTED_MT"
+        
+        # Get export set ID from existing mount target
+        local mt_json
+        mt_json=$(oci fs mount-target get --mount-target-id "$new_mt_id" --output json 2>/dev/null)
+        export_set_id=$(echo "$mt_json" | jq -r '.data["export-set-id"]')
+        local mt_display_name
+        mt_display_name=$(echo "$mt_json" | jq -r '.data["display-name"]')
+        echo -e "${GREEN}✓ Using existing mount target: ${WHITE}$mt_display_name${NC}"
+        
+    elif [[ "$mt_choice" == "1" ]]; then
+        # Create new mount target - select subnet
+        echo ""
+        echo -e "${CYAN}Available Subnets:${NC}"
+        local subnets_json
+        subnets_json=$(oci network subnet list --compartment-id "$compartment_id" --all --output json 2>/dev/null)
+        
+        local idx=0
+        declare -A GUIDED_SUBNET_MAP
+        while IFS='|' read -r subnet_name subnet_id cidr; do
+            [[ -z "$subnet_name" ]] && continue
+            ((idx++))
+            GUIDED_SUBNET_MAP[$idx]="$subnet_id"
+            echo -e "  ${YELLOW}$idx${NC}) $subnet_name (${cidr})"
+        done < <(echo "$subnets_json" | jq -r '.data[] | "\(.["display-name"])|\(.id)|\(.["cidr-block"])"' 2>/dev/null)
+        
+        if [[ $idx -eq 0 ]]; then
+            echo -e "${RED}No subnets found. Wizard stopped at Step 2.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+        
+        echo ""
+        echo -n -e "${CYAN}Select subnet #: ${NC}"
+        local subnet_selection
+        read -r subnet_selection
+        local subnet_id="${GUIDED_SUBNET_MAP[$subnet_selection]}"
+        
+        if [[ -z "$subnet_id" ]]; then
+            echo -e "${RED}Invalid selection. Wizard stopped at Step 2.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+        
+        # Suggest mount target name based on file system name
+        local suggested_mt_name="${fs_name}-mt"
+        echo ""
+        echo -n -e "${CYAN}Enter display name for mount target [${suggested_mt_name}]: ${NC}"
+        local mt_name
+        read -r mt_name
+        [[ -z "$mt_name" ]] && mt_name="$suggested_mt_name"
+        
+        echo ""
+        local mt_create_cmd="oci fs mount-target create --compartment-id \"$compartment_id\" --availability-domain \"$selected_ad\" --subnet-id \"$subnet_id\" --display-name \"$mt_name\""
+        echo -e "${GRAY}Command to execute:${NC}"
+        echo -e "${WHITE}$mt_create_cmd${NC}"
+        echo ""
+        
+        echo -n -e "${YELLOW}Create mount target '${mt_name}'? (y/N): ${NC}"
+        read -r confirm
+        
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo -e "${YELLOW}Wizard stopped at Step 2.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+        
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] GUIDED SETUP - CREATE MOUNT TARGET: $mt_create_cmd" >> "$log_file"
+        echo ""
+        echo -e "${CYAN}Creating mount target...${NC}"
+        
+        local mt_result
+        mt_result=$(oci fs mount-target create \
+            --compartment-id "$compartment_id" \
+            --availability-domain "$selected_ad" \
+            --subnet-id "$subnet_id" \
+            --display-name "$mt_name" \
+            --output json 2>&1)
+        
+        if echo "$mt_result" | jq -e '.data.id' > /dev/null 2>&1; then
+            new_mt_id=$(echo "$mt_result" | jq -r '.data.id')
+            export_set_id=$(echo "$mt_result" | jq -r '.data["export-set-id"]')
+            echo -e "${GREEN}✓ Mount target created: ${WHITE}$mt_name${NC}"
+            echo -e "  ${CYAN}OCID:${NC} ${GRAY}$new_mt_id${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created mount target $new_mt_id" >> "$log_file"
+        else
+            echo -e "${RED}✗ Failed to create mount target${NC}"
+            echo "$mt_result"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $mt_result" >> "$log_file"
+            echo ""
+            echo -e "${RED}Wizard stopped at Step 2.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+    else
+        echo -e "${YELLOW}Wizard stopped at Step 2.${NC}"
+        echo -e "${WHITE}Created resources:${NC}"
+        echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # Get export set ID if not already set
+    if [[ -z "$export_set_id" || "$export_set_id" == "null" ]]; then
+        echo -e "${CYAN}Retrieving export set from mount target...${NC}"
+        local mt_detail
+        mt_detail=$(oci fs mount-target get --mount-target-id "$new_mt_id" --output json 2>/dev/null)
+        export_set_id=$(echo "$mt_detail" | jq -r '.data["export-set-id"]')
+        
+        if [[ -z "$export_set_id" || "$export_set_id" == "null" ]]; then
+            echo -e "${RED}Could not retrieve export set ID from mount target${NC}"
+            echo -e "${RED}Wizard stopped at Step 3. Mount target may still be initializing.${NC}"
+            echo -e "${WHITE}Created resources:${NC}"
+            echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+            echo -e "  ${GREEN}✓${NC} Mount Target: ${GRAY}($new_mt_id)${NC}"
+            echo -e "${GRAY}Tip: Wait for the mount target to become ACTIVE, then use 'ce' to create the export manually.${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+    fi
+    
+    # ==================== STEP 3: Create Export ====================
+    echo ""
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${YELLOW}  Step 3/3 │ Create Export                                                        ${NC}"
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Suggest export path based on file system name
+    local suggested_path="/${fs_name}"
+    echo -e "${CYAN}The export path is the NFS mount path clients will use.${NC}"
+    echo ""
+    echo -n -e "${CYAN}Enter export path [${suggested_path}]: ${NC}"
+    local export_path
+    read -r export_path
+    [[ -z "$export_path" ]] && export_path="$suggested_path"
+    
+    # Ensure path starts with /
+    [[ "${export_path:0:1}" != "/" ]] && export_path="/$export_path"
+    
+    echo ""
+    local export_create_cmd="oci fs export create --file-system-id \"$new_fs_id\" --export-set-id \"$export_set_id\" --path \"$export_path\""
+    echo -e "${GRAY}Command to execute:${NC}"
+    echo -e "${WHITE}$export_create_cmd${NC}"
+    echo ""
+    
+    echo -n -e "${YELLOW}Create export '${export_path}'? (y/N): ${NC}"
+    read -r confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}Wizard stopped at Step 3.${NC}"
+        echo -e "${WHITE}Created resources:${NC}"
+        echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+        echo -e "  ${GREEN}✓${NC} Mount Target: ${GRAY}($new_mt_id)${NC}"
+        echo -e "${GRAY}Tip: Use 'ce' to create the export later.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] GUIDED SETUP - CREATE EXPORT: $export_create_cmd" >> "$log_file"
+    echo ""
+    echo -e "${CYAN}Creating export...${NC}"
+    
+    local export_result
+    export_result=$(oci fs export create \
+        --file-system-id "$new_fs_id" \
+        --export-set-id "$export_set_id" \
+        --path "$export_path" \
+        --output json 2>&1)
+    
+    local new_export_id=""
+    if echo "$export_result" | jq -e '.data.id' > /dev/null 2>&1; then
+        new_export_id=$(echo "$export_result" | jq -r '.data.id')
+        echo -e "${GREEN}✓ Export created: ${WHITE}$export_path${NC}"
+        echo -e "  ${CYAN}OCID:${NC} ${GRAY}$new_export_id${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created export $new_export_id" >> "$log_file"
+    else
+        echo -e "${RED}✗ Failed to create export${NC}"
+        echo "$export_result"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $export_result" >> "$log_file"
+        echo ""
+        echo -e "${RED}Wizard stopped at Step 3.${NC}"
+        echo -e "${WHITE}Created resources:${NC}"
+        echo -e "  ${GREEN}✓${NC} File System: ${WHITE}$fs_name${NC} ${GRAY}($new_fs_id)${NC}"
+        echo -e "  ${GREEN}✓${NC} Mount Target: ${GRAY}($new_mt_id)${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    # ==================== SUMMARY ====================
+    echo ""
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                       GUIDED SETUP COMPLETE ✓                                     ${NC}"
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Resources Created:${NC}"
+    echo -e "  ${GREEN}✓${NC} File System:  ${WHITE}$fs_name${NC}"
+    echo -e "                  ${GRAY}$new_fs_id${NC}"
+    echo -e "  ${GREEN}✓${NC} Mount Target: ${GRAY}$new_mt_id${NC}"
+    echo -e "  ${GREEN}✓${NC} Export:       ${WHITE}$export_path${NC}"
+    echo -e "                  ${GRAY}$new_export_id${NC}"
+    echo ""
+    
+    # Resolve mount target IP
+    local mt_detail_json
+    mt_detail_json=$(oci fs mount-target get --mount-target-id "$new_mt_id" --output json 2>/dev/null)
+    local mt_ip_id
+    mt_ip_id=$(echo "$mt_detail_json" | jq -r '.data["private-ip-ids"][0] // empty' 2>/dev/null)
+    local mt_ip="(resolving...)"
+    if [[ -n "$mt_ip_id" ]]; then
+        mt_ip=$(oci network private-ip get --private-ip-id "$mt_ip_id" --query 'data."ip-address"' --raw-output 2>/dev/null) || mt_ip="(pending)"
+    fi
+    
+    echo -e "${BOLD}${WHITE}Mount Command:${NC}"
+    echo -e "  ${CYAN}sudo mount -t nfs -o defaults ${mt_ip}:${export_path} /mnt/${fs_name}${NC}"
+    echo ""
+    echo -e "${GRAY}Note: Ensure NSGs/Security Lists allow NFS traffic (TCP 111, 2048-2050; UDP 111, 2048).${NC}"
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] GUIDED SETUP COMPLETE: FS=$new_fs_id MT=$new_mt_id Export=$new_export_id" >> "$log_file"
+    
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# FSS - Recursive Delete File System
+# Finds and deletes associated exports, optionally the mount target, then the FS
+#--------------------------------------------------------------------------------
+fss_recursive_delete_file_system() {
+    local compartment_id="$1"
+    local fs_id="$2"
+    local log_file="${LOGS_DIR}/fss_actions_$(date +%Y%m%d).log"
+    
+    echo ""
+    echo -e "${BOLD}${RED}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}                     RECURSIVE DELETE FILE SYSTEM                                    ${NC}"
+    echo -e "${BOLD}${RED}══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Get file system details
+    echo -e "${CYAN}Fetching file system details...${NC}"
+    local fs_json
+    fs_json=$(oci fs file-system get --file-system-id "$fs_id" --output json 2>/dev/null)
+    local fs_name
+    fs_name=$(echo "$fs_json" | jq -r '.data["display-name"]' 2>/dev/null)
+    local fs_state
+    fs_state=$(echo "$fs_json" | jq -r '.data["lifecycle-state"]' 2>/dev/null)
+    local fs_metered
+    fs_metered=$(echo "$fs_json" | jq -r '.data["metered-bytes"]' 2>/dev/null)
+    local fs_metered_gb="0"
+    [[ -n "$fs_metered" && "$fs_metered" != "null" ]] && fs_metered_gb=$(echo "scale=2; $fs_metered / 1073741824" | bc 2>/dev/null || echo "0")
+    
+    echo -e "  ${CYAN}File System:${NC} ${WHITE}$fs_name${NC} (${fs_state}) - ${fs_metered_gb} GB"
+    echo -e "  ${GRAY}$fs_id${NC}"
+    echo ""
+    
+    # Find all exports linked to this file system
+    echo -e "${CYAN}Searching for exports linked to this file system...${NC}"
+    local exports_json
+    exports_json=$(oci fs export list --compartment-id "$compartment_id" --file-system-id "$fs_id" --all --output json 2>/dev/null)
+    
+    local export_count
+    export_count=$(echo "$exports_json" | jq '.data | length' 2>/dev/null) || export_count=0
+    
+    # Track export details and mount targets involved
+    declare -a EXPORT_IDS
+    declare -a EXPORT_PATHS
+    declare -a EXPORT_SET_IDS
+    declare -A INVOLVED_MT_IDS  # export_set_id -> mt_id
+    local export_idx=0
+    
+    if [[ "$export_count" -gt 0 ]]; then
+        while IFS='|' read -r exp_id exp_path exp_set_id exp_state; do
+            [[ -z "$exp_id" ]] && continue
+            [[ "$exp_state" == "DELETED" || "$exp_state" == "DELETING" ]] && continue
+            
+            EXPORT_IDS+=("$exp_id")
+            EXPORT_PATHS+=("$exp_path")
+            EXPORT_SET_IDS+=("$exp_set_id")
+            ((export_idx++))
+        done < <(echo "$exports_json" | jq -r '.data[] | "\(.id)|\(.path)|\(.["export-set-id"])|\(.["lifecycle-state"])"' 2>/dev/null)
+    fi
+    
+    # Resolve mount targets for each export set
+    declare -A MT_NAMES
+    declare -A MT_EXPORT_COUNTS  # mt_id -> total export count (not just this FS)
+    
+    for exp_set_id in $(printf '%s\n' "${EXPORT_SET_IDS[@]}" | sort -u); do
+        [[ -z "$exp_set_id" ]] && continue
+        
+        # Find mount target with this export set
+        local mt_list_json
+        mt_list_json=$(cat "$FSS_MT_CACHE" 2>/dev/null)
+        
+        local mt_id mt_name
+        mt_id=$(echo "$mt_list_json" | jq -r --arg esid "$exp_set_id" '.data[] | select(.["export-set-id"] == $esid) | .id' 2>/dev/null)
+        mt_name=$(echo "$mt_list_json" | jq -r --arg esid "$exp_set_id" '.data[] | select(.["export-set-id"] == $esid) | .["display-name"]' 2>/dev/null)
+        
+        if [[ -n "$mt_id" ]]; then
+            INVOLVED_MT_IDS[$exp_set_id]="$mt_id"
+            MT_NAMES[$mt_id]="$mt_name"
+            
+            # Count total exports on this mount target (not just from this FS)
+            local total_exports
+            total_exports=$(oci fs export list --compartment-id "$compartment_id" --export-set-id "$exp_set_id" --all --query 'data[?"lifecycle-state"!=`DELETED`] | length(@)' --raw-output 2>/dev/null) || total_exports=0
+            MT_EXPORT_COUNTS[$mt_id]="$total_exports"
+        fi
+    done
+    
+    # Count exports from THIS file system per mount target
+    declare -A FS_EXPORTS_PER_MT  # mt_id -> count of exports from this FS
+    for i in "${!EXPORT_SET_IDS[@]}"; do
+        local mt_id="${INVOLVED_MT_IDS[${EXPORT_SET_IDS[$i]}]}"
+        if [[ -n "$mt_id" ]]; then
+            FS_EXPORTS_PER_MT[$mt_id]=$(( ${FS_EXPORTS_PER_MT[$mt_id]:-0} + 1 ))
+        fi
+    done
+    
+    # ==================== Display What Will Be Deleted ====================
+    echo ""
+    echo -e "${BOLD}${RED}The following resources will be deleted:${NC}"
+    echo ""
+    
+    # Show exports
+    if [[ $export_idx -gt 0 ]]; then
+        echo -e "  ${RED}Exports (${export_idx}):${NC}"
+        for i in "${!EXPORT_IDS[@]}"; do
+            echo -e "    ${RED}✗${NC} Export: ${WHITE}${EXPORT_PATHS[$i]}${NC}"
+            echo -e "      ${GRAY}${EXPORT_IDS[$i]}${NC}"
+        done
+        echo ""
+    else
+        echo -e "  ${GRAY}No active exports linked to this file system${NC}"
+        echo ""
+    fi
+    
+    # Determine which mount targets can be deleted (all their exports are from this FS)
+    declare -A MT_CAN_DELETE  # mt_id -> true/false
+    local mt_delete_count=0
+    
+    for mt_id in $(printf '%s\n' "${!INVOLVED_MT_IDS[@]}" | while read -r k; do echo "${INVOLVED_MT_IDS[$k]}"; done | sort -u); do
+        [[ -z "$mt_id" ]] && continue
+        
+        local total="${MT_EXPORT_COUNTS[$mt_id]:-0}"
+        local from_this_fs="${FS_EXPORTS_PER_MT[$mt_id]:-0}"
+        local mt_name="${MT_NAMES[$mt_id]}"
+        
+        if [[ "$total" -le "$from_this_fs" ]]; then
+            # Mount target will have no exports after deletion - safe to delete
+            MT_CAN_DELETE[$mt_id]="true"
+            ((mt_delete_count++))
+            echo -e "  ${RED}Mount Target:${NC}"
+            echo -e "    ${RED}✗${NC} ${WHITE}${mt_name}${NC} ${GRAY}(will have 0 exports after delete)${NC}"
+            echo -e "      ${GRAY}${mt_id}${NC}"
+        else
+            MT_CAN_DELETE[$mt_id]="false"
+            local remaining=$((total - from_this_fs))
+            echo -e "  ${YELLOW}Mount Target (kept):${NC}"
+            echo -e "    ${YELLOW}~${NC} ${WHITE}${mt_name}${NC} ${GRAY}(has ${remaining} other export(s) - will NOT be deleted)${NC}"
+            echo -e "      ${GRAY}${mt_id}${NC}"
+        fi
+    done
+    echo ""
+    
+    # Show file system
+    echo -e "  ${RED}File System:${NC}"
+    echo -e "    ${RED}✗${NC} ${WHITE}${fs_name}${NC} (${fs_metered_gb} GB)"
+    echo -e "      ${GRAY}${fs_id}${NC}"
+    echo ""
+    
+    # Summary count
+    local total_deletes=$((export_idx + mt_delete_count + 1))
+    echo -e "${BOLD}${RED}Total resources to delete: ${total_deletes}${NC} (${export_idx} export(s), ${mt_delete_count} mount target(s), 1 file system)"
+    echo ""
+    
+    # ==================== Confirmation ====================
+    echo -e "${RED}This action is ${BOLD}PERMANENT${NC}${RED} and cannot be undone.${NC}"
+    echo ""
+    echo -n -e "${RED}Type 'DELETE ALL' to confirm recursive deletion: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "DELETE ALL" ]]; then
+        echo -e "${YELLOW}Deletion cancelled${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] RECURSIVE DELETE STARTED for file system: $fs_name ($fs_id)" >> "$log_file"
+    
+    # ==================== Phase 1: Delete Exports ====================
+    if [[ $export_idx -gt 0 ]]; then
+        echo -e "${BOLD}${WHITE}Phase 1/3: Deleting exports...${NC}"
+        for i in "${!EXPORT_IDS[@]}"; do
+            local exp_id="${EXPORT_IDS[$i]}"
+            local exp_path="${EXPORT_PATHS[$i]}"
+            local delete_cmd="oci fs export delete --export-id \"$exp_id\" --force"
+            
+            echo -e "  ${CYAN}Deleting export: ${WHITE}$exp_path${NC}"
+            echo -e "  ${GRAY}$delete_cmd${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTING: $delete_cmd" >> "$log_file"
+            
+            local result
+            result=$(oci fs export delete --export-id "$exp_id" --force 2>&1)
+            
+            if [[ $? -eq 0 ]]; then
+                echo -e "  ${GREEN}✓ Export deleted${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted export $exp_id" >> "$log_file"
+            else
+                echo -e "  ${RED}✗ Failed to delete export: $result${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Delete export $exp_id - $result" >> "$log_file"
+            fi
+        done
+        echo ""
+        
+        # Brief wait for export deletions to propagate
+        echo -e "${GRAY}Waiting 5s for export deletions to propagate...${NC}"
+        sleep 5
+    fi
+    
+    # ==================== Phase 2: Delete Mount Targets ====================
+    if [[ $mt_delete_count -gt 0 ]]; then
+        echo -e "${BOLD}${WHITE}Phase 2/3: Deleting mount targets...${NC}"
+        for mt_id in $(printf '%s\n' "${!MT_CAN_DELETE[@]}"); do
+            [[ "${MT_CAN_DELETE[$mt_id]}" != "true" ]] && continue
+            
+            local mt_name="${MT_NAMES[$mt_id]}"
+            local delete_cmd="oci fs mount-target delete --mount-target-id \"$mt_id\" --force"
+            
+            echo -e "  ${CYAN}Deleting mount target: ${WHITE}$mt_name${NC}"
+            echo -e "  ${GRAY}$delete_cmd${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTING: $delete_cmd" >> "$log_file"
+            
+            local result
+            result=$(oci fs mount-target delete --mount-target-id "$mt_id" --force 2>&1)
+            
+            if [[ $? -eq 0 ]]; then
+                echo -e "  ${GREEN}✓ Mount target deleted${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted mount target $mt_id" >> "$log_file"
+            else
+                echo -e "  ${RED}✗ Failed to delete mount target: $result${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Delete mount target $mt_id - $result" >> "$log_file"
+            fi
+        done
+        echo ""
+    else
+        echo -e "${BOLD}${WHITE}Phase 2/3: No mount targets to delete (shared with other exports)${NC}"
+        echo ""
+    fi
+    
+    # ==================== Phase 3: Delete File System ====================
+    echo -e "${BOLD}${WHITE}Phase 3/3: Deleting file system...${NC}"
+    local delete_cmd="oci fs file-system delete --file-system-id \"$fs_id\" --force"
+    echo -e "  ${CYAN}Deleting file system: ${WHITE}$fs_name${NC}"
+    echo -e "  ${GRAY}$delete_cmd${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTING: $delete_cmd" >> "$log_file"
+    
+    local result
+    result=$(oci fs file-system delete --file-system-id "$fs_id" --force 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "  ${GREEN}✓ File system deletion initiated${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Deleted file system $fs_id" >> "$log_file"
+    else
+        echo -e "  ${RED}✗ Failed to delete file system: $result${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Delete file system $fs_id - $result" >> "$log_file"
+    fi
+    
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] RECURSIVE DELETE COMPLETED for: $fs_name ($fs_id)" >> "$log_file"
+    echo -e "${GREEN}Recursive delete complete.${NC}"
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
 }
 
 #--------------------------------------------------------------------------------
@@ -26140,43 +27779,54 @@ manage_file_storage() {
         echo -e "  ${YELLOW}m#${NC}        - View mount target details (e.g., ${YELLOW}m1${NC})"
         echo -e "  ${YELLOW}e#${NC}        - View export details (e.g., ${YELLOW}e1${NC})"
         echo ""
-        echo -e "  ${YELLOW}cf${NC}        - Create file system"
-        echo -e "  ${YELLOW}cm${NC}        - Create mount target"
-        echo -e "  ${YELLOW}ce${NC}        - Create export"
-        echo -e "  ${YELLOW}cs${NC}        - Create snapshot"
+        echo -e "  ${GREEN}setup${NC}     - Guided setup wizard (FS → Mount Target → Export)"
+        echo -e "  ${GREEN}cf${NC}        - Create file system"
+        echo -e "  ${GREEN}cm${NC}        - Create mount target"
+        echo -e "  ${GREEN}ce${NC}        - Create export"
+        echo -e "  ${GREEN}cs${NC}        - Create snapshot"
         echo ""
-        echo -e "  ${YELLOW}df#${NC}       - Delete file system (e.g., ${YELLOW}df1${NC})"
-        echo -e "  ${YELLOW}dm#${NC}       - Delete mount target (e.g., ${YELLOW}dm1${NC})"
-        echo -e "  ${YELLOW}de#${NC}       - Delete export (e.g., ${YELLOW}de1${NC})"
+        echo -e "  ${RED}df#${NC}       - Delete file system + exports + mount target (e.g., ${RED}df1${NC})"
+        echo -e "  ${RED}dm#${NC}       - Delete mount target (e.g., ${RED}dm1${NC})"
+        echo -e "  ${RED}de#${NC}       - Delete export (e.g., ${RED}de1${NC})"
         echo ""
-        echo -e "  ${YELLOW}refresh${NC}   - Reload FSS data"
-        echo -e "  ${YELLOW}b${NC}         - Back to main menu"
+        echo -e "  ${MAGENTA}r${NC}         - Reload FSS data"
+        echo -e "  ${CYAN}b${NC}         - Back to main menu"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[File Storage] Selection: ${NC}"
         read -r selection
         
         [[ -z "$selection" || "$selection" == "b" || "$selection" == "B" ]] && return 0
         
         # Refresh
-        if [[ "$selection" == "refresh" ]]; then
-            fss_show_overview "$compartment_id"
+        if [[ "$selection" == "r" || "$selection" == "R" || "$selection" == "refresh" ]]; then
+            rm -f "$FSS_FS_CACHE" "$FSS_MT_CACHE" "$FSS_EXPORT_CACHE"
+            fss_show_overview "$compartment_id" "true"
             continue
         fi
         
         # Create commands
+        if [[ "$selection" == "setup" || "$selection" == "SETUP" ]]; then
+            fss_guided_setup "$compartment_id" "$ad"
+            rm -f "$FSS_FS_CACHE" "$FSS_MT_CACHE" "$FSS_EXPORT_CACHE"
+            fss_show_overview "$compartment_id" "true"
+            continue
+        fi
         if [[ "$selection" == "cf" ]]; then
             fss_create_file_system "$compartment_id" "$ad"
-            fss_show_overview "$compartment_id"
+            rm -f "$FSS_FS_CACHE"
+            fss_show_overview "$compartment_id" "true"
             continue
         fi
         if [[ "$selection" == "cm" ]]; then
             fss_create_mount_target "$compartment_id" "$ad"
-            fss_show_overview "$compartment_id"
+            rm -f "$FSS_MT_CACHE"
+            fss_show_overview "$compartment_id" "true"
             continue
         fi
         if [[ "$selection" == "ce" ]]; then
             fss_create_export "$compartment_id" "$ad"
-            fss_show_overview "$compartment_id"
+            rm -f "$FSS_EXPORT_CACHE"
+            fss_show_overview "$compartment_id" "true"
             continue
         fi
         if [[ "$selection" == "cs" ]]; then
@@ -26218,13 +27868,13 @@ manage_file_storage() {
             continue
         fi
         
-        # Delete file system: df#
+        # Delete file system: df# (recursive - exports + mount target + FS)
         if [[ "$selection" =~ ^df([0-9]+)$ ]]; then
             local sel_idx="${BASH_REMATCH[1]}"
             if [[ -n "${FSS_FS_MAP[$sel_idx]}" ]]; then
-                FSS_SELECTED_FS="${FSS_FS_MAP[$sel_idx]}"
-                fss_delete_file_system_direct "$compartment_id"
-                fss_show_overview "$compartment_id"
+                fss_recursive_delete_file_system "$compartment_id" "${FSS_FS_MAP[$sel_idx]}"
+                rm -f "$FSS_FS_CACHE" "$FSS_MT_CACHE" "$FSS_EXPORT_CACHE"
+                fss_show_overview "$compartment_id" "true"
             else
                 echo -e "${RED}Invalid file system number: df${sel_idx}${NC}"
             fi
@@ -26237,7 +27887,8 @@ manage_file_storage() {
             if [[ -n "${FSS_MT_MAP[$sel_idx]}" ]]; then
                 FSS_SELECTED_MT="${FSS_MT_MAP[$sel_idx]}"
                 fss_delete_mount_target_direct "$compartment_id"
-                fss_show_overview "$compartment_id"
+                rm -f "$FSS_MT_CACHE"
+                fss_show_overview "$compartment_id" "true"
             else
                 echo -e "${RED}Invalid mount target number: dm${sel_idx}${NC}"
             fi
@@ -26250,7 +27901,8 @@ manage_file_storage() {
             if [[ -n "${FSS_EXPORT_MAP[$sel_idx]}" ]]; then
                 FSS_SELECTED_EXPORT="${FSS_EXPORT_MAP[$sel_idx]}"
                 fss_delete_export_direct "$compartment_id"
-                fss_show_overview "$compartment_id"
+                rm -f "$FSS_EXPORT_CACHE"
+                fss_show_overview "$compartment_id" "true"
             else
                 echo -e "${RED}Invalid export number: de${sel_idx}${NC}"
             fi
@@ -26267,22 +27919,20 @@ manage_file_storage() {
 #--------------------------------------------------------------------------------
 fss_show_overview() {
     local compartment_id="$1"
+    local force_refresh="${2:-false}"
     
     echo ""
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${WHITE}                                      FILE STORAGE SERVICE (FSS)                                                 ${NC}"
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    _display_cache_info \
+        "${FSS_FS_CACHE}|File Systems" \
+        "${FSS_MT_CACHE}|Mount Targets" \
+        "${FSS_EXPORT_CACHE}|Exports"
     echo ""
     
-    # Get availability domains
-    echo -e "${CYAN}Getting availability domains...${NC}"
-    local ads
-    ads=$(fss_get_availability_domains "$compartment_id")
-    
-    if [[ -z "$ads" ]]; then
-        echo -e "${RED}Unable to get availability domains${NC}"
-        return 1
-    fi
+    # Fetch and cache FSS data
+    fetch_fss_data "$compartment_id" "$force_refresh"
     
     # Clear global maps
     declare -gA FSS_FS_MAP
@@ -26299,54 +27949,25 @@ fss_show_overview() {
     local export_idx=0
     
     #---------------------------------------------------------------------------
-    # Gather all data first
+    # Load data from caches
     #---------------------------------------------------------------------------
-    echo -e "${CYAN}Fetching file systems...${NC}"
     local all_fs_json="[]"
-    while IFS= read -r ad; do
-        [[ -z "$ad" ]] && continue
-        local fs_json
-        fs_json=$(oci fs file-system list \
-            --compartment-id "$compartment_id" \
-            --availability-domain "$ad" \
-            --all \
-            --output json 2>&1)
-        if [[ $? -eq 0 ]]; then
-            local fs_data
-            fs_data=$(echo "$fs_json" | jq '.data // []' 2>/dev/null)
-            all_fs_json=$(echo "$all_fs_json" "$fs_data" | jq -s 'add' 2>/dev/null)
-        fi
-    done <<< "$ads"
+    if [[ -f "$FSS_FS_CACHE" ]]; then
+        all_fs_json=$(jq '.data // []' "$FSS_FS_CACHE" 2>/dev/null) || all_fs_json="[]"
+    fi
     
-    echo -e "${CYAN}Fetching mount targets...${NC}"
     local all_mt_json="[]"
-    while IFS= read -r ad; do
-        [[ -z "$ad" ]] && continue
-        local mt_json
-        mt_json=$(oci fs mount-target list \
-            --compartment-id "$compartment_id" \
-            --availability-domain "$ad" \
-            --all \
-            --output json 2>&1)
-        if [[ $? -eq 0 ]]; then
-            local mt_data
-            mt_data=$(echo "$mt_json" | jq '.data // []' 2>/dev/null)
-            all_mt_json=$(echo "$all_mt_json" "$mt_data" | jq -s 'add' 2>/dev/null)
-        fi
-    done <<< "$ads"
+    if [[ -f "$FSS_MT_CACHE" ]]; then
+        all_mt_json=$(jq '.data // []' "$FSS_MT_CACHE" 2>/dev/null) || all_mt_json="[]"
+    fi
     
-    echo -e "${CYAN}Fetching exports...${NC}"
-    local all_export_json
-    all_export_json=$(oci fs export list \
-        --compartment-id "$compartment_id" \
-        --all \
-        --output json 2>&1)
-    if [[ $? -ne 0 ]]; then
-        all_export_json='{"data":[]}'
+    local all_export_json='{"data":[]}'
+    if [[ -f "$FSS_EXPORT_CACHE" ]]; then
+        all_export_json=$(cat "$FSS_EXPORT_CACHE" 2>/dev/null) || all_export_json='{"data":[]}'
     fi
     
     # Get private IPs for mount targets
-    echo -e "${CYAN}Resolving private IPs...${NC}"
+    echo -ne "  ${GRAY}Resolving private IPs...${NC}"
     declare -A MT_IPS
     while IFS='|' read -r mt_id ip_ids; do
         [[ -z "$mt_id" ]] && continue
@@ -26358,8 +27979,7 @@ fss_show_overview() {
             MT_IPS[$mt_id]="$ip_addr"
         fi
     done < <(echo "$all_mt_json" | jq -r '.[] | "\(.id)|\(.["private-ip-ids"])"' 2>/dev/null)
-    
-    echo ""
+    echo -e "\r                                          \r"
     
     # Build file system lookup
     declare -A FS_INFO  # fs_id -> "name|state|metered_bytes|ad"
@@ -28252,23 +29872,23 @@ manage_lustre_file_systems() {
         echo ""
         echo -e "${BOLD}${WHITE}─── File System Operations ───${NC}"
         echo -e "  ${GREEN}c${NC})  ${WHITE}Create Lustre File System${NC}  - Create a new Lustre file system"
-        echo -e "  ${GREEN}u${NC})  ${WHITE}Update Lustre File System${NC}  - Update name or capacity"
+        echo -e "  ${CYAN}u${NC})  ${WHITE}Update Lustre File System${NC}  - Update name or capacity"
         echo -e "  ${RED}d${NC})  ${WHITE}Delete Lustre File System${NC}  - Delete a Lustre file system"
         echo ""
         echo -e "${BOLD}${WHITE}─── Object Storage Links ───${NC}"
-        echo -e "  ${GREEN}ol${NC}) ${WHITE}List Object Storage Links${NC}  - List all HSM links"
+        echo -e "  ${CYAN}ol${NC}) ${WHITE}List Object Storage Links${NC}  - List all HSM links"
         echo -e "  ${GREEN}oc${NC}) ${WHITE}Create Object Storage Link${NC} - Link Lustre to Object Storage"
-        echo -e "  ${GREEN}oi${NC}) ${WHITE}Start Import from Object${NC}   - Import data from Object Storage"
-        echo -e "  ${GREEN}oe${NC}) ${WHITE}Start Export to Object${NC}     - Export data to Object Storage"
+        echo -e "  ${CYAN}oi${NC}) ${WHITE}Start Import from Object${NC}   - Import data from Object Storage"
+        echo -e "  ${CYAN}oe${NC}) ${WHITE}Start Export to Object${NC}     - Export data to Object Storage"
         echo -e "  ${RED}od${NC}) ${WHITE}Delete Object Storage Link${NC} - Remove an Object Storage link"
         echo ""
         echo -e "${BOLD}${WHITE}─── Monitoring ───${NC}"
-        echo -e "  ${GREEN}w${NC})  ${WHITE}Work Requests${NC}              - View Lustre work requests (async operations)"
+        echo -e "  ${CYAN}w${NC})  ${WHITE}Work Requests${NC}              - View Lustre work requests (async operations)"
         echo ""
-        echo -e "  ${WHITE}r${NC})  Refresh"
-        echo -e "  ${WHITE}b${NC})  Back to main menu"
+        echo -e "  ${MAGENTA}r${NC})  Refresh"
+        echo -e "  ${CYAN}b${NC})  Back to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Lustre] Enter selection: ${NC}"
         read -r selection
         
         case "$selection" in
@@ -30166,6 +31786,8 @@ manage_capacity_topology() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                      CAPACITY TOPOLOGY                                                         ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        _display_cache_info \
+            "${CAPACITY_TOPOLOGY_CACHE}|Capacity Hosts"
         echo ""
         
         if [[ -z "$tenancy_id" ]]; then
@@ -30281,13 +31903,13 @@ manage_capacity_topology() {
         # Actions Menu
         #-----------------------------------------------------------------------
         echo -e "${BOLD}${WHITE}─── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}1${NC}) View hosts by lifecycle state"
-        echo -e "  ${GREEN}2${NC}) View hosts by lifecycle details"
-        echo -e "  ${GREEN}3${NC}) View all hosts (detailed)"
-        echo -e "  ${GREEN}r${NC}) Refresh data"
-        echo -e "  ${WHITE}Enter${NC}) Return to menu"
+        echo -e "  ${YELLOW}1${NC}) View hosts by lifecycle state"
+        echo -e "  ${YELLOW}2${NC}) View hosts by lifecycle details"
+        echo -e "  ${YELLOW}3${NC}) View all hosts (detailed)"
+        echo -e "  ${MAGENTA}r${NC}) Refresh data"
+        echo -e "  ${CYAN}Enter${NC}) Return to menu"
         echo ""
-        echo -n -e "${CYAN}Select [1-3/r/Enter]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Capacity Topology] Select [1-3/r/Enter]: ${NC}"
         
         local choice
         read -r choice
@@ -30475,6 +32097,309 @@ capacity_topology_view_all_hosts() {
 #--------------------------------------------------------------------------------
 # Manage GPU Instance Tagging - Main menu
 #--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+# Manage Kubernetes - Node operations, kubelet troubleshooting
+#--------------------------------------------------------------------------------
+manage_kubernetes() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${GREEN}                                         KUBERNETES MANAGEMENT                                                    ${NC}"
+        echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo ""
+        echo -e "  ${RED}1${NC})  ${WHITE}Deregister Node (Kubelet Issue)${NC}  - Drain → Delete from K8s (for nodes with kubelet problems)"
+        echo ""
+        echo -e "  ${CYAN}b${NC})  Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[K8s Management] Enter selection [1/b]: ${NC}"
+        
+        local choice
+        read -r choice
+        
+        case "$choice" in
+            1)
+                k8s_deregister_node "$compartment_id" "$region"
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# K8s Deregister Node - Drain and remove node from cluster
+# For nodes with kubelet issues that need to be deregistered from K8s
+#--------------------------------------------------------------------------------
+k8s_deregister_node() {
+    local compartment_id="$1"
+    local region="$2"
+    local log_file="${LOG_DIR}/k8s_deregister_$(date +%Y%m%d_%H%M%S).log"
+    
+    echo ""
+    echo -e "${BOLD}${YELLOW}═══ Deregister Node (Kubelet Issue) ═══${NC}"
+    echo ""
+    echo -e "${GRAY}This will drain and remove a node from the Kubernetes cluster.${NC}"
+    echo -e "${GRAY}Use when a node has kubelet issues and needs to be deregistered.${NC}"
+    echo ""
+    
+    # Check kubectl available
+    if ! command -v kubectl &>/dev/null; then
+        echo -e "${RED}kubectl not available - cannot manage K8s nodes${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Fetch instances from OCI (reuse cache from manage 5)
+    local instances_json
+    local instance_cache_ttl=300
+    if is_cache_fresh "$INSTANCE_LIST_CACHE" "$instance_cache_ttl"; then
+        instances_json=$(cat "$INSTANCE_LIST_CACHE")
+    else
+        echo -e "${GRAY}Fetching instances from OCI...${NC}"
+        instances_json=$(oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null)
+        if [[ -n "$instances_json" ]] && echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+            echo "$instances_json" > "$INSTANCE_LIST_CACHE"
+        fi
+    fi
+    
+    if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch instances${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Fetch K8s nodes for lookup
+    local k8s_nodes_json
+    k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null)
+    
+    if [[ -z "$k8s_nodes_json" ]]; then
+        echo -e "${RED}Failed to fetch K8s nodes - check kubectl access${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    local k8s_lookup
+    k8s_lookup=$(echo "$k8s_nodes_json" | jq -r '
+        .items[] |
+        (.status.conditions[] | select(.type=="Ready") | .status) as $ready |
+        (.spec.unschedulable // false) as $unsched |
+        "\(.spec.providerID)|\(.metadata.name)|\($ready)|\($unsched)"
+    ' 2>/dev/null)
+    
+    # Build and display instance list with K8s node names
+    echo -e "${BOLD}${WHITE}═══ Instances with K8s Node Names ═══${NC}"
+    echo ""
+    printf "${BOLD}%-5s %-50s %-10s %-8s %-8s %-45s %s${NC}\n" \
+        "ID" "Display Name" "State" "K8s" "Ready" "K8s Node Name" "Instance OCID"
+    print_separator 200
+    
+    declare -A DEREG_INDEX_MAP
+    declare -A DEREG_NODE_MAP
+    local dereg_idx=0
+    
+    while IFS='|' read -r time_created name state shape ad ocid; do
+        [[ -z "$ocid" ]] && continue
+        ((dereg_idx++))
+        local iid="i${dereg_idx}"
+        DEREG_INDEX_MAP[$iid]="$ocid"
+        
+        # Color state
+        local state_color="$GREEN"
+        case "$state" in
+            RUNNING) state_color="$GREEN" ;;
+            STOPPED) state_color="$RED" ;;
+            STARTING|STOPPING) state_color="$YELLOW" ;;
+            *) state_color="$WHITE" ;;
+        esac
+        
+        # Look up K8s node
+        local k8s_status="No"
+        local k8s_color="$YELLOW"
+        local k8s_ready="-"
+        local k8s_node_name="-"
+        
+        local k8s_match
+        k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
+        
+        if [[ -n "$k8s_match" ]]; then
+            k8s_node_name=$(echo "$k8s_match" | cut -d'|' -f2)
+            local ready_status=$(echo "$k8s_match" | cut -d'|' -f3)
+            k8s_status="Yes"
+            k8s_color="$GREEN"
+            
+            if [[ "$ready_status" == "True" ]]; then
+                k8s_ready="Yes"
+            else
+                k8s_ready="No"
+                k8s_color="$RED"
+            fi
+            
+            DEREG_NODE_MAP[$iid]="$k8s_node_name"
+        fi
+        
+        printf "${YELLOW}%-5s${NC} %-50s ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} %-8s ${CYAN}%-45s${NC} ${GRAY}%s${NC}\n" \
+            "$iid" "${name:0:50}" "$state" "$k8s_status" "$k8s_ready" "${k8s_node_name:0:45}" "$ocid"
+            
+    done < <(echo "$instances_json" | jq -r '
+        .data[] |
+        select(.["lifecycle-state"] != "TERMINATED") |
+        "\(.["time-created"] // "N/A")|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["availability-domain"])|\(.id)"
+    ' 2>/dev/null | sort -t'|' -k1,1)
+    
+    echo ""
+    echo -e "${GRAY}Total: ${dereg_idx} instance(s)${NC}"
+    echo ""
+    
+    # Prompt for node selection
+    echo -n -e "${BOLD}${CYAN}Enter instance ID to deregister (e.g., i1): ${NC}"
+    local target
+    read -r target
+    
+    if [[ -z "$target" ]]; then
+        return
+    fi
+    
+    local target_ocid="${DEREG_INDEX_MAP[$target]:-}"
+    local target_node="${DEREG_NODE_MAP[$target]:-}"
+    
+    if [[ -z "$target_ocid" ]]; then
+        echo -e "${RED}Invalid instance ID: ${target}${NC}"
+        sleep 2
+        return
+    fi
+    
+    if [[ -z "$target_node" || "$target_node" == "-" ]]; then
+        echo -e "${RED}Instance ${target} is not registered in Kubernetes - no K8s node name found.${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Get display name
+    local target_name
+    target_name=$(echo "$instances_json" | jq -r --arg ocid "$target_ocid" '.data[] | select(.id == $ocid) | .["display-name"]' 2>/dev/null)
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Selected Node:${NC}"
+    echo -e "  ${CYAN}Instance:${NC}    ${WHITE}${target_name}${NC}"
+    echo -e "  ${CYAN}K8s Node:${NC}    ${WHITE}${target_node}${NC}"
+    echo -e "  ${CYAN}OCID:${NC}        ${YELLOW}${target_ocid}${NC}"
+    echo ""
+    
+    echo -e "${BOLD}${WHITE}The following commands will be executed:${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1.${NC} ${WHITE}kubectl drain ${target_node} --ignore-daemonsets --delete-emptydir-data${NC}"
+    echo -e "  ${YELLOW}2.${NC} ${WHITE}kubectl delete node ${target_node}${NC}"
+    echo ""
+    echo -e "${BOLD}${RED}⚠  This will remove the node from the Kubernetes cluster.${NC}"
+    echo ""
+    echo -n -e "${BOLD}${RED}Type 'yes' to confirm: ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    mkdir -p "$LOG_DIR"
+    
+    # Step 1: Drain the node
+    echo ""
+    local drain_cmd="kubectl drain ${target_node} --ignore-daemonsets --delete-emptydir-data"
+    echo -e "${BOLD}${YELLOW}[Step 1/2] Draining node...${NC}"
+    echo -e "${GRAY}Executing: ${WHITE}${drain_cmd}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DRAIN NODE: ${drain_cmd}" >> "$log_file"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Instance: ${target_name} (${target_ocid})" >> "$log_file"
+    
+    if kubectl drain "$target_node" --ignore-daemonsets --delete-emptydir-data 2>&1 | tee -a "$log_file"; then
+        echo ""
+        echo -e "${GREEN}✓ Node drained successfully${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Drain successful" >> "$log_file"
+    else
+        echo ""
+        echo -e "${RED}✗ Drain returned an error (may be partial)${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Drain returned error" >> "$log_file"
+        echo ""
+        echo -n -e "${YELLOW}Continue with delete node anyway? (yes/no): ${NC}"
+        local cont
+        read -r cont
+        if [[ "$cont" != "yes" ]]; then
+            echo -e "${YELLOW}Stopped. Node was partially drained but NOT deleted from cluster.${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: User cancelled after drain error" >> "$log_file"
+            echo ""
+            echo -e "${GRAY}Log: ${log_file}${NC}"
+            echo -e "Press Enter to return..."
+            read -r
+            return
+        fi
+    fi
+    
+    # Step 2: Delete the node from K8s
+    echo ""
+    local delete_cmd="kubectl delete node ${target_node}"
+    echo -e "${BOLD}${YELLOW}[Step 2/2] Deleting node from cluster...${NC}"
+    echo -e "${GRAY}Executing: ${WHITE}${delete_cmd}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETE NODE: ${delete_cmd}" >> "$log_file"
+    
+    if kubectl delete node "$target_node" 2>&1 | tee -a "$log_file"; then
+        echo ""
+        echo -e "${GREEN}✓ Node deleted from Kubernetes cluster${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Node delete successful" >> "$log_file"
+    else
+        echo ""
+        echo -e "${RED}✗ Failed to delete node${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Node delete failed" >> "$log_file"
+    fi
+    
+    # Display manual steps for the problematic node
+    echo ""
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}  On the problematic node (${WHITE}${target_name}${YELLOW}), run:${NC}"
+    echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${WHITE}# Stop kubelet and container runtime${NC}"
+    echo -e "  ${YELLOW}sudo systemctl stop kubelet crio${NC}"
+    echo ""
+    echo -e "${GRAY}This stops the kubelet and container runtime on the node to complete the deregistration.${NC}"
+    echo -e "${GRAY}The node will no longer attempt to rejoin the cluster until these services are restarted.${NC}"
+    echo ""
+    echo -e "${GRAY}Log: ${WHITE}${log_file}${NC}"
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
+}
+
 manage_gpu_instance_tagging() {
     local tenancy_ocid="${TENANCY_ID:-$TENANCY_OCID}"
     local home_region
@@ -30512,25 +32437,25 @@ manage_gpu_instance_tagging() {
         
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo ""
-        echo -e "  ${GREEN}1${NC}) ${WHITE}Create namespace and tag${NC}      - Create ${GPU_TAG_NAMESPACE} namespace with ${GPU_TAG_NAME} tag"
-        echo -e "  ${CYAN}2${NC}) ${WHITE}Validate namespace and tag${NC}    - Check if namespace exists with proper tag configuration"
-        echo -e "  ${RED}3${NC}) ${WHITE}Delete namespace${NC}              - Retire and cascade-delete the namespace"
+        echo -e "  ${GREEN}c${NC}) ${WHITE}Create namespace and tag${NC}      - Create ${GPU_TAG_NAMESPACE} namespace with ${GPU_TAG_NAME} tag"
+        echo -e "  ${CYAN}v${NC}) ${WHITE}Validate namespace and tag${NC}    - Check if namespace exists with proper tag configuration"
+        echo -e "  ${RED}d${NC}) ${WHITE}Delete namespace${NC}              - Retire and cascade-delete the namespace"
         echo ""
-        echo -e "  ${WHITE}b${NC}) Back to main menu"
+        echo -e "  ${CYAN}b${NC}) Back to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [1-3/b]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[GPU Tagging] Enter selection [c/v/d/b]: ${NC}"
         
         local choice
         read -r choice
         
         case "$choice" in
-            1)
+            c|C|1)
                 create_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
                 ;;
-            2)
+            v|V|2)
                 validate_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
                 ;;
-            3)
+            d|D|3)
                 delete_gpu_tagging_namespace "$tenancy_ocid" "$home_region"
                 ;;
             b|B|back|BACK|"")
@@ -30541,6 +32466,296 @@ manage_gpu_instance_tagging() {
                 sleep 1
                 ;;
         esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Kubernetes Management - Node operations and troubleshooting
+#--------------------------------------------------------------------------------
+manage_kubernetes() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${MAGENTA}                                        KUBERNETES MANAGEMENT                                                     ${NC}"
+        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}Environment:${NC}"
+        echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
+        echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
+        echo ""
+        echo -e "  ${RED}1${NC}) ${WHITE}Kubelet Deregister${NC}  - Drain, delete K8s node, and show recovery steps for kubelet issues"
+        echo ""
+        echo -e "  ${CYAN}b${NC}) Back to main menu"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[K8s Management] Enter selection [1/b]: ${NC}"
+        
+        local choice
+        read -r choice
+        
+        case "$choice" in
+            1)
+                k8s_kubelet_deregister
+                ;;
+            b|B|back|BACK|"")
+                return
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Kubelet Deregister - Drain and delete a K8s node, show recovery steps
+#--------------------------------------------------------------------------------
+k8s_kubelet_deregister() {
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    local log_file="${LOGS_DIR}/k8s_deregister_$(date '+%Y%m%d_%H%M%S').log"
+    
+    echo ""
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}                                     KUBELET DEREGISTER (DRAIN + DELETE NODE)                                      ${NC}"
+    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Check kubectl availability
+    if ! command -v kubectl &>/dev/null; then
+        echo -e "${RED}kubectl not available - cannot perform node operations${NC}"
+        echo ""
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Fetch instances from cache or OCI
+    echo -e "${GRAY}Fetching instances and K8s node mappings...${NC}"
+    local instances_json
+    local instance_cache_ttl=300
+    if is_cache_fresh "$INSTANCE_LIST_CACHE" "$instance_cache_ttl"; then
+        instances_json=$(cat "$INSTANCE_LIST_CACHE")
+    else
+        instances_json=$(oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null)
+        if [[ -n "$instances_json" ]] && echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+            echo "$instances_json" > "$INSTANCE_LIST_CACHE"
+        fi
+    fi
+    
+    if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch instances${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return 1
+    fi
+    
+    # Fetch K8s node info
+    local k8s_nodes_json
+    k8s_nodes_json=$(kubectl get nodes -o json 2>/dev/null)
+    
+    local k8s_lookup
+    k8s_lookup=$(echo "$k8s_nodes_json" | jq -r '
+        .items[] |
+        (.spec.taints // [] | map(select(.key == "newNode")) | if length > 0 then .[0].effect else "N/A" end) as $newNodeTaint |
+        (.spec.unschedulable // false) as $unschedulable |
+        "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\($newNodeTaint)|\($unschedulable)"
+    ' 2>/dev/null)
+    
+    # Build instance list with K8s node names
+    declare -A DEREG_MAP=()      # i# -> ocid|name|k8s_node_name
+    local dereg_idx=0
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Instances with K8s Node Names ═══${NC}"
+    echo ""
+    printf "${BOLD}%-5s %-50s %-10s %-8s %-45s %s${NC}\n" \
+        "ID" "Display Name" "State" "K8s" "Kubectl Node Name" "Instance OCID"
+    print_separator 210
+    
+    echo "$instances_json" | jq -r '
+        .data[] |
+        select(.["lifecycle-state"] != "TERMINATED") |
+        "\(.["time-created"] // "N/A")|\(.["display-name"])|\(.["lifecycle-state"])|\(.id)"
+    ' 2>/dev/null | sort -t'|' -k1,1 | while IFS='|' read -r time_created name state ocid; do
+        ((dereg_idx++))
+        local iid="i${dereg_idx}"
+        
+        # Color state
+        local state_color="$GREEN"
+        case "$state" in
+            RUNNING) state_color="$GREEN" ;;
+            STOPPED) state_color="$RED" ;;
+            STARTING|STOPPING) state_color="$YELLOW" ;;
+            *) state_color="$WHITE" ;;
+        esac
+        
+        # Check K8s membership
+        local k8s_status="No"
+        local k8s_color="$YELLOW"
+        local k8s_node_name="-"
+        
+        local k8s_match
+        k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
+        
+        if [[ -n "$k8s_match" ]]; then
+            k8s_node_name=$(echo "$k8s_match" | cut -d'|' -f2)
+            local k8s_ready
+            k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
+            
+            if [[ "$k8s_ready" == "True" ]]; then
+                k8s_status="Ready"
+                k8s_color="$GREEN"
+            else
+                k8s_status="NotRdy"
+                k8s_color="$RED"
+            fi
+        fi
+        
+        printf "${YELLOW}%-5s${NC} %-50s ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${WHITE}%-45s${NC} ${GRAY}%s${NC}\n" \
+            "$iid" "${name:0:50}" "$state" "$k8s_status" "${k8s_node_name:0:45}" "$ocid"
+        
+        # Write to temp file for map (subshell)
+        echo "${iid}|${ocid}|${name}|${k8s_node_name}" >> "${TEMP_DIR}/dereg_map_$$"
+    done
+    
+    # Read map from temp file
+    if [[ -f "${TEMP_DIR}/dereg_map_$$" ]]; then
+        while IFS='|' read -r iid ocid name k8s_node; do
+            DEREG_MAP[$iid]="${ocid}|${name}|${k8s_node}"
+        done < "${TEMP_DIR}/dereg_map_$$"
+        rm -f "${TEMP_DIR}/dereg_map_$$"
+    fi
+    
+    local total=${#DEREG_MAP[@]}
+    echo ""
+    echo -e "${GRAY}Total: ${total} instances (excluding TERMINATED)${NC}"
+    echo ""
+    
+    # Selection loop
+    while true; do
+        echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
+        echo -e "  ${YELLOW}i#${NC}  - Select instance to deregister (e.g., 'i1', 'i5')"
+        echo -e "  ${CYAN}b${NC}   - Back"
+        echo ""
+        echo -n -e "${CYAN}Select instance [i#/b]: ${NC}"
+        local selection
+        read -r selection
+        
+        [[ -z "$selection" || "$selection" == "b" || "$selection" == "B" ]] && return 0
+        
+        # Validate selection
+        local selected_data="${DEREG_MAP[$selection]:-}"
+        if [[ -z "$selected_data" ]]; then
+            echo -e "${RED}Invalid selection: ${selection}${NC}"
+            sleep 1
+            continue
+        fi
+        
+        local sel_ocid sel_name sel_k8s_node
+        IFS='|' read -r sel_ocid sel_name sel_k8s_node <<< "$selected_data"
+        
+        if [[ "$sel_k8s_node" == "-" || -z "$sel_k8s_node" ]]; then
+            echo -e "${RED}Instance '${sel_name}' is not registered as a K8s node${NC}"
+            sleep 1
+            continue
+        fi
+        
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Kubelet Deregister ═══${NC}"
+        echo ""
+        echo -e "  ${CYAN}Instance:${NC}  ${WHITE}${sel_name}${NC}"
+        echo -e "  ${CYAN}OCID:${NC}      ${YELLOW}${sel_ocid}${NC}"
+        echo -e "  ${CYAN}K8s Node:${NC}  ${WHITE}${sel_k8s_node}${NC}"
+        echo ""
+        
+        echo -e "${BOLD}${YELLOW}This will execute:${NC}"
+        echo -e "  ${GRAY}1. kubectl drain ${sel_k8s_node} --ignore-daemonsets --delete-emptydir-data${NC}"
+        echo -e "  ${GRAY}2. kubectl delete node ${sel_k8s_node}${NC}"
+        echo ""
+        echo -e "${RED}WARNING: This will evict all pods and remove the node from the cluster.${NC}"
+        echo ""
+        echo -n -e "${BOLD}${YELLOW}Proceed? [y/N]: ${NC}"
+        local confirm
+        read -r confirm
+        
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo -e "${GRAY}Cancelled${NC}"
+            continue
+        fi
+        
+        # Ensure log directory exists
+        mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
+        
+        # Step 1: Drain
+        echo ""
+        local drain_cmd="kubectl drain ${sel_k8s_node} --ignore-daemonsets --delete-emptydir-data"
+        echo -e "${BOLD}${WHITE}Step 1: Draining node...${NC}"
+        echo -e "${GRAY}\$ ${drain_cmd}${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${drain_cmd}" >> "$log_file"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Instance: ${sel_name} (${sel_ocid})" >> "$log_file"
+        
+        if kubectl drain "$sel_k8s_node" --ignore-daemonsets --delete-emptydir-data 2>&1 | tee -a "$log_file"; then
+            echo ""
+            echo -e "${GREEN}✓ Node drained successfully${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Drain succeeded" >> "$log_file"
+        else
+            echo ""
+            echo -e "${YELLOW}⚠ Drain encountered errors (see above). Continuing with delete...${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Drain had errors" >> "$log_file"
+        fi
+        
+        # Step 2: Delete node
+        echo ""
+        local delete_cmd="kubectl delete node ${sel_k8s_node}"
+        echo -e "${BOLD}${WHITE}Step 2: Deleting node from cluster...${NC}"
+        echo -e "${GRAY}\$ ${delete_cmd}${NC}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${delete_cmd}" >> "$log_file"
+        
+        if kubectl delete node "$sel_k8s_node" 2>&1 | tee -a "$log_file"; then
+            echo ""
+            echo -e "${GREEN}✓ Node deleted from cluster${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Delete succeeded" >> "$log_file"
+        else
+            echo ""
+            echo -e "${RED}✗ Failed to delete node${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESULT: Delete failed" >> "$log_file"
+        fi
+        
+        # Step 3: Show manual recovery steps
+        echo ""
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}                              ON THE PROBLEMATIC NODE, RUN THE FOLLOWING:                                         ${NC}"
+        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${WHITE}# SSH to the node${NC}"
+        echo -e "  ${GRAY}ssh opc@<node-ip>${NC}"
+        echo ""
+        echo -e "  ${WHITE}# Step 1: Stop kubelet and CRI-O${NC}"
+        echo -e "  ${YELLOW}sudo systemctl stop kubelet crio${NC}"
+        echo ""
+        echo -e "  ${WHITE}# Step 2: Remove kubelet PKI certificates${NC}"
+        echo -e "  ${YELLOW}sudo rm /var/lib/kubelet/pki/*${NC}"
+        echo ""
+        echo -e "  ${WHITE}# Step 3: Re-bootstrap the node${NC}"
+        echo -e "  ${YELLOW}sudo oke bootstrap${NC}"
+        echo ""
+        echo -e "${GRAY}The node will re-register with the cluster and rejoin as a fresh worker node.${NC}"
+        echo -e "${GRAY}Log file: ${log_file}${NC}"
+        echo ""
+        echo -e "Press Enter to continue..."
+        read -r
     done
 }
 
@@ -30955,13 +33170,13 @@ manage_nvidia_gpu_stack_health() {
     while true; do
         echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
         echo -e "  Enter ${YELLOW}#${NC} (e.g., 1) to view detailed pod status for a node"
-        echo -e "  Enter ${YELLOW}pods${NC} to list all GPU-related pods"
-        echo -e "  Enter ${YELLOW}dra${NC} to list DRA kubelet-plugin pods with READY status"
-        echo -e "  Enter ${YELLOW}events${NC} to show recent events from GPU namespaces"
-        echo -e "  Enter ${YELLOW}refresh${NC} to refresh the status"
-        echo -e "  Enter ${YELLOW}b${NC} to go back"
+        echo -e "  Enter ${CYAN}pods${NC} to list all GPU-related pods"
+        echo -e "  Enter ${CYAN}dra${NC} to list DRA kubelet-plugin pods with READY status"
+        echo -e "  Enter ${CYAN}events${NC} to show recent events from GPU namespaces"
+        echo -e "  Enter ${MAGENTA}r${NC} to refresh the status"
+        echo -e "  Enter ${CYAN}b${NC} to go back"
         echo ""
-        echo -n -e "${CYAN}Selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[GPU Stack Health] Selection: ${NC}"
         read -r selection
         
         case "$selection" in
@@ -31035,7 +33250,7 @@ manage_nvidia_gpu_stack_health() {
                 kubectl get events -n nvidia-dra-driver-gpu --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo -e "${GRAY}No events${NC}"
                 echo ""
                 ;;
-            refresh|REFRESH)
+            r|R|refresh|REFRESH)
                 manage_nvidia_gpu_stack_health
                 return
                 ;;
@@ -31612,6 +33827,8 @@ create_instance_configuration_interactive() {
     local ad="${AD:-}"
     local worker_subnet="${WORKER_SUBNET_ID:-}"
     local worker_nsg="${WORKER_SUBNET_NSG_ID:-}"
+    local pod_subnet="${POD_SUBNET_ID:-}"
+    local pod_nsg="${POD_SUBNET_NSG_ID:-}"
     local image_id="${IMAGE_ID:-}"
     
     echo ""
@@ -31757,6 +33974,32 @@ create_instance_configuration_interactive() {
             ;;
     esac
     echo -e "${GREEN}✓ Network type: ${WHITE}${network_type}${NC}"
+    
+    # Validate pod subnet/NSG when native is selected
+    if [[ "$network_type" == "native" ]]; then
+        local native_missing=""
+        [[ -z "$pod_subnet" ]] && native_missing+="POD_SUBNET_ID "
+        [[ -z "$pod_nsg" ]] && native_missing+="POD_SUBNET_NSG_ID "
+        
+        if [[ -n "$native_missing" ]]; then
+            echo ""
+            echo -e "${RED}Native pod networking requires additional variables in variables.sh:${NC}"
+            echo -e "${YELLOW}  ${native_missing}${NC}"
+            echo ""
+            echo -e "${WHITE}Please run ${CYAN}--setup${WHITE} or manually add these to variables.sh${NC}"
+            echo ""
+            echo -e "Press Enter to return..."
+            read -r
+            return 1
+        fi
+        
+        # Show pod networking details
+        local pod_subnet_name pod_nsg_name
+        pod_subnet_name=$(oci network subnet get --subnet-id "$pod_subnet" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        pod_nsg_name=$(oci network nsg get --nsg-id "$pod_nsg" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        echo -e "  ${CYAN}Pod Subnet:${NC}  ${WHITE}${pod_subnet_name}${NC} ${GRAY}(${YELLOW}...${pod_subnet: -20}${GRAY})${NC}"
+        echo -e "  ${CYAN}Pod NSG:${NC}     ${WHITE}${pod_nsg_name}${NC} ${GRAY}(${YELLOW}...${pod_nsg: -20}${GRAY})${NC}"
+    fi
     
     # ========== STEP 3: Shape Selection ==========
     echo ""
@@ -32331,6 +34574,48 @@ create_instance_configuration_interactive() {
                     has_diff=true
                 fi
                 
+                # Native pod networking metadata comparison
+                local ex_native_flag
+                ex_native_flag=$(echo "$existing_launch" | jq -r '.metadata["oke-native-pod-networking"] // "(not set)"')
+                local new_native_flag="(not set)"
+                [[ "$network_type" == "native" ]] && new_native_flag="true"
+                
+                if [[ "$new_native_flag" != "$ex_native_flag" ]]; then
+                    echo -e "  ${RED}✗${NC} ${WHITE}oke-native-pod-networking:${NC}"
+                    echo -e "      ${GREEN}New:${NC} $new_native_flag"
+                    echo -e "      ${BLUE}Existing:${NC} $ex_native_flag"
+                    has_diff=true
+                else
+                    echo -e "  ${GREEN}✓${NC} ${WHITE}oke-native-pod-networking:${NC} $new_native_flag"
+                fi
+                
+                local ex_pod_subnets ex_pod_nsgids
+                ex_pod_subnets=$(echo "$existing_launch" | jq -r '.metadata["pod-subnets"] // "(not set)"')
+                ex_pod_nsgids=$(echo "$existing_launch" | jq -r '.metadata["pod-nsgids"] // "(not set)"')
+                local new_pod_subnets="(not set)" new_pod_nsgids="(not set)"
+                if [[ "$network_type" == "native" ]]; then
+                    new_pod_subnets="$pod_subnet"
+                    new_pod_nsgids="$pod_nsg"
+                fi
+                
+                if [[ "$new_pod_subnets" != "$ex_pod_subnets" ]]; then
+                    echo -e "  ${RED}✗${NC} ${WHITE}pod-subnets:${NC}"
+                    echo -e "      ${GREEN}New:${NC} $new_pod_subnets"
+                    echo -e "      ${BLUE}Existing:${NC} $ex_pod_subnets"
+                    has_diff=true
+                elif [[ "$new_pod_subnets" != "(not set)" ]]; then
+                    echo -e "  ${GREEN}✓${NC} ${WHITE}pod-subnets:${NC} ...${new_pod_subnets: -25}"
+                fi
+                
+                if [[ "$new_pod_nsgids" != "$ex_pod_nsgids" ]]; then
+                    echo -e "  ${RED}✗${NC} ${WHITE}pod-nsgids:${NC}"
+                    echo -e "      ${GREEN}New:${NC} $new_pod_nsgids"
+                    echo -e "      ${BLUE}Existing:${NC} $ex_pod_nsgids"
+                    has_diff=true
+                elif [[ "$new_pod_nsgids" != "(not set)" ]]; then
+                    echo -e "  ${GREEN}✓${NC} ${WHITE}pod-nsgids:${NC} ...${new_pod_nsgids: -25}"
+                fi
+                
                 # Cloud-init diff
                 echo ""
                 echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -32437,6 +34722,15 @@ create_instance_configuration_interactive() {
     nsg_name_display=$(oci network nsg get --nsg-id "$worker_nsg" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
     echo -e "  ${WHITE}Worker NSG:${NC}         ${WHITE}${nsg_name_display}${NC} (${YELLOW}${worker_nsg}${NC})"
     
+    # Show pod subnet/NSG when native
+    if [[ "$network_type" == "native" ]]; then
+        local pod_subnet_name_display pod_nsg_name_display
+        pod_subnet_name_display=$(oci network subnet get --subnet-id "$pod_subnet" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        pod_nsg_name_display=$(oci network nsg get --nsg-id "$pod_nsg" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        echo -e "  ${WHITE}Pod Subnet:${NC}         ${WHITE}${pod_subnet_name_display}${NC} (${YELLOW}${pod_subnet}${NC})"
+        echo -e "  ${WHITE}Pod NSG:${NC}            ${WHITE}${pod_nsg_name_display}${NC} (${YELLOW}${pod_nsg}${NC})"
+    fi
+    
     # Show image with name
     local img_name_display
     img_name_display=$(oci compute image get --image-id "$image_id" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
@@ -32459,6 +34753,29 @@ SCEOF
 )
     fi
     
+    # Build metadata block based on network type
+    local metadata_json=""
+    if [[ "$network_type" == "native" ]]; then
+        metadata_json=$(cat <<MDEOF
+    "metadata": {
+      "user_data": "${base64_cloud_init}",
+      "oke-native-pod-networking": "true",
+      "oke-max-pods": "${max_pods}",
+      "pod-subnets": "${pod_subnet}",
+      "pod-nsgids": "${pod_nsg}"
+    },
+MDEOF
+)
+    else
+        metadata_json=$(cat <<MDEOF
+    "metadata": {
+      "user_data": "${base64_cloud_init}",
+      "oke-max-pods": "${max_pods}"
+    },
+MDEOF
+)
+    fi
+    
     local instance_details_json
     instance_details_json=$(cat <<EOF
 {
@@ -32475,10 +34792,7 @@ SCEOF
         "${worker_nsg}"
       ]
     },
-    "metadata": {
-      "user_data": "${base64_cloud_init}",
-      "oke-max-pods": "${max_pods}"
-    },
+${metadata_json}
     "shape": "${shape_name}",
 ${shape_config_json}
     "sourceDetails": {
@@ -32541,15 +34855,24 @@ EOF
     img_summary_name=$(oci compute image get --image-id "$image_id" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
     echo -e "  ${CYAN}Image:${NC}       ${WHITE}${img_summary_name}${NC} (${YELLOW}${image_id}${NC})"
     
-    # Show subnet with name and OCID on same line
+    # Show worker subnet with name and OCID on same line
     local subnet_summary_name
     subnet_summary_name=$(oci network subnet get --subnet-id "$worker_subnet" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
-    echo -e "  ${CYAN}Subnet:${NC}      ${WHITE}${subnet_summary_name}${NC} (${YELLOW}${worker_subnet}${NC})"
+    echo -e "  ${CYAN}Worker Sub:${NC}  ${WHITE}${subnet_summary_name}${NC} (${YELLOW}${worker_subnet}${NC})"
     
-    # Show NSG with name and OCID on same line
+    # Show worker NSG with name and OCID on same line
     local nsg_summary_name
     nsg_summary_name=$(oci network nsg get --nsg-id "$worker_nsg" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
-    echo -e "  ${CYAN}NSG:${NC}         ${WHITE}${nsg_summary_name}${NC} (${YELLOW}${worker_nsg}${NC})"
+    echo -e "  ${CYAN}Worker NSG:${NC}  ${WHITE}${nsg_summary_name}${NC} (${YELLOW}${worker_nsg}${NC})"
+    
+    # Show pod subnet/NSG when native
+    if [[ "$network_type" == "native" ]]; then
+        local pod_sub_summary pod_nsg_summary
+        pod_sub_summary=$(oci network subnet get --subnet-id "$pod_subnet" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        pod_nsg_summary=$(oci network nsg get --nsg-id "$pod_nsg" --query 'data."display-name"' --raw-output 2>/dev/null || echo "Unknown")
+        echo -e "  ${CYAN}Pod Sub:${NC}     ${WHITE}${pod_sub_summary}${NC} (${YELLOW}${pod_subnet}${NC})"
+        echo -e "  ${CYAN}Pod NSG:${NC}     ${WHITE}${pod_nsg_summary}${NC} (${YELLOW}${pod_nsg}${NC})"
+    fi
     echo ""
     
     echo -e "${BOLD}${YELLOW}─── Command to Execute ───${NC}"
@@ -32604,6 +34927,10 @@ EOF
         fi
         echo "Image ID: ${image_id}"
         echo "Network Type: ${network_type}"
+        if [[ "$network_type" == "native" ]]; then
+            echo "Pod Subnet ID: ${pod_subnet}"
+            echo "Pod NSG ID: ${pod_nsg}"
+        fi
         echo "Boot Volume: ${boot_volume_size} GB @ ${boot_volume_vpus} VPUs/GB"
         echo "Max Pods: ${max_pods}"
         echo "Cloud-Init File: ${cloud_init_file}"
@@ -32754,10 +35081,10 @@ delete_instance_configuration_interactive() {
     # If no args provided, prompt interactively
     if [[ -z "$delete_args" ]]; then
         echo -e "${WHITE}Usage: Enter one of the following:${NC}"
-        echo -e "  ${YELLOW}i#${NC}          - Delete a single config (e.g., ${CYAN}i1${NC})"
-        echo -e "  ${YELLOW}i#,i#,i#${NC}   - Delete multiple configs (e.g., ${CYAN}i1,i3,i5${NC})"
-        echo -e "  ${YELLOW}all${NC}         - Delete ALL instance configurations"
-        echo -e "  ${YELLOW}cancel${NC}      - Cancel"
+        echo -e "  ${YELLOW}i#${NC}          - Delete a single config (e.g., ${YELLOW}i1${NC})"
+        echo -e "  ${YELLOW}i#,i#,i#${NC}   - Delete multiple configs (e.g., ${YELLOW}i1,i3,i5${NC})"
+        echo -e "  ${RED}all${NC}         - Delete ALL instance configurations"
+        echo -e "  ${CYAN}cancel${NC}      - Cancel"
         echo ""
         echo -n -e "${CYAN}Select Instance Configuration(s) to delete: ${NC}"
         read -r delete_args
@@ -33083,10 +35410,10 @@ manage_object_storage() {
         echo -e "${BOLD}${WHITE}─── Operations ───${NC}"
         echo -e "  ${CYAN}w${NC})  ${WHITE}Work Requests${NC}          - View work request status and logs"
         echo ""
-        echo -e "  ${WHITE}r${NC})  Refresh"
-        echo -e "  ${WHITE}b${NC})  Back to main menu"
+        echo -e "  ${MAGENTA}r${NC})  Refresh"
+        echo -e "  ${CYAN}b${NC})  Back to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Object Storage] Enter selection: ${NC}"
         read -r selection
         
         case "$selection" in
@@ -33216,10 +35543,10 @@ os_manage_work_requests() {
         echo ""
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo -e "  ${YELLOW}1-${idx}${NC}) View work request details and logs"
-        echo -e "  ${WHITE}r${NC})   Refresh"
-        echo -e "  ${WHITE}b${NC})   Back"
+        echo -e "  ${MAGENTA}r${NC})   Refresh"
+        echo -e "  ${CYAN}b${NC})   Back"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Object Storage > Work Requests] Enter selection: ${NC}"
         read -r selection
         
         case "$selection" in
@@ -33679,13 +36006,13 @@ os_view_private_endpoint_details() {
     echo -e "${BOLD}${WHITE}─── DNS Lookup (dig) ───${NC}"
     if [[ "$fqdn_idx" -gt 0 ]]; then
         echo -e "  ${YELLOW}d1-d${fqdn_idx}${NC}) Dig individual FQDN (e.g., d1)"
-        echo -e "  ${GREEN}da${NC})   Dig ALL FQDNs"
+        echo -e "  ${CYAN}da${NC})   Dig ALL FQDNs"
     fi
     echo ""
     if [[ "$nsg_idx" -gt 0 ]]; then
         echo -e "${BOLD}${WHITE}─── NSG Rules ───${NC}"
         echo -e "  ${YELLOW}n1-n${nsg_idx}${NC}) View individual NSG rules (e.g., n1)"
-        echo -e "  ${GREEN}na${NC})   Show ALL NSG rules"
+        echo -e "  ${CYAN}na${NC})   Show ALL NSG rules"
         echo -e "  ${CYAN}p${NC})    Check for required ports (80/443 ingress)"
         echo ""
     fi
@@ -35451,12 +37778,12 @@ manage_custom_images() {
         echo -e "  ${GREEN}i${NC})    Import image from URL"
         echo -e "  ${GREEN}c${NC})    Create image from instance"
         echo -e "  ${GREEN}e${NC})    Export image to Object Storage"
-        echo -e "  ${GREEN}s${NC})    Shape compatibility (view/add)"
+        echo -e "  ${CYAN}s${NC})    Shape compatibility (view/add)"
         echo -e "  ${RED}d${NC})    Delete custom image"
-        echo -e "  ${WHITE}r${NC})    Refresh list"
-        echo -e "  ${WHITE}q${NC})    Back to main menu"
+        echo -e "  ${MAGENTA}r${NC})    Refresh list"
+        echo -e "  ${CYAN}q${NC})    Back to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Custom Images] Enter selection: ${NC}"
         read -r choice
         
         case "$choice" in
@@ -36327,7 +38654,7 @@ custom_image_shape_compatibility() {
     echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
     echo -e "  ${GREEN}a${NC})  Add shape compatibility"
     echo -e "  ${RED}rm${NC}) Remove shape compatibility"
-    echo -e "  ${WHITE}b${NC})  Back"
+    echo -e "  ${CYAN}b${NC})  Back"
     echo ""
     echo -n -e "${CYAN}Select action: ${NC}"
     read -r action
