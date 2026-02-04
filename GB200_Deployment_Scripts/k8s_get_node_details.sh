@@ -15680,6 +15680,86 @@ view_network_resource_detail() {
 # COMPUTE INSTANCE MANAGEMENT
 #===============================================================================
 
+#--------------------------------------------------------------------------------
+# Helper: Parse instance targets (i1, i1,i3, i1-i5, all) into validated arrays
+# Args: $1 = target string, expects INSTANCE_INDEX_MAP to be populated
+# Sets global: _PARSED_IDS=() _PARSED_OCIDS=()
+# Returns: 0 if any valid targets, 1 if none
+#--------------------------------------------------------------------------------
+parse_instance_targets() {
+    local targets="$1"
+    _PARSED_IDS=()
+    _PARSED_OCIDS=()
+    
+    if [[ -z "$targets" ]]; then
+        return 1
+    fi
+    
+    declare -a raw_ids=()
+    
+    if [[ "${targets,,}" == "all" ]]; then
+        for tkey in "${!INSTANCE_INDEX_MAP[@]}"; do
+            raw_ids+=("$tkey")
+        done
+    else
+        IFS=',' read -ra parts <<< "$targets"
+        for part in "${parts[@]}"; do
+            part=$(echo "$part" | tr -d ' ')
+            # Range: i1-i5 or i1-5 or 1-5
+            if [[ "$part" =~ ^i?([0-9]+)-i?([0-9]+)$ ]]; then
+                local rstart="${BASH_REMATCH[1]}" rend="${BASH_REMATCH[2]}"
+                for ((ri=rstart; ri<=rend; ri++)); do
+                    [[ -n "${INSTANCE_INDEX_MAP[i${ri}]:-}" ]] && raw_ids+=("i${ri}")
+                done
+            # Single: i1 or 1
+            elif [[ "$part" =~ ^i?([0-9]+)$ ]]; then
+                local num="${BASH_REMATCH[1]}"
+                [[ -n "${INSTANCE_INDEX_MAP[i${num}]:-}" ]] && raw_ids+=("i${num}")
+            fi
+        done
+    fi
+    
+    # Deduplicate and sort
+    local -A seen=()
+    for rid in "${raw_ids[@]}"; do
+        if [[ -z "${seen[$rid]:-}" ]]; then
+            seen[$rid]=1
+            _PARSED_IDS+=("$rid")
+            _PARSED_OCIDS+=("${INSTANCE_INDEX_MAP[$rid]}")
+        fi
+    done
+    
+    # Sort numerically
+    if [[ ${#_PARSED_IDS[@]} -gt 0 ]]; then
+        local sorted
+        sorted=$(for idx in "${!_PARSED_IDS[@]}"; do
+            echo "${_PARSED_IDS[$idx]}|${_PARSED_OCIDS[$idx]}"
+        done | sort -t'i' -k2 -n)
+        
+        _PARSED_IDS=()
+        _PARSED_OCIDS=()
+        while IFS='|' read -r sid socid; do
+            _PARSED_IDS+=("$sid")
+            _PARSED_OCIDS+=("$socid")
+        done <<< "$sorted"
+        return 0
+    fi
+    
+    return 1
+}
+
+#--------------------------------------------------------------------------------
+# Helper: Resolve K8s node name from OCI instance OCID
+# Args: $1 = instance OCID, $2 = k8s_nodes_json
+# Prints: k8s node name or empty string
+#--------------------------------------------------------------------------------
+resolve_k8s_node_name() {
+    local ocid="$1" k8s_json="$2"
+    [[ -z "$k8s_json" ]] && return
+    echo "$k8s_json" | jq -r --arg ocid "$ocid" \
+        '.items[] | select(.spec.providerID | contains($ocid)) | .metadata.name' 2>/dev/null | head -1
+}
+
 manage_compute_instances() {
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     local region="${EFFECTIVE_REGION:-$REGION}"
@@ -15855,6 +15935,11 @@ manage_compute_instances() {
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
         echo -e "  ${YELLOW}i#${NC}         - View instance details (e.g., 'i1', 'i5')"
         echo -e "  ${YELLOW}ocid1...${NC}   - View instance by OCID directly"
+        echo -e "  ${CYAN}taint${NC}      - Apply newNode=true:NoSchedule taint (e.g., 'taint i1', 'taint i1,i3', 'taint all')"
+        echo -e "  ${CYAN}untaint${NC}    - Remove newNode=true:NoSchedule taint (e.g., 'untaint i1', 'untaint i1-i5')"
+        echo -e "  ${YELLOW}cordon${NC}     - Cordon K8s node(s) (e.g., 'cordon i1', 'cordon i1,i3')"
+        echo -e "  ${GREEN}uncordon${NC}   - Uncordon K8s node(s) (e.g., 'uncordon i1', 'uncordon all')"
+        echo -e "  ${RED}cdt${NC}        - Cordon → Drain → Tag → Terminate (e.g., 'cdt i1', 'cdt i1-i5', 'cdt all')"
         echo -e "  ${RED}terminate${NC}  - Terminate instances (e.g., 'terminate i1,i3' or 'terminate i1-i5' or 'terminate all')"
         echo -e "  ${GREEN}p${NC}          - View all instances with OCI properties (shape, mem, boot vol, cloud-init)"
         echo -e "  ${GREEN}bvr${NC}        - Boot Volume Replacement (upgrade OKE nodes without reboot)"
@@ -15866,7 +15951,7 @@ manage_compute_instances() {
         echo -e "${GRAY}  $0 <instance-ocid> --details        # Full details (network, volumes)${NC}"
         echo -e "${GRAY}  $0 <instance-ocid> --console-history # Boot logs (debug cloud-init)${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}Enter selection [i#/terminate/ocid/p/bvr/refresh/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}Enter selection [i#/taint/untaint/cordon/uncordon/cdt/terminate/p/bvr/refresh/back]: ${NC}"
         
         local input
         read -r input
@@ -15874,6 +15959,712 @@ manage_compute_instances() {
         # Empty input goes back
         if [[ -z "$input" ]]; then
             return
+        fi
+        
+        #----------------------------------------------------------------------
+        # Taint: Apply newNode=true:NoSchedule
+        # Usage: taint i1 / taint i1,i3 / taint i1-i5 / taint all
+        #----------------------------------------------------------------------
+        if [[ "$input" =~ ^taint[[:space:]]+(.+)$ ]]; then
+            local taint_targets="${BASH_REMATCH[1]}"
+            local taint_log_file="${LOGS_DIR}/instance_taint_actions.log"
+            mkdir -p "$(dirname "$taint_log_file")" 2>/dev/null
+            
+            if ! parse_instance_targets "$taint_targets"; then
+                echo -e "${RED}No valid instances selected. Use: taint i1, taint i1,i3, taint i1-i5, taint all${NC}"
+                sleep 2
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${CYAN}═══ Apply Taint: newNode=true:NoSchedule ═══${NC}"
+            echo ""
+            
+            # Resolve K8s node names and display
+            declare -a TAINT_VALID=()
+            printf "  ${BOLD}%-5s %-45s %-40s %-8s${NC}\n" "ID" "Display Name" "K8s Node Name" "Status"
+            print_separator 105
+            
+            for ti in "${!_PARSED_IDS[@]}"; do
+                local t_iid="${_PARSED_IDS[$ti]}"
+                local t_ocid="${_PARSED_OCIDS[$ti]}"
+                local t_name
+                t_name=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+                local t_k8s_node
+                t_k8s_node=$(resolve_k8s_node_name "$t_ocid" "$k8s_nodes_json")
+                
+                if [[ -z "$t_k8s_node" ]]; then
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${RED}%-40s${NC} ${RED}%-8s${NC}\n" "$t_iid" "$t_name" "(not in K8s)" "Skip"
+                else
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${CYAN}%-40s${NC} ${GREEN}%-8s${NC}\n" "$t_iid" "$t_name" "$t_k8s_node" "Ready"
+                    TAINT_VALID+=("$t_iid|$t_ocid|$t_name|$t_k8s_node")
+                fi
+            done
+            
+            if [[ ${#TAINT_VALID[@]} -eq 0 ]]; then
+                echo ""
+                echo -e "${RED}No selected instances are K8s nodes${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}Commands to execute:${NC}"
+            for tv in "${TAINT_VALID[@]}"; do
+                local tv_node
+                tv_node=$(echo "$tv" | cut -d'|' -f4)
+                echo -e "  ${GRAY}kubectl taint node ${tv_node} newNode=true:NoSchedule${NC}"
+            done
+            echo ""
+            echo -n -e "${CYAN}Apply taint to ${#TAINT_VALID[@]} node(s)? [y/N]: ${NC}"
+            local taint_confirm
+            read -r taint_confirm
+            
+            if [[ ! "$taint_confirm" =~ ^[Yy] ]]; then
+                echo -e "${YELLOW}Cancelled${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== TAINT: Apply newNode=true:NoSchedule to ${#TAINT_VALID[@]} node(s) =====" >> "$taint_log_file"
+            local taint_ok=0 taint_fail=0
+            
+            for tv in "${TAINT_VALID[@]}"; do
+                IFS='|' read -r tv_iid tv_ocid tv_name tv_node <<< "$tv"
+                local cmd="kubectl taint node ${tv_node} newNode=true:NoSchedule"
+                
+                echo -e "${WHITE}[${tv_iid}] ${tv_name} → ${tv_node}${NC}"
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$taint_log_file"
+                
+                local result
+                result=$(eval "$cmd" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${GREEN}✓ Taint applied${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Tainted ${tv_node} (${tv_name})" >> "$taint_log_file"
+                    ((taint_ok++))
+                else
+                    # Check if already tainted
+                    if [[ "$result" == *"already has"* || "$result" == *"already exists"* ]]; then
+                        echo -e "  ${YELLOW}⚠ Already tainted${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: ${tv_node} already tainted" >> "$taint_log_file"
+                        ((taint_ok++))
+                    else
+                        echo -e "  ${RED}✗ Failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Taint ${tv_node}: ${result}" >> "$taint_log_file"
+                        ((taint_fail++))
+                    fi
+                fi
+            done
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}─── Taint Summary ───${NC}"
+            echo -e "  ${GREEN}Succeeded:${NC} ${taint_ok}  ${RED}Failed:${NC} ${taint_fail}"
+            echo -e "  ${GRAY}Log: ${taint_log_file}${NC}"
+            echo ""
+            echo -e "Press Enter to refresh..."
+            read -r
+            continue
+        fi
+        
+        #----------------------------------------------------------------------
+        # Untaint: Remove newNode=true:NoSchedule
+        # Usage: untaint i1 / untaint i1,i3 / untaint i1-i5 / untaint all
+        #----------------------------------------------------------------------
+        if [[ "$input" =~ ^untaint[[:space:]]+(.+)$ ]]; then
+            local untaint_targets="${BASH_REMATCH[1]}"
+            local untaint_log_file="${LOGS_DIR}/instance_taint_actions.log"
+            mkdir -p "$(dirname "$untaint_log_file")" 2>/dev/null
+            
+            if ! parse_instance_targets "$untaint_targets"; then
+                echo -e "${RED}No valid instances selected. Use: untaint i1, untaint i1,i3, untaint i1-i5, untaint all${NC}"
+                sleep 2
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${GREEN}═══ Remove Taint: newNode=true:NoSchedule ═══${NC}"
+            echo ""
+            
+            declare -a UNTAINT_VALID=()
+            printf "  ${BOLD}%-5s %-45s %-40s %-8s${NC}\n" "ID" "Display Name" "K8s Node Name" "Status"
+            print_separator 105
+            
+            for ti in "${!_PARSED_IDS[@]}"; do
+                local t_iid="${_PARSED_IDS[$ti]}"
+                local t_ocid="${_PARSED_OCIDS[$ti]}"
+                local t_name
+                t_name=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+                local t_k8s_node
+                t_k8s_node=$(resolve_k8s_node_name "$t_ocid" "$k8s_nodes_json")
+                
+                if [[ -z "$t_k8s_node" ]]; then
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${RED}%-40s${NC} ${RED}%-8s${NC}\n" "$t_iid" "$t_name" "(not in K8s)" "Skip"
+                else
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${CYAN}%-40s${NC} ${GREEN}%-8s${NC}\n" "$t_iid" "$t_name" "$t_k8s_node" "Ready"
+                    UNTAINT_VALID+=("$t_iid|$t_ocid|$t_name|$t_k8s_node")
+                fi
+            done
+            
+            if [[ ${#UNTAINT_VALID[@]} -eq 0 ]]; then
+                echo ""
+                echo -e "${RED}No selected instances are K8s nodes${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}Commands to execute:${NC}"
+            for tv in "${UNTAINT_VALID[@]}"; do
+                local tv_node
+                tv_node=$(echo "$tv" | cut -d'|' -f4)
+                echo -e "  ${GRAY}kubectl taint node ${tv_node} newNode=true:NoSchedule-${NC}"
+            done
+            echo ""
+            echo -n -e "${CYAN}Remove taint from ${#UNTAINT_VALID[@]} node(s)? [y/N]: ${NC}"
+            local untaint_confirm
+            read -r untaint_confirm
+            
+            if [[ ! "$untaint_confirm" =~ ^[Yy] ]]; then
+                echo -e "${YELLOW}Cancelled${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== UNTAINT: Remove newNode=true:NoSchedule from ${#UNTAINT_VALID[@]} node(s) =====" >> "$untaint_log_file"
+            local untaint_ok=0 untaint_fail=0
+            
+            for tv in "${UNTAINT_VALID[@]}"; do
+                IFS='|' read -r tv_iid tv_ocid tv_name tv_node <<< "$tv"
+                local cmd="kubectl taint node ${tv_node} newNode=true:NoSchedule-"
+                
+                echo -e "${WHITE}[${tv_iid}] ${tv_name} → ${tv_node}${NC}"
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$untaint_log_file"
+                
+                local result
+                result=$(eval "$cmd" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${GREEN}✓ Taint removed${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Untainted ${tv_node} (${tv_name})" >> "$untaint_log_file"
+                    ((untaint_ok++))
+                else
+                    if [[ "$result" == *"not found"* ]]; then
+                        echo -e "  ${YELLOW}⚠ Taint not present${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: ${tv_node} taint not found" >> "$untaint_log_file"
+                        ((untaint_ok++))
+                    else
+                        echo -e "  ${RED}✗ Failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Untaint ${tv_node}: ${result}" >> "$untaint_log_file"
+                        ((untaint_fail++))
+                    fi
+                fi
+            done
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}─── Untaint Summary ───${NC}"
+            echo -e "  ${GREEN}Succeeded:${NC} ${untaint_ok}  ${RED}Failed:${NC} ${untaint_fail}"
+            echo -e "  ${GRAY}Log: ${untaint_log_file}${NC}"
+            echo ""
+            echo -e "Press Enter to refresh..."
+            read -r
+            continue
+        fi
+        
+        #----------------------------------------------------------------------
+        # Cordon: kubectl cordon node(s)
+        # Usage: cordon i1 / cordon i1,i3 / cordon i1-i5 / cordon all
+        #----------------------------------------------------------------------
+        if [[ "$input" =~ ^cordon[[:space:]]+(.+)$ ]]; then
+            local cordon_targets="${BASH_REMATCH[1]}"
+            local cordon_log_file="${LOGS_DIR}/instance_cordon_actions.log"
+            mkdir -p "$(dirname "$cordon_log_file")" 2>/dev/null
+            
+            if ! parse_instance_targets "$cordon_targets"; then
+                echo -e "${RED}No valid instances selected. Use: cordon i1, cordon i1,i3, cordon i1-i5, cordon all${NC}"
+                sleep 2
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${YELLOW}═══ Cordon K8s Nodes ═══${NC}"
+            echo ""
+            
+            declare -a CORDON_VALID=()
+            printf "  ${BOLD}%-5s %-45s %-40s %-8s${NC}\n" "ID" "Display Name" "K8s Node Name" "Status"
+            print_separator 105
+            
+            for ti in "${!_PARSED_IDS[@]}"; do
+                local t_iid="${_PARSED_IDS[$ti]}"
+                local t_ocid="${_PARSED_OCIDS[$ti]}"
+                local t_name
+                t_name=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+                local t_k8s_node
+                t_k8s_node=$(resolve_k8s_node_name "$t_ocid" "$k8s_nodes_json")
+                
+                if [[ -z "$t_k8s_node" ]]; then
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${RED}%-40s${NC} ${RED}%-8s${NC}\n" "$t_iid" "$t_name" "(not in K8s)" "Skip"
+                else
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${CYAN}%-40s${NC} ${GREEN}%-8s${NC}\n" "$t_iid" "$t_name" "$t_k8s_node" "Ready"
+                    CORDON_VALID+=("$t_iid|$t_ocid|$t_name|$t_k8s_node")
+                fi
+            done
+            
+            if [[ ${#CORDON_VALID[@]} -eq 0 ]]; then
+                echo ""
+                echo -e "${RED}No selected instances are K8s nodes${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}Commands to execute:${NC}"
+            for tv in "${CORDON_VALID[@]}"; do
+                local tv_node
+                tv_node=$(echo "$tv" | cut -d'|' -f4)
+                echo -e "  ${GRAY}kubectl cordon ${tv_node}${NC}"
+            done
+            echo ""
+            echo -n -e "${CYAN}Cordon ${#CORDON_VALID[@]} node(s)? [y/N]: ${NC}"
+            local cordon_confirm
+            read -r cordon_confirm
+            
+            if [[ ! "$cordon_confirm" =~ ^[Yy] ]]; then
+                echo -e "${YELLOW}Cancelled${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== CORDON: ${#CORDON_VALID[@]} node(s) =====" >> "$cordon_log_file"
+            local cordon_ok=0 cordon_fail=0
+            
+            for tv in "${CORDON_VALID[@]}"; do
+                IFS='|' read -r tv_iid tv_ocid tv_name tv_node <<< "$tv"
+                local cmd="kubectl cordon ${tv_node}"
+                
+                echo -e "${WHITE}[${tv_iid}] ${tv_name} → ${tv_node}${NC}"
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$cordon_log_file"
+                
+                local result
+                result=$(eval "$cmd" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${GREEN}✓ Cordoned${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Cordoned ${tv_node} (${tv_name})" >> "$cordon_log_file"
+                    ((cordon_ok++))
+                else
+                    echo -e "  ${RED}✗ Failed: ${result}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Cordon ${tv_node}: ${result}" >> "$cordon_log_file"
+                    ((cordon_fail++))
+                fi
+            done
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}─── Cordon Summary ───${NC}"
+            echo -e "  ${GREEN}Succeeded:${NC} ${cordon_ok}  ${RED}Failed:${NC} ${cordon_fail}"
+            echo -e "  ${GRAY}Log: ${cordon_log_file}${NC}"
+            echo ""
+            echo -e "Press Enter to refresh..."
+            read -r
+            continue
+        fi
+        
+        #----------------------------------------------------------------------
+        # Uncordon: kubectl uncordon node(s)
+        # Usage: uncordon i1 / uncordon i1,i3 / uncordon i1-i5 / uncordon all
+        #----------------------------------------------------------------------
+        if [[ "$input" =~ ^uncordon[[:space:]]+(.+)$ ]]; then
+            local uncordon_targets="${BASH_REMATCH[1]}"
+            local uncordon_log_file="${LOGS_DIR}/instance_cordon_actions.log"
+            mkdir -p "$(dirname "$uncordon_log_file")" 2>/dev/null
+            
+            if ! parse_instance_targets "$uncordon_targets"; then
+                echo -e "${RED}No valid instances selected. Use: uncordon i1, uncordon i1,i3, uncordon i1-i5, uncordon all${NC}"
+                sleep 2
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${GREEN}═══ Uncordon K8s Nodes ═══${NC}"
+            echo ""
+            
+            declare -a UNCORDON_VALID=()
+            printf "  ${BOLD}%-5s %-45s %-40s %-8s${NC}\n" "ID" "Display Name" "K8s Node Name" "Status"
+            print_separator 105
+            
+            for ti in "${!_PARSED_IDS[@]}"; do
+                local t_iid="${_PARSED_IDS[$ti]}"
+                local t_ocid="${_PARSED_OCIDS[$ti]}"
+                local t_name
+                t_name=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+                local t_k8s_node
+                t_k8s_node=$(resolve_k8s_node_name "$t_ocid" "$k8s_nodes_json")
+                
+                if [[ -z "$t_k8s_node" ]]; then
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${RED}%-40s${NC} ${RED}%-8s${NC}\n" "$t_iid" "$t_name" "(not in K8s)" "Skip"
+                else
+                    printf "  ${YELLOW}%-5s${NC} %-45s ${CYAN}%-40s${NC} ${GREEN}%-8s${NC}\n" "$t_iid" "$t_name" "$t_k8s_node" "Ready"
+                    UNCORDON_VALID+=("$t_iid|$t_ocid|$t_name|$t_k8s_node")
+                fi
+            done
+            
+            if [[ ${#UNCORDON_VALID[@]} -eq 0 ]]; then
+                echo ""
+                echo -e "${RED}No selected instances are K8s nodes${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}Commands to execute:${NC}"
+            for tv in "${UNCORDON_VALID[@]}"; do
+                local tv_node
+                tv_node=$(echo "$tv" | cut -d'|' -f4)
+                echo -e "  ${GRAY}kubectl uncordon ${tv_node}${NC}"
+            done
+            echo ""
+            echo -n -e "${CYAN}Uncordon ${#UNCORDON_VALID[@]} node(s)? [y/N]: ${NC}"
+            local uncordon_confirm
+            read -r uncordon_confirm
+            
+            if [[ ! "$uncordon_confirm" =~ ^[Yy] ]]; then
+                echo -e "${YELLOW}Cancelled${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== UNCORDON: ${#UNCORDON_VALID[@]} node(s) =====" >> "$uncordon_log_file"
+            local uncordon_ok=0 uncordon_fail=0
+            
+            for tv in "${UNCORDON_VALID[@]}"; do
+                IFS='|' read -r tv_iid tv_ocid tv_name tv_node <<< "$tv"
+                local cmd="kubectl uncordon ${tv_node}"
+                
+                echo -e "${WHITE}[${tv_iid}] ${tv_name} → ${tv_node}${NC}"
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$uncordon_log_file"
+                
+                local result
+                result=$(eval "$cmd" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${GREEN}✓ Uncordoned${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Uncordoned ${tv_node} (${tv_name})" >> "$uncordon_log_file"
+                    ((uncordon_ok++))
+                else
+                    echo -e "  ${RED}✗ Failed: ${result}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Uncordon ${tv_node}: ${result}" >> "$uncordon_log_file"
+                    ((uncordon_fail++))
+                fi
+            done
+            
+            echo ""
+            echo -e "${BOLD}${WHITE}─── Uncordon Summary ───${NC}"
+            echo -e "  ${GREEN}Succeeded:${NC} ${uncordon_ok}  ${RED}Failed:${NC} ${uncordon_fail}"
+            echo -e "  ${GRAY}Log: ${uncordon_log_file}${NC}"
+            echo ""
+            echo -e "Press Enter to refresh..."
+            read -r
+            continue
+        fi
+        
+        #----------------------------------------------------------------------
+        # CDT: Cordon → Drain → Tag → Terminate workflow
+        # Usage: cdt i1 / cdt i1,i3 / cdt i1-i5 / cdt all
+        #----------------------------------------------------------------------
+        if [[ "$input" =~ ^cdt[[:space:]]+(.+)$ ]]; then
+            local cdt_targets="${BASH_REMATCH[1]}"
+            local cdt_log_file="${LOGS_DIR}/instance_cdt_actions.log"
+            mkdir -p "$(dirname "$cdt_log_file")" 2>/dev/null
+            
+            if ! parse_instance_targets "$cdt_targets"; then
+                echo -e "${RED}No valid instances selected. Use: cdt i1, cdt i1,i3, cdt i1-i5, cdt all${NC}"
+                sleep 2
+                continue
+            fi
+            
+            echo ""
+            echo -e "${RED}╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}║                            ⚠️  CORDON → DRAIN → TAG → TERMINATE  ⚠️                                        ║${NC}"
+            echo -e "${RED}╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${WHITE}This workflow will execute the following steps for each instance:${NC}"
+            echo -e "  ${YELLOW}1.${NC} ${CYAN}Cordon${NC}    - Mark K8s node as unschedulable"
+            echo -e "  ${YELLOW}2.${NC} ${CYAN}Drain${NC}     - Evict all pods (--ignore-daemonsets --delete-emptydir-data --force --timeout=300s)"
+            echo -e "  ${YELLOW}3.${NC} ${CYAN}Tag${NC}       - Apply defined-tag ${MAGENTA}ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy${NC}"
+            echo -e "  ${YELLOW}4.${NC} ${RED}Terminate${NC} - Terminate OCI instance (boot volume deleted)"
+            echo ""
+            
+            # Build validated list
+            declare -a CDT_VALID=()
+            printf "  ${BOLD}%-5s %-45s %-40s %-10s %-8s %-10s${NC}\n" "ID" "Display Name" "K8s Node Name" "State" "Cordon" "Taint"
+            print_separator 125
+            
+            for ti in "${!_PARSED_IDS[@]}"; do
+                local t_iid="${_PARSED_IDS[$ti]}"
+                local t_ocid="${_PARSED_OCIDS[$ti]}"
+                local t_name t_state
+                t_name=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+                t_state=$(echo "$instances_json" | jq -r --arg id "$t_ocid" '.data[] | select(.id == $id) | .["lifecycle-state"] // "Unknown"' 2>/dev/null)
+                
+                local t_k8s_node=""
+                local t_cordon_status="-"
+                local t_taint_status="-"
+                
+                t_k8s_node=$(resolve_k8s_node_name "$t_ocid" "$k8s_nodes_json")
+                
+                if [[ -n "$t_k8s_node" ]]; then
+                    # Get cordon and taint status
+                    local k8s_match
+                    k8s_match=$(echo "$k8s_lookup" | grep "$t_ocid" 2>/dev/null)
+                    if [[ -n "$k8s_match" ]]; then
+                        local unschedulable new_node_taint
+                        new_node_taint=$(echo "$k8s_match" | cut -d'|' -f4)
+                        unschedulable=$(echo "$k8s_match" | cut -d'|' -f5)
+                        [[ "$unschedulable" == "true" ]] && t_cordon_status="Yes"
+                        [[ "$new_node_taint" != "N/A" && -n "$new_node_taint" ]] && t_taint_status="newNode"
+                    fi
+                fi
+                
+                # Color state
+                local state_color="$GREEN"
+                case "$t_state" in STOPPED) state_color="$RED" ;; STARTING|STOPPING) state_color="$YELLOW" ;; esac
+                local cordon_color="$GRAY"
+                [[ "$t_cordon_status" == "Yes" ]] && cordon_color="$YELLOW"
+                local taint_color="$GRAY"
+                [[ "$t_taint_status" == "newNode" ]] && taint_color="$CYAN"
+                
+                local k8s_display="${t_k8s_node:-(not in K8s)}"
+                local k8s_col="$CYAN"
+                [[ -z "$t_k8s_node" ]] && k8s_col="$RED"
+                
+                printf "  ${YELLOW}%-5s${NC} %-45s ${k8s_col}%-40s${NC} ${state_color}%-10s${NC} ${cordon_color}%-8s${NC} ${taint_color}%-10s${NC}\n" \
+                    "$t_iid" "$t_name" "$k8s_display" "$t_state" "$t_cordon_status" "$t_taint_status"
+                
+                CDT_VALID+=("$t_iid|$t_ocid|$t_name|$t_state|$t_k8s_node")
+            done
+            
+            if [[ ${#CDT_VALID[@]} -eq 0 ]]; then
+                echo ""
+                echo -e "${RED}No valid instances selected${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            # K8s warnings
+            local cdt_no_k8s=0
+            for tv in "${CDT_VALID[@]}"; do
+                local tv_node
+                tv_node=$(echo "$tv" | cut -d'|' -f5)
+                [[ -z "$tv_node" ]] && ((cdt_no_k8s++))
+            done
+            if [[ $cdt_no_k8s -gt 0 ]]; then
+                echo ""
+                echo -e "${YELLOW}⚠ ${cdt_no_k8s} instance(s) not in K8s - cordon/drain steps will be skipped for those${NC}"
+            fi
+            
+            echo ""
+            echo -e "${RED}⚠️  WARNING: This will PERMANENTLY TERMINATE ${#CDT_VALID[@]} instance(s)!${NC}"
+            echo -e "${RED}   Boot volumes will be deleted. This action cannot be undone!${NC}"
+            echo ""
+            echo -n -e "${RED}Type 'CDT' to confirm cordon-drain-tag-terminate of ${#CDT_VALID[@]} instance(s): ${NC}"
+            local cdt_confirm
+            read -r cdt_confirm
+            
+            if [[ "$cdt_confirm" != "CDT" ]]; then
+                echo -e "${YELLOW}Cancelled${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                continue
+            fi
+            
+            echo ""
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== CDT WORKFLOW: ${#CDT_VALID[@]} instance(s) =====" >> "$cdt_log_file"
+            
+            local cdt_success=0 cdt_fail=0
+            
+            for tv in "${CDT_VALID[@]}"; do
+                IFS='|' read -r tv_iid tv_ocid tv_name tv_state tv_node <<< "$tv"
+                
+                echo -e "${BOLD}${WHITE}═══ [${tv_iid}] ${tv_name} ═══${NC}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- CDT START: ${tv_name} (${tv_ocid}) ---" >> "$cdt_log_file"
+                
+                local cdt_abort=false
+                
+                # ── Step 1: Cordon ──
+                if [[ -n "$tv_node" ]]; then
+                    local cmd="kubectl cordon ${tv_node}"
+                    echo -e "  ${CYAN}Step 1: Cordon${NC}"
+                    echo -e "  ${GRAY}$ ${cmd}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$cdt_log_file"
+                    
+                    local result
+                    result=$(eval "$cmd" 2>&1)
+                    if [[ $? -eq 0 || "$result" == *"already cordoned"* ]]; then
+                        echo -e "  ${GREEN}✓ Cordoned${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Cordoned ${tv_node}" >> "$cdt_log_file"
+                    else
+                        echo -e "  ${RED}✗ Cordon failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Cordon ${tv_node}: ${result}" >> "$cdt_log_file"
+                        echo -n -e "  ${YELLOW}Continue anyway? [y/N]: ${NC}"
+                        local cordon_cont
+                        read -r cordon_cont
+                        if [[ ! "$cordon_cont" =~ ^[Yy] ]]; then
+                            echo -e "  ${RED}Skipping this instance${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ABORTED: CDT for ${tv_name} (cordon failed)" >> "$cdt_log_file"
+                            cdt_abort=true
+                        fi
+                    fi
+                else
+                    echo -e "  ${YELLOW}Step 1: Cordon - Skipped (not in K8s)${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: Cordon - ${tv_name} not in K8s" >> "$cdt_log_file"
+                fi
+                
+                # ── Step 2: Drain ──
+                if [[ "$cdt_abort" != "true" && -n "$tv_node" ]]; then
+                    local cmd="kubectl drain ${tv_node} --ignore-daemonsets --delete-emptydir-data --force --timeout=300s"
+                    echo -e "  ${CYAN}Step 2: Drain${NC}"
+                    echo -e "  ${GRAY}$ ${cmd}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$cdt_log_file"
+                    
+                    echo -e "  ${YELLOW}Draining pods (timeout 300s)...${NC}"
+                    local result
+                    result=$(eval "$cmd" 2>&1)
+                    local drain_exit=$?
+                    
+                    if [[ $drain_exit -eq 0 ]]; then
+                        echo -e "  ${GREEN}✓ Drained${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Drained ${tv_node}" >> "$cdt_log_file"
+                    else
+                        echo -e "  ${RED}✗ Drain failed (exit code: ${drain_exit})${NC}"
+                        echo -e "  ${GRAY}${result}${NC}" | tail -5
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Drain ${tv_node}: exit=${drain_exit}" >> "$cdt_log_file"
+                        echo -n -e "  ${YELLOW}Continue to terminate anyway? [y/N]: ${NC}"
+                        local drain_cont
+                        read -r drain_cont
+                        if [[ ! "$drain_cont" =~ ^[Yy] ]]; then
+                            echo -e "  ${RED}Skipping this instance${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ABORTED: CDT for ${tv_name} (drain failed)" >> "$cdt_log_file"
+                            cdt_abort=true
+                        fi
+                    fi
+                elif [[ "$cdt_abort" != "true" ]]; then
+                    echo -e "  ${YELLOW}Step 2: Drain - Skipped (not in K8s)${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: Drain - ${tv_name} not in K8s" >> "$cdt_log_file"
+                fi
+                
+                # ── Step 3: Tag (ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy) ──
+                if [[ "$cdt_abort" != "true" ]]; then
+                    local tag_namespace="ComputeInstanceHostActions"
+                    local tag_key="CustomerReportedHostStatus"
+                    local tag_value="unhealthy"
+                    
+                    echo -e "  ${CYAN}Step 3: Tag${NC} ${MAGENTA}${tag_namespace}.${tag_key}=${tag_value}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Step 3: Tag ${tag_namespace}.${tag_key}=${tag_value}" >> "$cdt_log_file"
+                    
+                    # Fetch current defined tags (preserve existing)
+                    local inst_json
+                    inst_json=$(oci compute instance get \
+                        --instance-id "$tv_ocid" \
+                        --region "${EFFECTIVE_REGION:-$REGION}" \
+                        --output json 2>/dev/null)
+                    
+                    if [[ -n "$inst_json" ]]; then
+                        local current_defined_tags
+                        current_defined_tags=$(echo "$inst_json" | jq -r '.data["defined-tags"] // {}')
+                        
+                        # Merge new tag preserving all existing
+                        local updated_defined_tags
+                        updated_defined_tags=$(echo "$current_defined_tags" | jq --arg ns "$tag_namespace" --arg key "$tag_key" --arg val "$tag_value" '
+                            .[$ns] = ((.[$ns] // {}) + {($key): $val})
+                        ')
+                        
+                        local updated_tags_compact
+                        updated_tags_compact=$(echo "$updated_defined_tags" | jq -c '.')
+                        
+                        local cmd="oci compute instance update --instance-id ${tv_ocid} --region ${EFFECTIVE_REGION:-$REGION} --defined-tags '${updated_tags_compact}' --force"
+                        echo -e "  ${GRAY}$ oci compute instance update --instance-id ${tv_ocid} \\${NC}"
+                        echo -e "  ${GRAY}    --region ${EFFECTIVE_REGION:-$REGION} --defined-tags '<merged-tags>' --force${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$cdt_log_file"
+                        
+                        local tag_result
+                        tag_result=$(oci compute instance update \
+                            --instance-id "$tv_ocid" \
+                            --region "${EFFECTIVE_REGION:-$REGION}" \
+                            --defined-tags "$updated_defined_tags" \
+                            --force \
+                            --output json 2>&1)
+                        
+                        if [[ $? -eq 0 ]]; then
+                            # Verify the tag was applied
+                            local applied_tag
+                            applied_tag=$(echo "$tag_result" | jq -r --arg ns "$tag_namespace" --arg key "$tag_key" '.data["defined-tags"][$ns][$key] // "NOT_SET"' 2>/dev/null)
+                            echo -e "  ${GREEN}✓ Tagged: ${MAGENTA}${tag_namespace}.${tag_key}${NC} = ${RED}${applied_tag}${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Tagged ${tv_name} ${tag_namespace}.${tag_key}=${applied_tag}" >> "$cdt_log_file"
+                        else
+                            echo -e "  ${YELLOW}⚠ Tag failed (non-fatal): ${tag_result}${NC}"
+                            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Tag failed for ${tv_name}: ${tag_result}" >> "$cdt_log_file"
+                            # Check if namespace doesn't exist
+                            if echo "$tag_result" | grep -qi "TagDefinition\|TagNamespace\|does not exist"; then
+                                echo -e "  ${YELLOW}  ↳ Tag namespace '${tag_namespace}' may not exist in this tenancy${NC}"
+                            fi
+                        fi
+                    else
+                        echo -e "  ${YELLOW}⚠ Could not fetch instance tags (non-fatal)${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Could not fetch tags for ${tv_name}" >> "$cdt_log_file"
+                    fi
+                fi
+                
+                # ── Step 4: Terminate ──
+                if [[ "$cdt_abort" != "true" ]]; then
+                    local cmd="oci compute instance terminate --instance-id ${tv_ocid} --region ${EFFECTIVE_REGION:-$REGION} --preserve-boot-volume false --force"
+                    echo -e "  ${RED}Step 4: Terminate${NC}"
+                    echo -e "  ${GRAY}$ ${cmd}${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$cdt_log_file"
+                    
+                    local result
+                    result=$(oci compute instance terminate \
+                        --instance-id "$tv_ocid" \
+                        --region "${EFFECTIVE_REGION:-$REGION}" \
+                        --preserve-boot-volume false \
+                        --force 2>&1)
+                    if [[ $? -eq 0 ]]; then
+                        echo -e "  ${GREEN}✓ Terminate initiated${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Terminated ${tv_name} (${tv_ocid})" >> "$cdt_log_file"
+                        ((cdt_success++))
+                    else
+                        echo -e "  ${RED}✗ Terminate failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Terminate ${tv_name}: ${result}" >> "$cdt_log_file"
+                        ((cdt_fail++))
+                    fi
+                else
+                    ((cdt_fail++))
+                fi
+                
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- CDT END: ${tv_name} ---" >> "$cdt_log_file"
+                echo ""
+            done
+            
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== CDT COMPLETE: Success=${cdt_success} Failed=${cdt_fail} Total=${#CDT_VALID[@]} =====" >> "$cdt_log_file"
+            echo -e "${BOLD}${WHITE}═══ CDT Workflow Complete ═══${NC}"
+            echo -e "  ${GREEN}Success:${NC} ${cdt_success}  ${RED}Failed/Skipped:${NC} ${cdt_fail}  ${WHITE}Total:${NC} ${#CDT_VALID[@]}"
+            echo -e "  ${GRAY}Log: ${cdt_log_file}${NC}"
+            echo ""
+            echo -e "Press Enter to refresh..."
+            read -r
+            continue
         fi
         
         #----------------------------------------------------------------------
@@ -20888,7 +21679,8 @@ rename_instance_configuration_interactive() {
     echo ""
     
     # Log file for the action
-    local log_file="instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    local log_file="${LOGS_DIR}/instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     echo -e "${BOLD}${YELLOW}═══ CONFIRM RENAME ═══${NC}"
     echo ""
@@ -21082,7 +21874,8 @@ rename_single_instance_configuration() {
     fi
     
     # Log file
-    local log_file="instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    local log_file="${LOGS_DIR}/instance_config_rename_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     {
         echo "=========================================="
@@ -22821,7 +23614,8 @@ delete_compute_cluster_interactive() {
     echo ""
     
     # Log file for the action
-    local log_file="compute_cluster_delete_$(date +%Y%m%d_%H%M%S).log"
+    local log_file="${LOGS_DIR}/compute_cluster_delete_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     echo -e "${BOLD}${RED}═══ CONFIRM DELETION ═══${NC}"
     echo ""
@@ -23013,7 +23807,8 @@ create_compute_cluster_interactive() {
     echo ""
     
     # Log file for the action
-    local log_file="compute_cluster_create_$(date +%Y%m%d_%H%M%S).log"
+    local log_file="${LOGS_DIR}/compute_cluster_create_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
     
     echo -e "${BOLD}${RED}═══ CONFIRM CREATION ═══${NC}"
     echo ""
@@ -25943,7 +26738,7 @@ fss_show_export_detail() {
 #--------------------------------------------------------------------------------
 fss_delete_file_system_direct() {
     local compartment_id="$1"
-    local log_file="${MAINTENANCE_LOG_FILE:-./logs/k8s_maintenance_$(date +%Y%m%d).log}"
+    local log_file="${MAINTENANCE_LOG_FILE}"
     
     echo ""
     echo -e "${BOLD}${RED}═══ Delete File System ═══${NC}"
@@ -25981,7 +26776,7 @@ fss_delete_file_system_direct() {
 #--------------------------------------------------------------------------------
 fss_delete_mount_target_direct() {
     local compartment_id="$1"
-    local log_file="${MAINTENANCE_LOG_FILE:-./logs/k8s_maintenance_$(date +%Y%m%d).log}"
+    local log_file="${MAINTENANCE_LOG_FILE}"
     
     echo ""
     echo -e "${BOLD}${RED}═══ Delete Mount Target ═══${NC}"
@@ -26019,7 +26814,7 @@ fss_delete_mount_target_direct() {
 #--------------------------------------------------------------------------------
 fss_delete_export_direct() {
     local compartment_id="$1"
-    local log_file="${MAINTENANCE_LOG_FILE:-./logs/k8s_maintenance_$(date +%Y%m%d).log}"
+    local log_file="${MAINTENANCE_LOG_FILE}"
     
     echo ""
     echo -e "${BOLD}${RED}═══ Delete Export ═══${NC}"
@@ -31772,8 +32567,8 @@ EOF
     echo ""
     
     # Ensure logs directory exists
-    mkdir -p ./logs 2>/dev/null
-    local log_file="./logs/instance_config_create_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "${LOGS_DIR}" 2>/dev/null
+    local log_file="${LOGS_DIR}/instance_config_create_$(date +%Y%m%d_%H%M%S).log"
     
     echo -e "${BOLD}${RED}═══ CONFIRM CREATION ═══${NC}"
     echo ""
