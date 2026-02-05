@@ -9292,32 +9292,31 @@ manage_identity_domains() {
             return
         fi
         
-        # Display domain list
-        printf "${BOLD}%-3s  %-35s  %-12s  %-15s  %-10s  %s${NC}\n" \
-            "#" "Domain Name" "Type" "License" "State" "URL"
-        printf "${WHITE}%-3s  %-35s  %-12s  %-15s  %-10s  %s${NC}\n" \
-            "---" "-----------------------------------" "------------" "---------------" "----------" "--------------------------------------------"
-        
+        # Display domain list in aligned columns
+        printf "${BOLD}%-3s  %-35s  %-12s  %-15s  %-10s  %-8s  %s${NC}\n" \
+            "#" "Domain Name" "Type" "License" "State" "Default" "URL"
+        print_separator 160
+
         local idx=0
         declare -A _DOM_IDS
         declare -A _DOM_NAMES
         declare -A _DOM_URLS
-        
+
         while IFS=$'\t' read -r d_name d_type d_license d_state d_url d_id d_is_default d_compartment; do
             ((idx++))
             _DOM_IDS[$idx]="$d_id"
             _DOM_NAMES[$idx]="$d_name"
             _DOM_URLS[$idx]="$d_url"
-            
+
             local state_color="$GREEN"
             [[ "$d_state" != "ACTIVE" ]] && state_color="$YELLOW"
             [[ "$d_state" == "FAILED" ]] && state_color="$RED"
-            
-            local default_tag=""
-            [[ "$d_is_default" == "true" ]] && default_tag=" ${CYAN}(default)${NC}"
-            
-            printf "${YELLOW}%-3s${NC}  ${WHITE}%-35s${NC}  ${CYAN}%-12s${NC}  %-15s  ${state_color}%-10s${NC}  ${GRAY}%s${NC}%b\n" \
-                "$idx" "${d_name:0:35}" "${d_type:0:12}" "${d_license:0:15}" "$d_state" "${d_url:0:44}" "$default_tag"
+
+            local default_display="No"
+            [[ "$d_is_default" == "true" ]] && default_display="Yes"
+
+            printf "${YELLOW}%-3s${NC}  ${WHITE}%-35s${NC}  ${CYAN}%-12s${NC}  %-15s  ${state_color}%-10s${NC}  ${CYAN}%-8s${NC}  ${GRAY}%s${NC}\n" \
+                "$idx" "${d_name:0:35}" "${d_type:0:12}" "${d_license:0:15}" "$d_state" "$default_display" "$d_url"
         done < <(echo "$domains_json" | jq -r '
             (.data // [])[] |
             [
@@ -9392,9 +9391,14 @@ _identity_domain_submenu() {
         echo -e "  ${YELLOW}10${NC}) ${WHITE}Create Group${NC}                  - Create a new group in this domain"
         echo -e "  ${YELLOW}11${NC}) ${WHITE}Create Dynamic Group${NC}          - Create a new dynamic group"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Domain: ${domain_name}] Enter selection [1-11, back]: ${NC}"
+        echo -e "${BOLD}${BLUE}─── Update ───${NC}"
+        echo -e "  ${YELLOW}12${NC}) ${WHITE}Update User${NC}                   - Update an existing user in this domain"
+        echo -e "  ${YELLOW}13${NC}) ${WHITE}Update Group${NC}                  - Update an existing group in this domain"
+        echo -e "  ${YELLOW}14${NC}) ${WHITE}Update Dynamic Group${NC}          - Update an existing dynamic group"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Domain: ${domain_name}] Enter selection [1-14, back]: ${NC}"
         read -r sub_choice
-        
+
         case "$sub_choice" in
             ""|back|b|q)
                 return
@@ -9410,6 +9414,9 @@ _identity_domain_submenu() {
             9)  _identity_create_user "$domain_url" "$tenancy_id" "$domain_name" ;;
             10) _identity_create_group "$domain_url" "$tenancy_id" ;;
             11) _identity_create_dynamic_group "$domain_url" "$tenancy_id" ;;
+            12) _identity_update_user "$domain_url" "$tenancy_id" "$domain_name" ;;
+            13) _identity_update_group "$domain_url" "$tenancy_id" "$domain_name" ;;
+            14) _identity_update_dynamic_group "$domain_url" "$tenancy_id" ;;
             *)
                 echo -e "${RED}Invalid selection${NC}"
                 sleep 1
@@ -9460,10 +9467,22 @@ _identity_domain_detail() {
     
     echo ""
     echo -e "  ${CYAN}Replica Regions:${NC}"
-    echo "$detail_json" | jq -r '
-        (.data["replica-regions"] // [])[] |
-        "    - \(.region // "N/A")  (State: \(.state // "N/A"))"
-    ' 2>/dev/null || echo -e "    ${GRAY}(none)${NC}"
+    local replica_count
+    replica_count=$(echo "$detail_json" | jq '(.data["replica-regions"] // []) | length' 2>/dev/null)
+    if [[ "$replica_count" -gt 0 && "$replica_count" != "null" ]]; then
+        printf "    ${BOLD}%-20s  %-12s  %s${NC}\n" "Region" "State" "URL"
+        printf "    %-20s  %-12s  %s\n" "--------------------" "------------" "────────────────────────────────────────────────────────────────"
+        echo "$detail_json" | jq -r '
+            (.data["replica-regions"] // [])[] |
+            "\(.region // "N/A")\t\(.state // "N/A")\t\(.url // "N/A")"
+        ' 2>/dev/null | while IFS=$'\t' read -r rep_region rep_state rep_url; do
+            local rep_state_color="$GREEN"
+            [[ "$rep_state" != "READY" && "$rep_state" != "ACTIVE" ]] && rep_state_color="$YELLOW"
+            printf "    ${WHITE}%-20s${NC}  ${rep_state_color}%-12s${NC}  ${GRAY}%s${NC}\n" "$rep_region" "$rep_state" "$rep_url"
+        done
+    else
+        echo -e "    ${GRAY}(none)${NC}"
+    fi
     
     echo ""
     echo -e "Press Enter to continue..."
@@ -9471,7 +9490,7 @@ _identity_domain_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Users (oci identity-domains user list)
+# List Users (oci identity-domains users list)
 # Groups are embedded in user SCIM response - no N+1 membership queries needed
 #--------------------------------------------------------------------------------
 _identity_list_users() {
@@ -9480,62 +9499,64 @@ _identity_list_users() {
     local domain_name="$3"
     
     echo ""
-    local cmd="oci identity-domains user list --endpoint \"$domain_url\" --attribute-sets all --all"
+    local cmd="oci identity-domains users list --endpoint \"$domain_url\" --attribute-sets all --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching users from identity domain...${NC}"
-    
+
     local users_json
-    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
-    
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+
     if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch users. Check permissions (identity-domains user list).${NC}"
+        echo -e "${RED}Failed to fetch users. Check permissions (identity-domains users list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
-    
-    local user_count
+
+    local user_count total_user_count
     user_count=$(echo "$users_json" | jq '[(.resources // [])[] | select(.active == true)] | length')
-    
+    total_user_count=$(echo "$users_json" | jq '(.resources // []) | length')
+
     echo ""
-    echo -e "${BOLD}${WHITE}═══ Users (${user_count} active) ═══${NC}"
+    echo -e "${BOLD}${WHITE}═══ Users (${user_count} active / ${total_user_count} total) ═══${NC}"
     echo ""
-    
-    printf "${BOLD}%-3s  %-30s  %-35s  %-10s  %-10s  %s${NC}\n" \
-        "#" "Username" "Email" "State" "Created" "Groups"
-    printf "${WHITE}%-3s  %-30s  %-35s  %-10s  %-10s  %s${NC}\n" \
-        "---" "------------------------------" "-----------------------------------" "----------" "----------" "──────────────────────────────────────────"
-    
+
+    printf "${BOLD}%-3s  %-30s  %-40s  %-10s  %-12s  %-10s  %s${NC}\n" \
+        "#" "Username" "Email" "State" "User Type" "Created" "Groups"
+    print_separator 160
+
     local idx=0
     declare -A _USR_IDS
     declare -A _USR_NAMES
-    
-    while IFS=$'\t' read -r u_name u_email u_active u_id u_created u_groups; do
+
+    while IFS=$'\t' read -r u_name u_email u_active u_id u_created u_groups u_display_name u_user_type; do
         [[ -z "$u_name" ]] && continue
         ((idx++))
         _USR_IDS[$idx]="$u_id"
         _USR_NAMES[$idx]="$u_name"
-        
+
         local state_display="ACTIVE"
         local state_color="$GREEN"
         if [[ "$u_active" != "true" ]]; then
             state_display="INACTIVE"
             state_color="$RED"
         fi
-        
+
         local created_short="${u_created:0:10}"
-        
-        printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}  ${state_color}%-10s${NC}  ${GRAY}%-10s${NC}  ${MAGENTA}%s${NC}\n" \
-            "$idx" "${u_name:0:30}" "${u_email:0:35}" "$state_display" "$created_short" "${u_groups}"
+
+        printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-40s${NC}  ${state_color}%-10s${NC}  ${CYAN}%-12s${NC}  ${GRAY}%-10s${NC}  ${MAGENTA}%s${NC}\n" \
+            "$idx" "${u_name:0:30}" "${u_email:0:40}" "$state_display" "${u_user_type:0:12}" "$created_short" "${u_groups}"
     done < <(echo "$users_json" | jq -r '
-        (.resources // [])[] | select(.active == true) |
+        (.resources // [])[] |
         [
             (.["user-name"] // "N/A"),
             ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
             (if .active then "true" else "false" end),
             (.id // "N/A"),
             ((.meta // {}).created // "N/A"),
-            ([(.groups // [])[] | .display] | join(", "))
+            ([(.groups // [])[] | .display] | join(", ")),
+            (.["display-name"] // "N/A"),
+            (.["user-type"] // "N/A")
         ] | @tsv
     ' 2>/dev/null)
     
@@ -9549,7 +9570,7 @@ _identity_list_users() {
 }
 
 #--------------------------------------------------------------------------------
-# User Detail View (oci identity-domains user get)
+# User Detail View (oci identity-domains users get)
 # Groups are embedded - no separate membership query needed
 #--------------------------------------------------------------------------------
 _identity_user_detail() {
@@ -9559,12 +9580,12 @@ _identity_user_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains user get --user-id \"$user_id\" --endpoint \"$domain_url\" --attribute-sets all"
+    local cmd="oci identity-domains users get --user-id \"$user_id\" --endpoint \"$domain_url\" --attribute-sets all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching user details...${NC}"
-    
+
     local user_json
-    user_json=$(oci identity-domains user get --user-id "$user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+    user_json=$(oci identity-domains users get --user-id "$user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
     if [[ -z "$user_json" ]]; then
         echo -e "${RED}Failed to fetch user details${NC}"
@@ -9878,7 +9899,7 @@ USER_POL_SEARCH_EOF
 }
 
 #--------------------------------------------------------------------------------
-# List Groups with Member Count (oci identity-domains group list)
+# List Groups with Member Count (oci identity-domains groups list)
 # Members are embedded in SCIM group response
 #--------------------------------------------------------------------------------
 _identity_list_groups() {
@@ -9887,54 +9908,53 @@ _identity_list_groups() {
     local domain_name="$3"
     
     echo ""
-    local cmd="oci identity-domains group list --endpoint \"$domain_url\" --attribute-sets all --all"
+    local cmd="oci identity-domains groups list --endpoint \"$domain_url\" --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching groups from identity domain...${NC}"
-    
+
     local groups_json
-    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
-    
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+
     if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch groups. Check permissions (identity-domains group list).${NC}"
+        echo -e "${RED}Failed to fetch groups. Check permissions (identity-domains groups list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
-    
+
     local group_count
     group_count=$(echo "$groups_json" | jq '(.resources // []) | length')
-    
+
     echo ""
     echo -e "${BOLD}${WHITE}═══ Groups (${group_count}) ═══${NC}"
     echo ""
-    
-    printf "${BOLD}%-3s  %-40s  %-10s  %-8s  %-15s  %s${NC}\n" \
+
+    printf "${BOLD}%-3s  %-40s  %-10s  %-8s  %-12s  %s${NC}\n" \
         "#" "Group Name" "State" "Members" "Created" "Description"
-    printf "${WHITE}%-3s  %-40s  %-10s  %-8s  %-15s  %s${NC}\n" \
-        "---" "----------------------------------------" "----------" "--------" "---------------" "-------------------------------------------"
-    
+    print_separator 160
+
     local idx=0
     declare -A _GRP_IDS
     declare -A _GRP_NAMES
-    
+
     while IFS=$'\t' read -r g_name g_active g_id g_created g_desc g_member_count; do
         [[ -z "$g_name" ]] && continue
         ((idx++))
         _GRP_IDS[$idx]="$g_id"
         _GRP_NAMES[$idx]="$g_name"
-        
+
         local state_display="ACTIVE"
         local state_color="$GREEN"
         if [[ "$g_active" != "true" ]]; then
             state_display="INACTIVE"
             state_color="$YELLOW"
         fi
-        
+
         local mem_color="$CYAN"
         [[ "$g_member_count" == "0" ]] && mem_color="$GRAY"
-        
-        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${mem_color}%-8s${NC}  ${GRAY}%-15s${NC}  ${GRAY}%s${NC}\n" \
-            "$idx" "${g_name:0:40}" "$state_display" "$g_member_count" "${g_created:0:10}" "${g_desc:0:43}"
+
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${mem_color}%-8s${NC}  ${GRAY}%-12s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${g_name:0:40}" "$state_display" "$g_member_count" "${g_created:0:10}" "${g_desc:0:50}"
     done < <(echo "$groups_json" | jq -r '
         (.resources // [])[] |
         [
@@ -9957,7 +9977,7 @@ _identity_list_groups() {
 }
 
 #--------------------------------------------------------------------------------
-# Group Detail View (oci identity-domains group get)
+# Group Detail View (oci identity-domains groups get)
 # Members are embedded - no separate user-group-membership query needed
 #--------------------------------------------------------------------------------
 _identity_group_detail() {
@@ -9967,13 +9987,13 @@ _identity_group_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains group get --group-id \"$group_id\" --endpoint \"$domain_url\" --attribute-sets all"
+    local cmd="oci identity-domains groups get --group-id \"$group_id\" --endpoint \"$domain_url\" --attribute-sets all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${BOLD}${WHITE}═══ Group Details: ${MAGENTA}${group_name}${WHITE} ═══${NC}"
     echo ""
-    
+
     local group_json
-    group_json=$(oci identity-domains group get --group-id "$group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+    group_json=$(oci identity-domains groups get --group-id "$group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
     if [[ -n "$group_json" ]]; then
         echo "$group_json" | jq -r '
@@ -10036,61 +10056,60 @@ _identity_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Dynamic Groups (oci identity-domains dynamic-resource-group list)
+# List Dynamic Groups (oci identity-domains dynamic-resource-groups list)
 #--------------------------------------------------------------------------------
 _identity_list_dynamic_groups() {
     local domain_url="$1"
     local tenancy_id="$2"
     
     echo ""
-    local cmd="oci identity-domains dynamic-resource-group list --endpoint \"$domain_url\" --all"
+    local cmd="oci identity-domains dynamic-resource-groups list --endpoint \"$domain_url\" --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching dynamic groups from identity domain...${NC}"
-    
+
     local dg_json
-    dg_json=$(oci identity-domains dynamic-resource-group list --endpoint "$domain_url" --all --output json 2>/dev/null)
-    
+    dg_json=$(oci identity-domains dynamic-resource-groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+
     if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch dynamic groups. Check permissions (identity-domains dynamic-resource-group list).${NC}"
+        echo -e "${RED}Failed to fetch dynamic groups. Check permissions (identity-domains dynamic-resource-groups list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
-    
+
     local dg_count
     dg_count=$(echo "$dg_json" | jq '(.resources // []) | length')
-    
+
     echo ""
     echo -e "${BOLD}${WHITE}═══ Dynamic Groups (${dg_count}) ═══${NC}"
     echo ""
-    
+
     local idx=0
     declare -A _DG_IDS
     declare -A _DG_NAMES
-    
-    printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "#" "Dynamic Group Name" "Active" "Matching Rule"
-    printf "${WHITE}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "---" "----------------------------------------" "----------" "────────────────────────────────────────────────────────────────"
-    
+
+    printf "${BOLD}%-3s  %-40s  %-10s  %-40s  %s${NC}\n" \
+        "#" "Dynamic Group Name" "Active" "Description" "Matching Rule"
+    print_separator 160
+
     while IFS=$'\t' read -r dg_name dg_active dg_id dg_rule dg_desc; do
         [[ -z "$dg_name" ]] && continue
         ((idx++))
         _DG_IDS[$idx]="$dg_id"
         _DG_NAMES[$idx]="$dg_name"
-        
+
         local state_display="Yes"
         local state_color="$GREEN"
         if [[ "$dg_active" != "true" ]]; then
             state_display="No"
             state_color="$YELLOW"
         fi
-        
-        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-            "$idx" "${dg_name:0:40}" "$state_display" "${dg_rule:0:65}"
+
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%-40s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${dg_name:0:40}" "$state_display" "${dg_desc:0:40}" "${dg_rule:0:70}"
         # Show full rule if truncated
-        if [[ ${#dg_rule} -gt 65 ]]; then
-            printf "     %-40s  %-10s  ${GRAY}%s${NC}\n" "" "" "${dg_rule:65}"
+        if [[ ${#dg_rule} -gt 70 ]]; then
+            printf "     %-40s  %-10s  %-40s  ${GRAY}%s${NC}\n" "" "" "" "${dg_rule:70}"
         fi
     done < <(echo "$dg_json" | jq -r '
         (.resources // [])[] |
@@ -10113,7 +10132,7 @@ _identity_list_dynamic_groups() {
 }
 
 #--------------------------------------------------------------------------------
-# Dynamic Group Detail View (oci identity-domains dynamic-resource-group get)
+# Dynamic Group Detail View (oci identity-domains dynamic-resource-groups get)
 #--------------------------------------------------------------------------------
 _identity_dynamic_group_detail() {
     local dg_id="$1"
@@ -10122,10 +10141,10 @@ _identity_dynamic_group_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains dynamic-resource-group get --dynamic-resource-group-id \"$dg_id\" --endpoint \"$domain_url\""
+    local cmd="oci identity-domains dynamic-resource-groups get --dynamic-resource-group-id \"$dg_id\" --endpoint \"$domain_url\""
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     local dg_json
-    dg_json=$(oci identity-domains dynamic-resource-group get --dynamic-resource-group-id "$dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
+    dg_json=$(oci identity-domains dynamic-resource-groups get --dynamic-resource-group-id "$dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
     
     if [[ -z "$dg_json" ]]; then
         echo -e "${RED}Failed to fetch dynamic group details${NC}"
@@ -10183,18 +10202,18 @@ _identity_dynamic_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Identity Providers (oci identity-domains identity-provider list)
+# List Identity Providers (oci identity-domains identity-providers list)
 #--------------------------------------------------------------------------------
 _identity_list_identity_providers() {
     local domain_url="$1"
     
     echo ""
-    local cmd="oci identity-domains identity-provider list --endpoint \"$domain_url\" --all"
+    local cmd="oci identity-domains identity-providers list --endpoint \"$domain_url\" --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching identity providers from domain...${NC}"
-    
+
     local idp_json
-    idp_json=$(oci identity-domains identity-provider list --endpoint "$domain_url" --all --output json 2>/dev/null)
+    idp_json=$(oci identity-domains identity-providers list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Identity Providers / Federation ═══${NC}"
@@ -10241,7 +10260,7 @@ _identity_list_identity_providers() {
 }
 
 #--------------------------------------------------------------------------------
-# Search Users by keyword (oci identity-domains user list + client filter)
+# Search Users by keyword (oci identity-domains users list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_users() {
     local domain_url="$1"
@@ -10257,51 +10276,50 @@ _identity_search_users() {
     fi
     
     echo -e "${GRAY}Searching users for '${search_kw}'...${NC}"
-    
+
     local users_json
-    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
-    
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+
     if [[ -z "$users_json" ]]; then
         echo -e "${RED}Failed to fetch users${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
-    
+
     echo ""
     echo -e "${BOLD}${WHITE}═══ User Search Results: '${YELLOW}${search_kw}${WHITE}' ═══${NC}"
     echo ""
-    
+
     local idx=0
     declare -A _USR_SEARCH_IDS
     declare -A _USR_SEARCH_NAMES
-    
-    printf "${BOLD}%-3s  %-30s  %-35s  %-10s  %s${NC}\n" \
-        "#" "Username" "Email" "State" "Created"
-    printf "${WHITE}%-3s  %-30s  %-35s  %-10s  %s${NC}\n" \
-        "---" "------------------------------" "-----------------------------------" "----------" "---------------"
-    
-    while IFS=$'\t' read -r u_name u_email u_active u_id u_created; do
+
+    printf "${BOLD}%-3s  %-30s  %-40s  %-10s  %-12s  %s${NC}\n" \
+        "#" "Username" "Email" "State" "User Type" "Created"
+    print_separator 130
+
+    while IFS=$'\t' read -r u_name u_email u_active u_id u_created u_user_type; do
         [[ -z "$u_name" ]] && continue
         # Case-insensitive match on name or email
         local search_lower="${search_kw,,}"
         local name_lower="${u_name,,}"
         local email_lower="${u_email,,}"
-        
+
         if [[ "$name_lower" == *"$search_lower"* ]] || [[ "$email_lower" == *"$search_lower"* ]]; then
             ((idx++))
             _USR_SEARCH_IDS[$idx]="$u_id"
             _USR_SEARCH_NAMES[$idx]="$u_name"
-            
+
             local state_display="ACTIVE"
             local state_color="$GREEN"
             if [[ "$u_active" != "true" ]]; then
                 state_display="INACTIVE"
                 state_color="$YELLOW"
             fi
-            
-            printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-                "$idx" "${u_name:0:30}" "${u_email:0:35}" "$state_display" "${u_created:0:10}"
+
+            printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-40s${NC}  ${state_color}%-10s${NC}  ${CYAN}%-12s${NC}  ${GRAY}%s${NC}\n" \
+                "$idx" "${u_name:0:30}" "${u_email:0:40}" "$state_display" "${u_user_type:0:12}" "${u_created:0:10}"
         fi
     done < <(echo "$users_json" | jq -r '
         (.resources // [])[] |
@@ -10310,7 +10328,8 @@ _identity_search_users() {
             ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
             (if .active then "true" else "false" end),
             (.id // "N/A"),
-            ((.meta // {}).created // "N/A")
+            ((.meta // {}).created // "N/A"),
+            (.["user-type"] // "N/A")
         ] | @tsv
     ' 2>/dev/null)
     
@@ -10328,7 +10347,7 @@ _identity_search_users() {
 }
 
 #--------------------------------------------------------------------------------
-# Search Groups by keyword (oci identity-domains group list + client filter)
+# Search Groups by keyword (oci identity-domains groups list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_groups() {
     local domain_url="$1"
@@ -10344,50 +10363,52 @@ _identity_search_groups() {
     fi
     
     echo -e "${GRAY}Searching groups for '${search_kw}'...${NC}"
-    
+
     local groups_json
-    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --all --output json 2>/dev/null)
-    
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+
     if [[ -z "$groups_json" ]]; then
         echo -e "${RED}Failed to fetch groups${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
-    
+
     echo ""
     echo -e "${BOLD}${WHITE}═══ Group Search Results: '${YELLOW}${search_kw}${WHITE}' ═══${NC}"
     echo ""
-    
+
     local idx=0
     declare -A _GRP_SEARCH_IDS
     declare -A _GRP_SEARCH_NAMES
-    
-    printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "#" "Group Name" "Active" "Description"
-    printf "${WHITE}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "---" "----------------------------------------" "----------" "---------------------------------------------"
-    
-    while IFS=$'\t' read -r g_name g_active g_id g_desc; do
+
+    printf "${BOLD}%-3s  %-40s  %-10s  %-8s  %s${NC}\n" \
+        "#" "Group Name" "Active" "Members" "Description"
+    print_separator 130
+
+    while IFS=$'\t' read -r g_name g_active g_id g_desc g_member_count; do
         [[ -z "$g_name" ]] && continue
         local search_lower="${search_kw,,}"
         local name_lower="${g_name,,}"
         local desc_lower="${g_desc,,}"
-        
+
         if [[ "$name_lower" == *"$search_lower"* ]] || [[ "$desc_lower" == *"$search_lower"* ]]; then
             ((idx++))
             _GRP_SEARCH_IDS[$idx]="$g_id"
             _GRP_SEARCH_NAMES[$idx]="$g_name"
-            
+
             local state_display="Yes"
             local state_color="$GREEN"
             if [[ "$g_active" != "true" ]]; then
                 state_display="No"
                 state_color="$YELLOW"
             fi
-            
-            printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-                "$idx" "${g_name:0:40}" "$state_display" "${g_desc:0:45}"
+
+            local mem_color="$CYAN"
+            [[ "$g_member_count" == "0" ]] && mem_color="$GRAY"
+
+            printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${mem_color}%-8s${NC}  ${GRAY}%s${NC}\n" \
+                "$idx" "${g_name:0:40}" "$state_display" "$g_member_count" "${g_desc:0:50}"
         fi
     done < <(echo "$groups_json" | jq -r '
         (.resources // [])[] |
@@ -10395,7 +10416,8 @@ _identity_search_groups() {
             (.["display-name"] // "N/A"),
             (if .active // true then "true" else "false" end),
             (.id // "N/A"),
-            (.description // "-")
+            (.description // "-"),
+            ((.members // []) | length | tostring)
         ] | @tsv
     ' 2>/dev/null)
     
@@ -10550,7 +10572,7 @@ SEARCH_POL_EOF
 }
 
 #--------------------------------------------------------------------------------
-# Create User (oci identity-domains user create)
+# Create User (oci identity-domains users create)
 #--------------------------------------------------------------------------------
 _identity_create_user() {
     local domain_url="$1"
@@ -10586,25 +10608,25 @@ _identity_create_user() {
     local name_json="{\"givenName\":\"$new_first_name\",\"familyName\":\"$new_last_name\"}"
     local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:User"]'
     
-    local create_cmd="oci identity-domains user create --endpoint \"$domain_url\" --schemas '$schemas_json' --user-name \"$new_user_name\" --name '$name_json'"
+    local create_cmd="oci identity-domains users create --endpoint \"$domain_url\" --schemas '$schemas_json' --user-name \"$new_user_name\" --name '$name_json'"
     [[ -n "$new_user_email" ]] && create_cmd+=" --emails '[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]'"
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
     read -r confirm
-    
+
     if [[ "${confirm,,}" == "y" ]]; then
         local log_file="${LOG_DIR}/identity_actions.log"
         mkdir -p "$LOG_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
-        
+
         local result
         local email_arg=""
         [[ -n "$new_user_email" ]] && email_arg="--emails [$(printf '{"value":"%s","primary":true,"type":"work"}' "$new_user_email")]"
-        
+
         if [[ -n "$new_user_email" ]]; then
-            result=$(oci identity-domains user create \
+            result=$(oci identity-domains users create \
                 --endpoint "$domain_url" \
                 --schemas "$schemas_json" \
                 --user-name "$new_user_name" \
@@ -10612,7 +10634,7 @@ _identity_create_user() {
                 --emails "[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]" \
                 --output json 2>&1)
         else
-            result=$(oci identity-domains user create \
+            result=$(oci identity-domains users create \
                 --endpoint "$domain_url" \
                 --schemas "$schemas_json" \
                 --user-name "$new_user_name" \
@@ -10643,7 +10665,7 @@ _identity_create_user() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Group (oci identity-domains group create)
+# Create Group (oci identity-domains groups create)
 #--------------------------------------------------------------------------------
 _identity_create_group() {
     local domain_url="$1"
@@ -10663,20 +10685,20 @@ _identity_create_group() {
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
     local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:Group"]'
-    local create_cmd="oci identity-domains group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_group_name\""
+    local create_cmd="oci identity-domains groups create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_group_name\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
     read -r confirm
-    
+
     if [[ "${confirm,,}" == "y" ]]; then
         local log_file="${LOG_DIR}/identity_actions.log"
         mkdir -p "$LOG_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
-        
+
         local result
-        result=$(oci identity-domains group create \
+        result=$(oci identity-domains groups create \
             --endpoint "$domain_url" \
             --schemas "$schemas_json" \
             --display-name "$new_group_name" \
@@ -10705,7 +10727,7 @@ _identity_create_group() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Dynamic Group (oci identity-domains dynamic-resource-group create)
+# Create Dynamic Group (oci identity-domains dynamic-resource-groups create)
 #--------------------------------------------------------------------------------
 _identity_create_dynamic_group() {
     local domain_url="$1"
@@ -10739,20 +10761,20 @@ _identity_create_dynamic_group() {
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
     local schemas_json='["urn:ietf:params:scim:schemas:oracle:idcs:DynamicResourceGroup"]'
-    local create_cmd="oci identity-domains dynamic-resource-group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
+    local create_cmd="oci identity-domains dynamic-resource-groups create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
     read -r confirm
-    
+
     if [[ "${confirm,,}" == "y" ]]; then
         local log_file="${LOG_DIR}/identity_actions.log"
         mkdir -p "$LOG_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
-        
+
         local result
-        result=$(oci identity-domains dynamic-resource-group create \
+        result=$(oci identity-domains dynamic-resource-groups create \
             --endpoint "$domain_url" \
             --schemas "$schemas_json" \
             --display-name "$new_dg_name" \
@@ -10777,6 +10799,485 @@ _identity_create_dynamic_group() {
         echo -e "  ${GRAY}Cancelled${NC}"
     fi
     
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update User (oci identity-domains users put)
+# Lists users, lets you select one, then update fields
+#--------------------------------------------------------------------------------
+_identity_update_user() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
+
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update User (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
+    echo ""
+
+    # First, list users so the operator can pick one
+    echo -e "${GRAY}Fetching users...${NC}"
+    local users_json
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+
+    if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch users.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local idx=0
+    declare -A _UPD_USR_IDS
+    declare -A _UPD_USR_NAMES
+
+    printf "${BOLD}%-3s  %-30s  %-40s  %-10s  %s${NC}\n" \
+        "#" "Username" "Email" "State" "Display Name"
+    print_separator 120
+
+    while IFS=$'\t' read -r u_name u_email u_active u_id u_display; do
+        [[ -z "$u_name" ]] && continue
+        ((idx++))
+        _UPD_USR_IDS[$idx]="$u_id"
+        _UPD_USR_NAMES[$idx]="$u_name"
+
+        local state_display="ACTIVE"
+        local state_color="$GREEN"
+        if [[ "$u_active" != "true" ]]; then
+            state_display="INACTIVE"
+            state_color="$RED"
+        fi
+
+        printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${u_name:0:30}" "${u_email:0:40}" "$state_display" "${u_display:0:30}"
+    done < <(echo "$users_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["user-name"] // "N/A"),
+            ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
+            (if .active then "true" else "false" end),
+            (.id // "N/A"),
+            (.["display-name"] // "N/A")
+        ] | @tsv
+    ' 2>/dev/null)
+
+    echo ""
+    echo -n -e "${BOLD}${CYAN}[Update User] Enter # to select user, back=return: ${NC}"
+    read -r uchoice
+
+    if [[ ! "$uchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_USR_IDS[$uchoice]:-}" ]]; then
+        return
+    fi
+
+    local sel_user_id="${_UPD_USR_IDS[$uchoice]}"
+    local sel_user_name="${_UPD_USR_NAMES[$uchoice]}"
+
+    # Fetch current user details
+    local user_json
+    user_json=$(oci identity-domains users get --user-id "$sel_user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+
+    if [[ -z "$user_json" ]]; then
+        echo -e "${RED}Failed to fetch user details${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local cur_email cur_first cur_last cur_active cur_display cur_desc
+    cur_email=$(echo "$user_json" | jq -r '((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value) // "N/A"')
+    cur_first=$(echo "$user_json" | jq -r '(.name // {})["given-name"] // "N/A"')
+    cur_last=$(echo "$user_json" | jq -r '(.name // {})["family-name"] // "N/A"')
+    cur_active=$(echo "$user_json" | jq -r 'if .active then "true" else "false" end')
+    cur_display=$(echo "$user_json" | jq -r '.["display-name"] // "N/A"')
+    cur_desc=$(echo "$user_json" | jq -r '.description // ""')
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Current values for: ${GREEN}${sel_user_name}${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}  ${WHITE}${cur_display}${NC}"
+    echo -e "  ${CYAN}First Name:${NC}    ${WHITE}${cur_first}${NC}"
+    echo -e "  ${CYAN}Last Name:${NC}     ${WHITE}${cur_last}${NC}"
+    echo -e "  ${CYAN}Email:${NC}         ${WHITE}${cur_email}${NC}"
+    echo -e "  ${CYAN}Active:${NC}        ${WHITE}${cur_active}${NC}"
+    echo -e "  ${CYAN}Description:${NC}   ${WHITE}${cur_desc:-N/A}${NC}"
+    echo ""
+    echo -e "  ${GRAY}Press Enter to keep current value for each field${NC}"
+    echo ""
+
+    echo -n -e "  ${WHITE}New email (current: ${cur_email}): ${NC}"
+    read -r new_email
+    [[ -z "$new_email" ]] && new_email="$cur_email"
+
+    echo -n -e "  ${WHITE}New first name (current: ${cur_first}): ${NC}"
+    read -r new_first
+    [[ -z "$new_first" ]] && new_first="$cur_first"
+
+    echo -n -e "  ${WHITE}New last name (current: ${cur_last}): ${NC}"
+    read -r new_last
+    [[ -z "$new_last" ]] && new_last="$cur_last"
+
+    echo -n -e "  ${WHITE}Active (true/false, current: ${cur_active}): ${NC}"
+    read -r new_active
+    [[ -z "$new_active" ]] && new_active="$cur_active"
+
+    echo -n -e "  ${WHITE}New description (current: ${cur_desc:-N/A}): ${NC}"
+    read -r new_desc
+    [[ -z "$new_desc" ]] && new_desc="$cur_desc"
+
+    # Build the update payload
+    local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:User"]'
+    local name_json="{\"givenName\":\"$new_first\",\"familyName\":\"$new_last\"}"
+    local active_bool="true"
+    [[ "$new_active" == "false" ]] && active_bool="false"
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    local update_cmd="oci identity-domains users put --user-id \"$sel_user_id\" --endpoint \"$domain_url\" --schemas '$schemas_json' --name '$name_json' --emails '[{\"value\":\"$new_email\",\"primary\":true,\"type\":\"work\"}]' --active $active_bool"
+    echo -e "  ${CYAN}${update_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    read -r confirm
+
+    if [[ "${confirm,,}" == "y" ]]; then
+        local log_file="${LOG_DIR}/identity_actions.log"
+        mkdir -p "$LOG_DIR"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $update_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+
+        local result
+        result=$(oci identity-domains users put \
+            --user-id "$sel_user_id" \
+            --endpoint "$domain_url" \
+            --schemas "$schemas_json" \
+            --user-name "$sel_user_name" \
+            --name "$name_json" \
+            --emails "[{\"value\":\"$new_email\",\"primary\":true,\"type\":\"work\"}]" \
+            --active "$active_bool" \
+            --output json 2>&1)
+
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} User updated: ${WHITE}${sel_user_name}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated user $sel_user_name" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update user${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update Group (oci identity-domains groups put)
+# Lists groups, lets you select one, then update fields
+#--------------------------------------------------------------------------------
+_identity_update_group() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
+
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update Group (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
+    echo ""
+
+    # First, list groups so the operator can pick one
+    echo -e "${GRAY}Fetching groups...${NC}"
+    local groups_json
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+
+    if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch groups.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local idx=0
+    declare -A _UPD_GRP_IDS
+    declare -A _UPD_GRP_NAMES
+
+    printf "${BOLD}%-3s  %-40s  %-10s  %-8s  %s${NC}\n" \
+        "#" "Group Name" "Active" "Members" "Description"
+    print_separator 120
+
+    while IFS=$'\t' read -r g_name g_active g_id g_desc g_member_count; do
+        [[ -z "$g_name" ]] && continue
+        ((idx++))
+        _UPD_GRP_IDS[$idx]="$g_id"
+        _UPD_GRP_NAMES[$idx]="$g_name"
+
+        local state_display="Yes"
+        local state_color="$GREEN"
+        if [[ "$g_active" != "true" ]]; then
+            state_display="No"
+            state_color="$YELLOW"
+        fi
+
+        local mem_color="$CYAN"
+        [[ "$g_member_count" == "0" ]] && mem_color="$GRAY"
+
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${mem_color}%-8s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${g_name:0:40}" "$state_display" "$g_member_count" "${g_desc:0:50}"
+    done < <(echo "$groups_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
+            (.id // "N/A"),
+            (.description // "-"),
+            ((.members // []) | length | tostring)
+        ] | @tsv
+    ' 2>/dev/null)
+
+    echo ""
+    echo -n -e "${BOLD}${CYAN}[Update Group] Enter # to select group, back=return: ${NC}"
+    read -r gchoice
+
+    if [[ ! "$gchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_GRP_IDS[$gchoice]:-}" ]]; then
+        return
+    fi
+
+    local sel_group_id="${_UPD_GRP_IDS[$gchoice]}"
+    local sel_group_name="${_UPD_GRP_NAMES[$gchoice]}"
+
+    # Fetch current group details
+    local group_json
+    group_json=$(oci identity-domains groups get --group-id "$sel_group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+
+    if [[ -z "$group_json" ]]; then
+        echo -e "${RED}Failed to fetch group details${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local cur_display cur_desc
+    cur_display=$(echo "$group_json" | jq -r '.["display-name"] // "N/A"')
+    cur_desc=$(echo "$group_json" | jq -r '.description // ""')
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Current values for: ${MAGENTA}${sel_group_name}${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}  ${WHITE}${cur_display}${NC}"
+    echo -e "  ${CYAN}Description:${NC}   ${WHITE}${cur_desc:-N/A}${NC}"
+    echo ""
+    echo -e "  ${GRAY}Press Enter to keep current value for each field${NC}"
+    echo ""
+
+    echo -n -e "  ${WHITE}New display name (current: ${cur_display}): ${NC}"
+    read -r new_display
+    [[ -z "$new_display" ]] && new_display="$cur_display"
+
+    echo -n -e "  ${WHITE}New description (current: ${cur_desc:-N/A}): ${NC}"
+    read -r new_desc
+    [[ -z "$new_desc" ]] && new_desc="$cur_desc"
+
+    local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:Group"]'
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    local update_cmd="oci identity-domains groups put --group-id \"$sel_group_id\" --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_display\""
+    echo -e "  ${CYAN}${update_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    read -r confirm
+
+    if [[ "${confirm,,}" == "y" ]]; then
+        local log_file="${LOG_DIR}/identity_actions.log"
+        mkdir -p "$LOG_DIR"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $update_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+
+        local result
+        if [[ -n "$new_desc" ]]; then
+            result=$(oci identity-domains groups put \
+                --group-id "$sel_group_id" \
+                --endpoint "$domain_url" \
+                --schemas "$schemas_json" \
+                --display-name "$new_display" \
+                --output json 2>&1)
+        else
+            result=$(oci identity-domains groups put \
+                --group-id "$sel_group_id" \
+                --endpoint "$domain_url" \
+                --schemas "$schemas_json" \
+                --display-name "$new_display" \
+                --output json 2>&1)
+        fi
+
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} Group updated: ${MAGENTA}${new_display}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated group $sel_group_name -> $new_display" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update group${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update Dynamic Group (oci identity-domains dynamic-resource-groups put)
+# Lists dynamic groups, lets you select one, then update fields
+#--------------------------------------------------------------------------------
+_identity_update_dynamic_group() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update Dynamic Group ═══${NC}"
+    echo ""
+
+    # First, list dynamic groups so the operator can pick one
+    echo -e "${GRAY}Fetching dynamic groups...${NC}"
+    local dg_json
+    dg_json=$(oci identity-domains dynamic-resource-groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+
+    if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch dynamic groups.${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local idx=0
+    declare -A _UPD_DG_IDS
+    declare -A _UPD_DG_NAMES
+
+    printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
+        "#" "Dynamic Group Name" "Active" "Matching Rule"
+    print_separator 120
+
+    while IFS=$'\t' read -r dg_name dg_active dg_id dg_rule dg_desc; do
+        [[ -z "$dg_name" ]] && continue
+        ((idx++))
+        _UPD_DG_IDS[$idx]="$dg_id"
+        _UPD_DG_NAMES[$idx]="$dg_name"
+
+        local state_display="Yes"
+        local state_color="$GREEN"
+        if [[ "$dg_active" != "true" ]]; then
+            state_display="No"
+            state_color="$YELLOW"
+        fi
+
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${dg_name:0:40}" "$state_display" "${dg_rule:0:70}"
+    done < <(echo "$dg_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
+            (.id // "N/A"),
+            (.["matching-rule"] // "N/A"),
+            (.description // "-")
+        ] | @tsv
+    ' 2>/dev/null)
+
+    echo ""
+    echo -n -e "${BOLD}${CYAN}[Update Dynamic Group] Enter # to select, back=return: ${NC}"
+    read -r dgchoice
+
+    if [[ ! "$dgchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_DG_IDS[$dgchoice]:-}" ]]; then
+        return
+    fi
+
+    local sel_dg_id="${_UPD_DG_IDS[$dgchoice]}"
+    local sel_dg_name="${_UPD_DG_NAMES[$dgchoice]}"
+
+    # Fetch current dynamic group details
+    local dg_detail_json
+    dg_detail_json=$(oci identity-domains dynamic-resource-groups get --dynamic-resource-group-id "$sel_dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
+
+    if [[ -z "$dg_detail_json" ]]; then
+        echo -e "${RED}Failed to fetch dynamic group details${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local cur_display cur_desc cur_rule
+    cur_display=$(echo "$dg_detail_json" | jq -r '.["display-name"] // "N/A"')
+    cur_desc=$(echo "$dg_detail_json" | jq -r '.description // ""')
+    cur_rule=$(echo "$dg_detail_json" | jq -r '.["matching-rule"] // "N/A"')
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Current values for: ${MAGENTA}${sel_dg_name}${NC}"
+    echo -e "  ${CYAN}Display Name:${NC}    ${WHITE}${cur_display}${NC}"
+    echo -e "  ${CYAN}Description:${NC}     ${WHITE}${cur_desc:-N/A}${NC}"
+    echo -e "  ${CYAN}Matching Rule:${NC}   ${WHITE}${cur_rule}${NC}"
+    echo ""
+    echo -e "  ${GRAY}Press Enter to keep current value for each field${NC}"
+    echo ""
+
+    echo -n -e "  ${WHITE}New display name (current: ${cur_display}): ${NC}"
+    read -r new_display
+    [[ -z "$new_display" ]] && new_display="$cur_display"
+
+    echo -n -e "  ${WHITE}New description (current: ${cur_desc:-N/A}): ${NC}"
+    read -r new_desc
+    [[ -z "$new_desc" ]] && new_desc="$cur_desc"
+
+    echo -e ""
+    echo -e "  ${CYAN}Matching rule examples:${NC}"
+    echo -e "    ${GRAY}All instances in a compartment:${NC}"
+    echo -e "    ${WHITE}Any {instance.compartment.id = 'ocid1.compartment.oc1..xxx'}${NC}"
+    echo -e "    ${GRAY}All instances with a tag:${NC}"
+    echo -e "    ${WHITE}Any {tag.namespace.key.value = 'myvalue'}${NC}"
+    echo ""
+    echo -n -e "  ${WHITE}New matching rule (current: ${cur_rule}): ${NC}"
+    read -r new_rule
+    [[ -z "$new_rule" ]] && new_rule="$cur_rule"
+
+    local schemas_json='["urn:ietf:params:scim:schemas:oracle:idcs:DynamicResourceGroup"]'
+
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    local update_cmd="oci identity-domains dynamic-resource-groups put --dynamic-resource-group-id \"$sel_dg_id\" --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_display\" --description \"$new_desc\" --matching-rule \"$new_rule\""
+    echo -e "  ${CYAN}${update_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    read -r confirm
+
+    if [[ "${confirm,,}" == "y" ]]; then
+        local log_file="${LOG_DIR}/identity_actions.log"
+        mkdir -p "$LOG_DIR"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $update_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+
+        local result
+        result=$(oci identity-domains dynamic-resource-groups put \
+            --dynamic-resource-group-id "$sel_dg_id" \
+            --endpoint "$domain_url" \
+            --schemas "$schemas_json" \
+            --display-name "$new_display" \
+            --description "$new_desc" \
+            --matching-rule "$new_rule" \
+            --output json 2>&1)
+
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} Dynamic group updated: ${MAGENTA}${new_display}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated dynamic-group $sel_dg_name -> $new_display" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update dynamic group${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+
     echo ""
     echo -e "Press Enter to continue..."
     read -r
