@@ -6300,9 +6300,9 @@ list_all_announcements() {
         echo ""
         
         if [[ "$show_deleted" == "true" ]]; then
-            echo -e "${BOLD}${WHITE}Showing: ${YELLOW}ALL${WHITE} announcements (including DELETED)${NC}"
+            echo -e "${BOLD}${WHITE}Showing: ${YELLOW}ALL${WHITE} announcements (including instances with OCI state DELETED)${NC}"
         else
-            echo -e "${BOLD}${WHITE}Showing: ${GREEN}Active${WHITE} announcements (excluding DELETED)${NC}"
+            echo -e "${BOLD}${WHITE}Showing: ${GREEN}Active${WHITE} announcements (hiding where all instances are DELETED/gone)${NC}"
         fi
         echo ""
         
@@ -6328,29 +6328,57 @@ list_all_announcements() {
                 continue
             fi
             
-            # Extract lifecycle state first for filtering
-            local lifecycle_state
-            lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
-            
-            # Skip DELETED unless show_deleted is true
-            if [[ "$show_deleted" != "true" && "$lifecycle_state" == "DELETED" ]]; then
-                ((skipped_count++))
-                continue
-            fi
-            
-            ((ann_idx++))
-            ((shown_count++))
-            
             # Extract announcement fields
-            local ref_ticket ann_type description
+            local lifecycle_state ref_ticket ann_type description
             local time_one time_two resource_count
             
+            lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
             ref_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$detail_file")
             ann_type=$(jq -r '.data."announcement-type" // "N/A"' "$detail_file")
             description=$(jq -r '.data.description // ""' "$detail_file")
             time_one=$(jq -r '.data."time-one-value" // "N/A"' "$detail_file")
             time_two=$(jq -r '.data."time-two-value" // "N/A"' "$detail_file")
             resource_count=$(jq '.data."affected-resources" | length' "$detail_file" 2>/dev/null) || resource_count=0
+            
+            # ── Filter by OCI instance state (not announcement lifecycle-state) ──
+            # Skip announcements where ALL affected resources are DELETED/gone
+            if [[ "$show_deleted" != "true" && $resource_count -gt 0 ]]; then
+                local all_deleted=true
+                local ri
+                for ((ri=0; ri<resource_count; ri++)); do
+                    local chk_resource_id
+                    chk_resource_id=$(jq -r ".data.\"affected-resources\"[$ri] | 
+                        if .properties then
+                            (.properties[] | select(.name == \"resourceId\" or .name == \"instanceId\") | .value) // \"N/A\"
+                        else
+                            (.\"resource-id\" // .\"instance-id\" // \"N/A\")
+                        end" "$detail_file" 2>/dev/null)
+                    
+                    if [[ "$chk_resource_id" != "N/A" && -n "$chk_resource_id" ]]; then
+                        if [[ -n "${INSTANCE_LOOKUP[$chk_resource_id]:-}" ]]; then
+                            local chk_state
+                            chk_state=$(echo "${INSTANCE_LOOKUP[$chk_resource_id]}" | cut -d'|' -f2)
+                            if [[ "$chk_state" != "TERMINATED" ]]; then
+                                all_deleted=false
+                                break
+                            fi
+                        fi
+                        # Instance not in lookup = deleted/gone, continue checking
+                    else
+                        # No resource ID = not an instance resource, don't filter
+                        all_deleted=false
+                        break
+                    fi
+                done
+                
+                if [[ "$all_deleted" == "true" ]]; then
+                    ((skipped_count++))
+                    continue
+                fi
+            fi
+            
+            ((ann_idx++))
+            ((shown_count++))
             
             # Store mapping
             ANN_INDEX_MAP["a${ann_idx}"]="${detail_file}"
@@ -6463,7 +6491,7 @@ list_all_announcements() {
     echo ""
     echo -e "${WHITE}Displayed ${CYAN}${shown_count}${WHITE} announcement(s)${NC}"
     [[ "$show_deleted" != "true" && $skipped_count -gt 0 ]] && \
-        echo -e "${GRAY}  (${skipped_count} DELETED announcement(s) hidden - use ${WHITE}all${GRAY} to show)${NC}"
+        echo -e "${GRAY}  (${skipped_count} announcement(s) hidden where all instances DELETED - use ${WHITE}all${GRAY} to show)${NC}"
     echo ""
     
     # Show legend
@@ -6487,9 +6515,9 @@ list_all_announcements() {
         echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
         echo -e "  Enter ${YELLOW}a#${NC} (e.g., a1) to view full announcement details"
         if [[ "$current_show_all" == "true" ]]; then
-            echo -e "  Enter ${CYAN}active${NC} to hide DELETED announcements"
+            echo -e "  Enter ${CYAN}active${NC} to hide announcements where all instances are DELETED"
         else
-            echo -e "  Enter ${CYAN}all${NC} to show ALL announcements (including DELETED)"
+            echo -e "  Enter ${CYAN}all${NC} to include announcements where all instances are DELETED"
         fi
         echo -e "  Enter ${CYAN}q${NC} to quit"
         echo ""
