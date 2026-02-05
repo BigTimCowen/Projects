@@ -4008,8 +4008,6 @@ fetch_maintenance_events() {
             cache_age=$(( $(date +%s) - $(stat -c %Y "$MAINT_EVENTS_CACHE" 2>/dev/null || echo 0) ))
         fi
         if [[ $cache_age -lt $MAINT_EVENTS_CACHE_TTL ]]; then
-            local ttl_remain=$(( MAINT_EVENTS_CACHE_TTL - cache_age ))
-            echo -e "${GRAY}Using cached maintenance events (${ttl_remain}s remaining, use 'refresh' to force)${NC}" >&2
             echo "$MAINT_EVENTS_CACHE"
             return 0
         fi
@@ -4196,7 +4194,7 @@ list_maintenance_events() {
     local compartment_id="${1:-$EFFECTIVE_COMPARTMENT_ID}"
     local region="${2:-$EFFECTIVE_REGION}"
     local force_refresh="${3:-false}"
-    local filter_named="${4:-false}"
+    local filter_type="${4:-named}"
     local me_view_mode="${5:-compact}"
     
     echo ""
@@ -4210,7 +4208,14 @@ list_maintenance_events() {
     echo ""
     echo -e "${GRAY}Region: ${WHITE}$region${NC}  ${GRAY}Compartment: ${WHITE}$(resolve_compartment_name "$compartment_id")${NC} ${GRAY}($compartment_id)${NC}"
     echo -e "${GRAY}Source: oci compute instance-maintenance-event list${NC}  ${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)${NC}"
-    [[ "$filter_named" == "true" ]] && echo -e "${YELLOW}Filter: Showing only events with a matching instance name${NC}"
+    case "$filter_type" in
+        named)       echo -e "${YELLOW}Filter: Named instances only + hiding CapTopo=AVAILABLE + hiding SUCCEEDED >2 days old${NC}" ;;
+        PROCESSING)  echo -e "${YELLOW}Filter: Showing only PROCESSING events${NC}" ;;
+        SUCCEEDED)   echo -e "${YELLOW}Filter: Showing only SUCCEEDED events${NC}" ;;
+        CANCELED)    echo -e "${YELLOW}Filter: Showing only CANCELED events${NC}" ;;
+        SCHEDULED)   echo -e "${YELLOW}Filter: Showing only SCHEDULED events${NC}" ;;
+        none)        ;;
+    esac
     echo ""
     
     #==========================================================================
@@ -4302,6 +4307,11 @@ list_maintenance_events() {
     while IFS='|' read -r mi_ocid mi_name mi_shape mi_state mi_ad mi_gpu_mem; do
         [[ -z "$mi_ocid" ]] && continue
         
+        # Apply named filter to instances section too
+        if [[ "$filter_type" == "named" && ("$mi_name" == "N/A" || -z "$mi_name") ]]; then
+            continue
+        fi
+        
         local mi_cap_topo
         mi_cap_topo=$(get_capacity_topology_state "$mi_ocid")
         [[ -z "$mi_cap_topo" ]] && mi_cap_topo="N/A"
@@ -4333,6 +4343,39 @@ list_maintenance_events() {
         
         local mi_sort_ann="$mi_ann"
         [[ "$mi_ann" == "-" || -z "$mi_ann" ]] && mi_sort_ann="zzz"
+        
+        # When named filter: skip instances where ALL their events are SUCCEEDED with window start > 2 days old
+        if [[ "$filter_type" == "named" ]]; then
+            local mi_has_active_event=false
+            local mi_evt_line
+            while IFS='|' read -r _eid mi_evt_iid _er _ec mi_evt_lc mi_evt_ws _rest; do
+                [[ "$mi_evt_iid" != "$mi_ocid" ]] && continue
+                if [[ "${mi_evt_lc^^}" != "SUCCEEDED" ]]; then
+                    mi_has_active_event=true
+                    break
+                fi
+                # SUCCEEDED - check if window start is within 2 days
+                if [[ "$mi_evt_ws" != "null" && -n "$mi_evt_ws" ]]; then
+                    local mi_chk_epoch
+                    mi_chk_epoch=$(date -u -d "${mi_evt_ws:0:19}" +%s 2>/dev/null) || mi_chk_epoch=""
+                    if [[ -n "$mi_chk_epoch" ]]; then
+                        local mi_2d_ago=$(( $(date -u +%s) - 172800 ))
+                        if [[ $mi_chk_epoch -ge $mi_2d_ago ]]; then
+                            mi_has_active_event=true
+                            break
+                        fi
+                    fi
+                fi
+            done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")"' "$cache_file" 2>/dev/null)
+            
+            # Also keep if DEGRADED cap topo (regardless of event state)
+            [[ "$mi_cap_topo" == "DEGRADED" ]] && mi_has_active_event=true
+            
+            if [[ "$mi_has_active_event" != "true" ]]; then
+                continue
+            fi
+        fi
+        
         echo "${mi_sort_ann}|${mi_cap_topo}|${mi_ann}|${mi_name}|${mi_state}|${mi_k8s_node}|${mi_k8s_ready}|${mi_k8s_cordon}|${mi_k8s_pods}|${mi_k8s_serial}|${mi_shape}|${mi_ocid}" >> "$maint_output_temp"
     done < "$me_inst_temp"
     
@@ -4600,14 +4643,14 @@ list_maintenance_events() {
         "" "" "" "" "" "" "" "" "" "" "" "" "Current UTC:" "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
     
     if [[ "$me_view_mode" == "detail" ]]; then
-        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s${NC}\n" \
-            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce"
-        print_separator 263
+        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s %-10s${NC}\n" \
+            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce" "CapTopo"
+        print_separator 275
     else
-        # Compact view: same columns + Fault Code at end, no sub-lines
-        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s %-22s${NC}\n" \
-            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce" "Fault Code"
-        print_separator 285
+        # Compact view: same columns + Fault Code + CapTopo at end, no sub-lines
+        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s %-22s %-10s${NC}\n" \
+            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce" "Fault Code" "CapTopo"
+        print_separator 297
     fi
     
     declare -A ME_EVENT_MAP=()
@@ -4629,9 +4672,40 @@ list_maintenance_events() {
             inst_gpu_mem=$(echo "$inst_info" | cut -d'|' -f6)
         fi
         
-        # Apply named filter - skip events without a matching instance name
-        if [[ "$filter_named" == "true" && ("$inst_name" == "N/A" || -z "$inst_name") ]]; then
+        # Apply filters
+        # Named filter: skip events without a matching instance name
+        if [[ "$filter_type" == "named" && ("$inst_name" == "N/A" || -z "$inst_name") ]]; then
             continue
+        fi
+        # Lifecycle state filters: skip events not matching the filter
+        if [[ "$filter_type" == "PROCESSING" || "$filter_type" == "SUCCEEDED" || "$filter_type" == "CANCELED" || "$filter_type" == "SCHEDULED" ]]; then
+            if [[ "${evt_lifecycle^^}" != "${filter_type}" ]]; then
+                continue
+            fi
+        fi
+        
+        # Look up CapTopo state for this instance
+        local evt_cap_topo="N/A"
+        evt_cap_topo=$(get_capacity_topology_state "$evt_instance_id" 2>/dev/null)
+        [[ -z "$evt_cap_topo" ]] && evt_cap_topo="N/A"
+        
+        # When named filter is active: hide events where CapTopo is AVAILABLE
+        if [[ "$filter_type" == "named" && "$evt_cap_topo" == "AVAILABLE" ]]; then
+            continue
+        fi
+        
+        # When named filter is active: hide SUCCEEDED events with window start > 2 days old
+        if [[ "$filter_type" == "named" && "${evt_lifecycle^^}" == "SUCCEEDED" ]]; then
+            if [[ "$evt_window_start" != "null" && -n "$evt_window_start" ]]; then
+                local chk_ws_epoch
+                chk_ws_epoch=$(date -u -d "${evt_window_start:0:19}" +%s 2>/dev/null) || chk_ws_epoch=""
+                if [[ -n "$chk_ws_epoch" ]]; then
+                    local two_days_ago=$(( me_now_epoch - 172800 ))
+                    if [[ $chk_ws_epoch -lt $two_days_ago ]]; then
+                        continue
+                    fi
+                fi
+            fi
         fi
         
         ((me_idx++))
@@ -4843,9 +4917,13 @@ list_maintenance_events() {
         fi
         
         if [[ "$me_view_mode" == "detail" ]]; then
+            # CapTopo color
+            local cap_topo_color="$GREEN"
+            case "$evt_cap_topo" in AVAILABLE) cap_topo_color="$GREEN" ;; DEGRADED) cap_topo_color="$RED" ;; N/A) cap_topo_color="$GRAY" ;; *) cap_topo_color="$YELLOW" ;; esac
+            
             # ── Detail view: full row + fault sub-line + blank line ──
-            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC}\n" \
-                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}"
+            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${cap_topo_color}%-10s${NC}\n" \
+                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "$evt_cap_topo"
             
             # Display fault/additional details as dim sub-line aligned to main row columns
             # ↳ indented 3 spaces, then:  Fault ID→Instance Name  Component→K8s Node  Sev→Serial
@@ -4903,12 +4981,14 @@ list_maintenance_events() {
             # Blank line after each event group for readability
             echo ""
         else
-            # ── Compact view: single row + fault code column, no sub-line ──
+            # ── Compact view: single row + fault code + CapTopo column, no sub-line ──
             local fault_code_color="$GRAY"
             [[ "$compact_fault_code" != "-" ]] && fault_code_color="$CYAN"
+            local cap_topo_color="$GREEN"
+            case "$evt_cap_topo" in AVAILABLE) cap_topo_color="$GREEN" ;; DEGRADED) cap_topo_color="$RED" ;; N/A) cap_topo_color="$GRAY" ;; *) cap_topo_color="$YELLOW" ;; esac
             
-            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${fault_code_color}%-22s${NC}\n" \
-                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}"
+            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${fault_code_color}%-22s${NC} ${cap_topo_color}%-10s${NC}\n" \
+                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo"
         fi
             
     done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
@@ -4966,21 +5046,22 @@ list_maintenance_events() {
         echo -e "  ${BOLD}Maintenance Events:${NC}"
         echo -e "    ${YELLOW}#${NC}                      - View event details (e.g., '1', '3')"
         echo -e "    ${YELLOW}resched #${NC}              - Reschedule event (e.g., 'resched 1' or 'resched 1,3,5' or 'resched 1-5' or 'resched all')"
-        echo -e "    ${ORANGE}cordon #${NC}               - Cordon K8s node for event (e.g., 'cordon 1' or 'cordon 1,3,5' or 'cordon all')"
-        echo -e "    ${ORANGE}drain #${NC}                - Drain K8s node for event (e.g., 'drain 1' or 'drain 1,3,5' or 'drain all')"
-        echo -e "    ${ORANGE}cordon-drain #${NC}         - Cordon then drain K8s node (e.g., 'cordon-drain 1' or 'cordon-drain all')"
+        echo -e "    ${ORANGE}c #${NC}                    - Cordon K8s node for event (e.g., 'c 1' or 'c 1,3,5' or 'c all')"
+        echo -e "    ${ORANGE}d #${NC}                    - Drain K8s node for event (e.g., 'd 1' or 'd 1,3,5' or 'd all')"
+        echo -e "    ${ORANGE}cd #${NC}                   - Cordon then drain K8s node (e.g., 'cd 1' or 'cd all')"
+        echo -e "    ${CYAN}p #${NC}                    - View pods on event node (e.g., 'p 1' or 'p 1,3,5' or 'p all')"
         echo -e "  ${BOLD}Maintenance Instances:${NC}"
-        echo -e "    ${YELLOW}m#${NC}                     - Manage instance (e.g., 'm1' for cordon/drain/uncordon/terminate/details)"
+        echo -e "    ${YELLOW}m#${NC}                     - Manage instance (e.g., 'm1' for c/d/uncordon/terminate/details)"
         echo -e "    ${YELLOW}a#${NC}                     - View announcement details (e.g., 'a1')"
         echo -e "    ${CYAN}pods m1,m2${NC}             - View pods on nodes (or 'pods all')"
-        echo -e "    ${ORANGE}cordon m1,m2${NC}           - Cordon multiple nodes (or 'drain m1,m2' / 'cordon-drain m1,m2' / 'uncordon m1,m2' / 'terminate m1,m2')"
+        echo -e "    ${ORANGE}c m1,m2${NC}                - Cordon multiple nodes (or 'd m1,m2' / 'cd m1,m2' / 'uncordon m1,m2' / 'terminate m1,m2')"
         echo -e "  ${BOLD}General:${NC}"
         if [[ "$me_view_mode" == "compact" ]]; then
             echo -e "    ${CYAN}view${NC}                   - Switch to detail view (fault sub-lines)"
         else
             echo -e "    ${CYAN}view${NC}                   - Switch to compact view (single-line)"
         fi
-        echo -e "    ${CYAN}named${NC}                  - Show only events with matching instance name"
+        echo -e "    ${CYAN}filter${NC}                 - Filter events (${GREEN}n${NC}=named ${GREEN}p${NC}=processing ${GREEN}su${NC}=succeeded ${GREEN}c${NC}=canceled ${GREEN}sc${NC}=scheduled ${GREEN}all${NC}=clear)"
         echo -e "    ${CYAN}list${NC}                   - Show announcement details again"
         echo -e "    ${MAGENTA}r${NC}                      - Force refresh from OCI (invalidate cache)"
         echo -e "    ${CYAN}q${NC}                      - Back"
@@ -4990,12 +5071,24 @@ list_maintenance_events() {
         
         [[ -z "$me_selection" || "$me_selection" == "q" || "$me_selection" == "Q" || "$me_selection" == "back" ]] && break
         
+        # Normalize shortcuts: c → cordon, d → drain, cd → cordon-drain, p → pods
+        # Must check cd before c to avoid cd being matched as c + d...
+        if [[ "$me_selection" =~ ^cd[[:space:]]+(.+)$ ]]; then
+            me_selection="cordon-drain ${BASH_REMATCH[1]}"
+        elif [[ "$me_selection" =~ ^c[[:space:]]+(.+)$ ]]; then
+            me_selection="cordon ${BASH_REMATCH[1]}"
+        elif [[ "$me_selection" =~ ^d[[:space:]]+(.+)$ ]]; then
+            me_selection="drain ${BASH_REMATCH[1]}"
+        elif [[ "$me_selection" =~ ^p[[:space:]]+(.+)$ && ! "$me_selection" =~ ^pods ]]; then
+            me_selection="pods ${BASH_REMATCH[1]}"
+        fi
+        
         # View toggle
         if [[ "$me_selection" == "view" || "$me_selection" == "VIEW" || "$me_selection" == "v" || "$me_selection" == "V" ]]; then
             local new_view="compact"
             [[ "$me_view_mode" == "compact" ]] && new_view="detail"
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "$filter_named" "$new_view"
+            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$new_view"
             return
         fi
         
@@ -5004,21 +5097,48 @@ list_maintenance_events() {
             rm -f "$MAINT_EVENTS_CACHE" "$FAULT_DETAILS_CACHE"
             echo -e "${YELLOW}Cache invalidated - refreshing...${NC}"
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "true" "$filter_named" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "true" "$filter_type" "$me_view_mode"
             return
         fi
         
-        # Named filter
-        if [[ "$me_selection" == "named" || "$me_selection" == "NAMED" ]]; then
+        # Filter command - supports 'filter' (submenu) or 'filter <shortcut>' (direct)
+        if [[ "${me_selection,,}" =~ ^(filter|f)(\ +.*)?$ ]]; then
+            local filter_arg="${me_selection#* }"
+            # If just 'filter' or 'f' with no arg, show submenu
+            if [[ "$filter_arg" == "${me_selection}" || -z "${filter_arg// /}" ]]; then
+                echo ""
+                echo -e "${BOLD}${WHITE}─── Filter Options ───${NC}"
+                echo -e "  ${GREEN}n${NC}   - Named instances only (has a display name)"
+                echo -e "  ${GREEN}p${NC}   - PROCESSING events"
+                echo -e "  ${GREEN}su${NC}  - SUCCEEDED events"
+                echo -e "  ${GREEN}c${NC}   - CANCELED events"
+                echo -e "  ${GREEN}sc${NC}  - SCHEDULED events"
+                echo -e "  ${GREEN}all${NC} - Clear filter (show all)"
+                echo ""
+                echo -n -e "${BOLD}${CYAN}[Filter] Select: ${NC}"
+                read -r filter_arg
+            fi
+            
+            local new_filter="none"
+            case "${filter_arg,,}" in
+                n)   new_filter="named" ;;
+                p)   new_filter="PROCESSING" ;;
+                su)  new_filter="SUCCEEDED" ;;
+                c)   new_filter="CANCELED" ;;
+                sc)  new_filter="SCHEDULED" ;;
+                all) new_filter="none" ;;
+                *)   echo -e "${RED}Invalid filter: ${filter_arg}${NC}"; continue ;;
+            esac
+            
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "true" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "$new_filter" "$me_view_mode"
             return
         fi
         
-        # All filter - remove filter
-        if [[ "$me_selection" == "all" || "$me_selection" == "ALL" ]]; then
+        # Legacy: 'all' clears filter
+        if [[ "${me_selection,,}" == "all" ]]; then
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "false" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "none" "$me_view_mode"
             return
         fi
         
@@ -5556,23 +5676,50 @@ list_maintenance_events() {
         fi
         
         #----------------------------------------------------------------------
-        # Pods on nodes: pods m1,m2 or pods all
+        # Pods on nodes: pods m1,m2 or pods 1,2 (p #) or pods all
         #----------------------------------------------------------------------
         if [[ "$me_selection" =~ ^pods[[:space:]]+(.*) ]]; then
             local pods_targets="${BASH_REMATCH[1]}"
-            [[ "$pods_targets" == "all" ]] && pods_targets=$(echo "${!MAINT_INSTANCE_MAP[@]}" | tr ' ' ',')
             
             local pods_valid=() pods_invalid=() pods_non_k8s=()
-            IFS=',' read -ra pods_list <<< "$pods_targets"
-            for pt in "${pods_list[@]}"; do
-                pt=$(echo "$pt" | tr -d ' ')
-                local pi="${MAINT_INSTANCE_MAP[$pt]:-}"
-                if [[ -z "$pi" ]]; then pods_invalid+=("$pt"); continue; fi
-                local po pk pn pc
-                IFS='|' read -r po pk pn pc <<< "$pi"
-                if [[ "$pk" == "N/A" || -z "$pk" ]]; then pods_non_k8s+=("$pt:$pn"); continue; fi
-                pods_valid+=("$pt|$pk|$pn")
-            done
+            
+            # Detect target type: numeric (events) or m# (instances)
+            if [[ "$pods_targets" =~ ^[0-9] || "$pods_targets" == "all" ]]; then
+                # Event-based pods: resolve event indices to k8s nodes
+                local pods_evt_indices=()
+                if [[ "$pods_targets" == "all" || "$pods_targets" == "ALL" ]]; then
+                    for ((pei=1; pei<=me_idx; pei++)); do pods_evt_indices+=("$pei"); done
+                else
+                    IFS=',' read -ra pods_evt_indices <<< "$pods_targets"
+                fi
+                
+                for pei in "${pods_evt_indices[@]}"; do
+                    pei=$(echo "$pei" | tr -d ' ')
+                    local pe_info="${ME_EVENT_MAP[$pei]:-}"
+                    if [[ -z "$pe_info" ]]; then pods_invalid+=("$pei"); continue; fi
+                    local pe_k8s_node pe_inst_name
+                    pe_k8s_node=$(echo "$pe_info" | cut -d'|' -f11)
+                    pe_inst_name=$(echo "$pe_info" | cut -d'|' -f10)
+                    if [[ "$pe_k8s_node" == "N/A" || -z "$pe_k8s_node" ]]; then
+                        pods_non_k8s+=("${pei}:${pe_inst_name}")
+                        continue
+                    fi
+                    pods_valid+=("${pei}|${pe_k8s_node}|${pe_inst_name}")
+                done
+            else
+                # m# instance-based pods
+                [[ "$pods_targets" == "mall" || "$pods_targets" == "MALL" ]] && pods_targets=$(echo "${!MAINT_INSTANCE_MAP[@]}" | tr ' ' ',')
+                IFS=',' read -ra pods_list <<< "$pods_targets"
+                for pt in "${pods_list[@]}"; do
+                    pt=$(echo "$pt" | tr -d ' ')
+                    local pi="${MAINT_INSTANCE_MAP[$pt]:-}"
+                    if [[ -z "$pi" ]]; then pods_invalid+=("$pt"); continue; fi
+                    local po pk pn pc
+                    IFS='|' read -r po pk pn pc <<< "$pi"
+                    if [[ "$pk" == "N/A" || -z "$pk" ]]; then pods_non_k8s+=("$pt:$pn"); continue; fi
+                    pods_valid+=("$pt|$pk|$pn")
+                done
+            fi
             [[ ${#pods_invalid[@]} -gt 0 ]] && echo -e "${RED}Invalid: ${pods_invalid[*]}${NC}"
             [[ ${#pods_non_k8s[@]} -gt 0 ]] && echo -e "${YELLOW}Skipping (not K8s): ${pods_non_k8s[*]}${NC}"
             if [[ ${#pods_valid[@]} -eq 0 ]]; then echo -e "${RED}No valid nodes${NC}"; continue; fi
@@ -9154,11 +9301,13 @@ manage_identity_domains() {
         local idx=0
         declare -A _DOM_IDS
         declare -A _DOM_NAMES
+        declare -A _DOM_URLS
         
         while IFS=$'\t' read -r d_name d_type d_license d_state d_url d_id d_is_default d_compartment; do
             ((idx++))
             _DOM_IDS[$idx]="$d_id"
             _DOM_NAMES[$idx]="$d_name"
+            _DOM_URLS[$idx]="$d_url"
             
             local state_color="$GREEN"
             [[ "$d_state" != "ACTIVE" ]] && state_color="$YELLOW"
@@ -9196,7 +9345,7 @@ manage_identity_domains() {
                 ;;
             *)
                 if [[ "$dom_choice" =~ ^[0-9]+$ ]] && [[ -n "${_DOM_IDS[$dom_choice]:-}" ]]; then
-                    _identity_domain_submenu "${_DOM_IDS[$dom_choice]}" "${_DOM_NAMES[$dom_choice]}" "$tenancy_id"
+                    _identity_domain_submenu "${_DOM_IDS[$dom_choice]}" "${_DOM_NAMES[$dom_choice]}" "$tenancy_id" "${_DOM_URLS[$dom_choice]}"
                 else
                     echo -e "${RED}Invalid selection${NC}"
                     sleep 1
@@ -9213,12 +9362,15 @@ _identity_domain_submenu() {
     local domain_id="$1"
     local domain_name="$2"
     local tenancy_id="$3"
+    local domain_url="$4"
     
     while true; do
         echo ""
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${GREEN}                                              DOMAIN: ${WHITE}${domain_name}                                                                                   ${NC}"
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${GRAY}Endpoint: ${domain_url}${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}═══ Domain Operations ═══${NC}"
@@ -9248,16 +9400,16 @@ _identity_domain_submenu() {
                 return
                 ;;
             1)  _identity_domain_detail "$domain_id" ;;
-            2)  _identity_list_users "$tenancy_id" "$domain_name" ;;
-            3)  _identity_list_groups "$tenancy_id" "$domain_name" ;;
-            4)  _identity_list_dynamic_groups "$tenancy_id" ;;
-            5)  _identity_list_identity_providers "$tenancy_id" ;;
-            6)  _identity_search_users "$tenancy_id" "$domain_name" ;;
-            7)  _identity_search_groups "$tenancy_id" "$domain_name" ;;
+            2)  _identity_list_users "$domain_url" "$tenancy_id" "$domain_name" ;;
+            3)  _identity_list_groups "$domain_url" "$tenancy_id" "$domain_name" ;;
+            4)  _identity_list_dynamic_groups "$domain_url" "$tenancy_id" ;;
+            5)  _identity_list_identity_providers "$domain_url" ;;
+            6)  _identity_search_users "$domain_url" "$tenancy_id" "$domain_name" ;;
+            7)  _identity_search_groups "$domain_url" "$tenancy_id" "$domain_name" ;;
             8)  _identity_search_policies_for_principal "$tenancy_id" ;;
-            9)  _identity_create_user "$tenancy_id" "$domain_name" ;;
-            10) _identity_create_group "$tenancy_id" ;;
-            11) _identity_create_dynamic_group "$tenancy_id" ;;
+            9)  _identity_create_user "$domain_url" "$tenancy_id" "$domain_name" ;;
+            10) _identity_create_group "$domain_url" "$tenancy_id" ;;
+            11) _identity_create_dynamic_group "$domain_url" "$tenancy_id" ;;
             *)
                 echo -e "${RED}Invalid selection${NC}"
                 sleep 1
@@ -9267,7 +9419,7 @@ _identity_domain_submenu() {
 }
 
 #--------------------------------------------------------------------------------
-# Domain Details
+# Domain Details (uses oci iam domain get - this is NOT an identity-domains op)
 #--------------------------------------------------------------------------------
 _identity_domain_detail() {
     local domain_id="$1"
@@ -9280,7 +9432,7 @@ _identity_domain_detail() {
     local detail_json
     detail_json=$(oci iam domain get --domain-id "$domain_id" --output json 2>/dev/null)
     
-    if [[ -z "$detail_json" ]] || ! echo "$detail_json" | jq -e '.data' > /dev/null 2>&1; then
+    if [[ -z "$detail_json" ]]; then
         echo -e "${RED}Failed to fetch domain details${NC}"
         echo -e "Press Enter to continue..."
         read -r
@@ -9288,54 +9440,30 @@ _identity_domain_detail() {
     fi
     
     echo ""
-    echo -e "${BOLD}${WHITE}═══ Identity Domain Details ═══${NC}"
+    echo -e "${BOLD}${WHITE}═══ Domain Configuration ═══${NC}"
     echo ""
     
     echo "$detail_json" | jq -r '
         .data |
-        "  \u001b[0;36mName:\u001b[0m           \u001b[1;37m\(.["display-name"] // "N/A")\u001b[0m",
-        "  \u001b[0;36mOCID:\u001b[0m           \u001b[1;33m\(.id // "N/A")\u001b[0m",
-        "  \u001b[0;36mType:\u001b[0m           \(.type // "N/A")",
-        "  \u001b[0;36mDefault:\u001b[0m        \(if .["is-default"] then "\u001b[0;32mYes\u001b[0m" else "No" end)",
-        "  \u001b[0;36mState:\u001b[0m          \(.["lifecycle-state"] // "N/A")",
-        "  \u001b[0;36mLicense:\u001b[0m        \(.["license-type"] // "N/A")",
-        "  \u001b[0;36mURL:\u001b[0m            \(.url // "N/A")",
-        "  \u001b[0;36mHome Region:\u001b[0m    \(.["home-region"] // "N/A")",
-        "  \u001b[0;36mHome URL:\u001b[0m       \(.["home-region-url"] // "N/A")",
-        "  \u001b[0;36mCompartment:\u001b[0m    \(.["compartment-id"] // "N/A")",
-        "  \u001b[0;36mDescription:\u001b[0m    \(.description // "N/A")",
-        "  \u001b[0;36mCreated:\u001b[0m        \((.["time-created"] // "N/A") | split("T") | .[0])"
+        "  \u001b[0;36mDisplay Name:\u001b[0m      \u001b[1;37m\(.["display-name"] // "N/A")\u001b[0m",
+        "  \u001b[0;36mDomain OCID:\u001b[0m       \u001b[1;33m\(.id // "N/A")\u001b[0m",
+        "  \u001b[0;36mCompartment:\u001b[0m       \(.["compartment-id"] // "N/A")",
+        "  \u001b[0;36mType:\u001b[0m              \(.type // "N/A")",
+        "  \u001b[0;36mState:\u001b[0m             \(.["lifecycle-state"] // "N/A")",
+        "  \u001b[0;36mHome Region:\u001b[0m       \(.["home-region"] // "N/A")",
+        "  \u001b[0;36mURL:\u001b[0m               \(.url // "N/A")",
+        "  \u001b[0;36mLicense Type:\u001b[0m      \(.["license-type"] // "N/A")",
+        "  \u001b[0;36mIs Default:\u001b[0m        \(.["is-default"] // "N/A")",
+        "  \u001b[0;36mIs Hidden:\u001b[0m         \(.["is-hidden-on-login"] // "N/A")",
+        "  \u001b[0;36mCreated:\u001b[0m           \(.["time-created"] // "N/A")"
     ' 2>/dev/null
     
-    # Show replica regions if any
-    local replica_count
-    replica_count=$(echo "$detail_json" | jq '(.data["replica-regions"] // []) | length' 2>/dev/null)
-    if [[ "$replica_count" -gt 0 ]]; then
-        echo ""
-        echo -e "  ${CYAN}Replica Regions (${replica_count}):${NC}"
-        echo ""
-        printf "    ${BOLD}%-20s  %-22s  %s${NC}\n" "Region" "Status" "URL"
-        printf "    ${WHITE}%-20s  %-22s  %s${NC}\n" "────────────────────" "──────────────────────" "────────────────────────────────────────────────────────────────────────────────"
-        
-        while IFS=$'\t' read -r r_region r_state r_url; do
-            local state_color="$GREEN"
-            if [[ "$r_state" == *"ENABLED"* ]]; then
-                state_color="$GREEN"
-            else
-                state_color="$YELLOW"
-            fi
-            
-            printf "    ${GRAY}%-20s${NC}  ${state_color}%-22s${NC}  ${WHITE}%s${NC}\n" \
-                "$r_region" "$r_state" "$r_url"
-        done < <(echo "$detail_json" | jq -r '
-            (.data["replica-regions"] // [])[] |
-            [
-                (.region // "N/A"),
-                (.state // "N/A"),
-                (.url // "")
-            ] | @tsv
-        ' 2>/dev/null)
-    fi
+    echo ""
+    echo -e "  ${CYAN}Replica Regions:${NC}"
+    echo "$detail_json" | jq -r '
+        (.data["replica-regions"] // [])[] |
+        "    - \(.region // "N/A")  (State: \(.state // "N/A"))"
+    ' 2>/dev/null || echo -e "    ${GRAY}(none)${NC}"
     
     echo ""
     echo -e "Press Enter to continue..."
@@ -9343,99 +9471,38 @@ _identity_domain_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Users with Group Membership
+# List Users (oci identity-domains user list)
+# Groups are embedded in user SCIM response - no N+1 membership queries needed
 #--------------------------------------------------------------------------------
 _identity_list_users() {
-    local tenancy_id="$1"
-    local domain_name="$2"
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
     
     echo ""
-    local cmd="oci iam user list --compartment-id \"$tenancy_id\" --all"
+    local cmd="oci identity-domains user list --endpoint \"$domain_url\" --attribute-sets all --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
-    echo -e "${GRAY}Fetching users...${NC}"
+    echo -e "${GRAY}Fetching users from identity domain...${NC}"
     
     local users_json
-    users_json=$(oci iam user list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
+    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
     
-    if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.data' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch users. Check permissions.${NC}"
+    if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch users. Check permissions (identity-domains user list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
     
     local user_count
-    user_count=$(echo "$users_json" | jq '[(.data // [])[] | select(.["lifecycle-state"] != "DELETED")] | length')
-    
-    # Pre-fetch all groups and all memberships once (avoid N+1 API calls)
-    echo -e "${GRAY}Fetching groups and memberships...${NC}"
-    local groups_json
-    groups_json=$(oci iam group list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
-    
-    # Build user-id -> group-names mapping using Python for efficiency
-    local user_groups_map_file="${TEMP_DIR}/user_groups_map_$$"
-    local users_tmp_file="${TEMP_DIR}/users_tmp_$$"
-    local groups_tmp_file="${TEMP_DIR}/groups_tmp_$$"
-    
-    # Write JSON to temp files (command-line args have OS length limits)
-    echo "$users_json" > "$users_tmp_file"
-    echo "${groups_json:-{\}}" > "$groups_tmp_file"
-    
-    # Fetch memberships for each user efficiently
-    python3 - "$users_tmp_file" "$groups_tmp_file" "$tenancy_id" "$user_groups_map_file" << 'USER_GRP_MAP_EOF'
-import json, sys, subprocess, os
-
-with open(sys.argv[1]) as f:
-    users = json.load(f)
-with open(sys.argv[2]) as f:
-    groups = json.load(f)
-tenancy_id = sys.argv[3]
-outfile = sys.argv[4]
-
-# Build group id -> name map
-gid_to_name = {}
-for g in groups.get('data', []):
-    gid_to_name[g.get('id', '')] = g.get('name', 'Unknown')
-
-# For each user, fetch memberships
-user_groups = {}
-for u in users.get('data', []):
-    if u.get('lifecycle-state') == 'DELETED':
-        continue
-    uid = u.get('id', '')
-    uname = u.get('name', '')
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['oci', 'iam', 'user-group-membership', 'list',
-             '--compartment-id', tenancy_id, '--user-id', uid, '--all', '--output', 'json'],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            mems = json.loads(result.stdout)
-            gnames = []
-            for m in mems.get('data', []):
-                gid = m.get('group-id', '')
-                gnames.append(gid_to_name.get(gid, gid[:20]))
-            user_groups[uid] = ', '.join(gnames) if gnames else ''
-        else:
-            user_groups[uid] = ''
-    except:
-        user_groups[uid] = ''
-
-with open(outfile, 'w') as f:
-    json.dump(user_groups, f)
-USER_GRP_MAP_EOF
-    
-    # Cleanup temp input files
-    rm -f "$users_tmp_file" "$groups_tmp_file"
+    user_count=$(echo "$users_json" | jq '[(.resources // [])[] | select(.active == true)] | length')
     
     echo ""
-    echo -e "${BOLD}${WHITE}═══ Users (${user_count}) ═══${NC}"
+    echo -e "${BOLD}${WHITE}═══ Users (${user_count} active) ═══${NC}"
     echo ""
     
     printf "${BOLD}%-3s  %-30s  %-35s  %-10s  %-10s  %s${NC}\n" \
-        "#" "Name" "Email" "State" "Created" "Groups"
+        "#" "Username" "Email" "State" "Created" "Groups"
     printf "${WHITE}%-3s  %-30s  %-35s  %-10s  %-10s  %s${NC}\n" \
         "---" "------------------------------" "-----------------------------------" "----------" "----------" "──────────────────────────────────────────"
     
@@ -9443,67 +9510,63 @@ USER_GRP_MAP_EOF
     declare -A _USR_IDS
     declare -A _USR_NAMES
     
-    # Load group map
-    local user_groups_map="{}"
-    [[ -f "$user_groups_map_file" ]] && user_groups_map=$(cat "$user_groups_map_file")
-    
-    while IFS=$'\t' read -r u_name u_email u_state u_id u_created; do
+    while IFS=$'\t' read -r u_name u_email u_active u_id u_created u_groups; do
+        [[ -z "$u_name" ]] && continue
         ((idx++))
         _USR_IDS[$idx]="$u_id"
         _USR_NAMES[$idx]="$u_name"
         
+        local state_display="ACTIVE"
         local state_color="$GREEN"
-        [[ "$u_state" != "ACTIVE" ]] && state_color="$YELLOW"
-        [[ "$u_state" == "BLOCKED" || "$u_state" == "DELETED" ]] && state_color="$RED"
-        
-        # Get group names from pre-built map
-        local groups_str=""
-        groups_str=$(echo "$user_groups_map" | jq -r --arg uid "$u_id" '.[$uid] // ""' 2>/dev/null)
+        if [[ "$u_active" != "true" ]]; then
+            state_display="INACTIVE"
+            state_color="$RED"
+        fi
         
         local created_short="${u_created:0:10}"
         
         printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}  ${state_color}%-10s${NC}  ${GRAY}%-10s${NC}  ${MAGENTA}%s${NC}\n" \
-            "$idx" "${u_name:0:30}" "${u_email:0:35}" "$u_state" "$created_short" "${groups_str}"
+            "$idx" "${u_name:0:30}" "${u_email:0:35}" "$state_display" "$created_short" "${u_groups}"
     done < <(echo "$users_json" | jq -r '
-        (.data // [])[] | select(.["lifecycle-state"] != "DELETED") |
+        (.resources // [])[] | select(.active == true) |
         [
-            (.name // "N/A"),
-            (.email // "N/A"),
-            (.["lifecycle-state"] // "N/A"),
+            (.["user-name"] // "N/A"),
+            ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
+            (if .active then "true" else "false" end),
             (.id // "N/A"),
-            (.["time-created"] // "N/A")
+            ((.meta // {}).created // "N/A"),
+            ([(.groups // [])[] | .display] | join(", "))
         ] | @tsv
     ' 2>/dev/null)
-    
-    # Cleanup temp file
-    rm -f "$user_groups_map_file"
     
     echo ""
     echo -n -e "${BOLD}${CYAN}[Users] Enter # for details, back=return: ${NC}"
     read -r uchoice
     
     if [[ "$uchoice" =~ ^[0-9]+$ ]] && [[ -n "${_USR_IDS[$uchoice]:-}" ]]; then
-        _identity_user_detail "${_USR_IDS[$uchoice]}" "${_USR_NAMES[$uchoice]}" "$tenancy_id"
+        _identity_user_detail "${_USR_IDS[$uchoice]}" "${_USR_NAMES[$uchoice]}" "$domain_url" "$tenancy_id"
     fi
 }
 
 #--------------------------------------------------------------------------------
-# User Detail View
+# User Detail View (oci identity-domains user get)
+# Groups are embedded - no separate membership query needed
 #--------------------------------------------------------------------------------
 _identity_user_detail() {
     local user_id="$1"
     local user_name="$2"
-    local tenancy_id="$3"
+    local domain_url="$3"
+    local tenancy_id="$4"
     
     echo ""
-    local cmd="oci iam user get --user-id \"$user_id\""
+    local cmd="oci identity-domains user get --user-id \"$user_id\" --endpoint \"$domain_url\" --attribute-sets all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${GRAY}Fetching user details...${NC}"
     
     local user_json
-    user_json=$(oci iam user get --user-id "$user_id" --output json 2>/dev/null)
+    user_json=$(oci identity-domains user get --user-id "$user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
-    if [[ -z "$user_json" ]] || ! echo "$user_json" | jq -e '.data' > /dev/null 2>&1; then
+    if [[ -z "$user_json" ]]; then
         echo -e "${RED}Failed to fetch user details${NC}"
         echo -e "Press Enter to continue..."
         read -r
@@ -9514,48 +9577,47 @@ _identity_user_detail() {
     echo -e "${BOLD}${WHITE}═══ User Details: ${GREEN}${user_name}${WHITE} ═══${NC}"
     echo ""
     
+    # Display user attributes from SCIM response
     echo "$user_json" | jq -r '
-        .data |
-        "  \u001b[0;36mName:\u001b[0m           \u001b[1;37m\(.name // "N/A")\u001b[0m",
-        "  \u001b[0;36mOCID:\u001b[0m           \u001b[1;33m\(.id // "N/A")\u001b[0m",
-        "  \u001b[0;36mEmail:\u001b[0m          \(.email // "N/A")",
-        "  \u001b[0;36mState:\u001b[0m          \(.["lifecycle-state"] // "N/A")",
-        "  \u001b[0;36mDescription:\u001b[0m    \(.description // "N/A")",
-        "  \u001b[0;36mCreated:\u001b[0m        \((.["time-created"] // "N/A") | split("T") | .[0])",
-        "  \u001b[0;36mCompartment:\u001b[0m    \(.["compartment-id"] // "N/A")",
-        "  \u001b[0;36mDB Credential:\u001b[0m  \(if .["db-user-name"] then .["db-user-name"] else "N/A" end)",
-        "  \u001b[0;36mMFA Active:\u001b[0m     \(if .["is-mfa-activated"] then "\u001b[0;32mYes\u001b[0m" else "\u001b[1;33mNo\u001b[0m" end)"
+        "  \u001b[0;36mUsername:\u001b[0m        \u001b[1;37m\(.["user-name"] // "N/A")\u001b[0m",
+        "  \u001b[0;36mDisplay Name:\u001b[0m    \(.["display-name"] // "N/A")",
+        "  \u001b[0;36mOCID:\u001b[0m            \u001b[1;33m\(.ocid // "N/A")\u001b[0m",
+        "  \u001b[0;36mSCIM ID:\u001b[0m         \u001b[0;90m\(.id // "N/A")\u001b[0m",
+        "  \u001b[0;36mEmail:\u001b[0m           \(((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value) // "N/A")",
+        "  \u001b[0;36mActive:\u001b[0m          \(if .active then "\u001b[0;32mYes\u001b[0m" else "\u001b[1;31mNo\u001b[0m" end)",
+        "  \u001b[0;36mName:\u001b[0m            \(((.name // {})["given-name"] // "") + " " + ((.name // {})["family-name"] // ""))",
+        "  \u001b[0;36mCreated:\u001b[0m         \(((.meta // {}).created // "N/A") | split("T") | .[0])",
+        "  \u001b[0;36mDescription:\u001b[0m     \(.description // "N/A")"
     ' 2>/dev/null
     
-    # Fetch group memberships for this user
+    # Groups are embedded in the SCIM user response
     echo ""
     echo -e "  ${CYAN}Group Memberships:${NC}"
-    local mem_cmd="oci iam user-group-membership list --compartment-id \"$tenancy_id\" --user-id \"$user_id\" --all"
-    echo -e "  ${GRAY}Command: ${mem_cmd}${NC}"
     
-    local memberships_json
-    memberships_json=$(oci iam user-group-membership list --compartment-id "$tenancy_id" --user-id "$user_id" --all --output json 2>/dev/null)
-    
-    # Collect group names for policy search
     local user_group_names=()
+    local group_count
+    group_count=$(echo "$user_json" | jq '(.groups // []) | length' 2>/dev/null)
     
-    if [[ -n "$memberships_json" ]]; then
-        local mem_count
-        mem_count=$(echo "$memberships_json" | jq '(.data // []) | length' 2>/dev/null)
-        
-        if [[ "$mem_count" -gt 0 ]]; then
-            while read -r gid; do
-                local gname
-                gname=$(oci iam group get --group-id "$gid" --query 'data.name' --raw-output 2>/dev/null || echo "$gid")
-                echo -e "    - ${MAGENTA}${gname}${NC}  ${GRAY}(${gid})${NC}"
-                user_group_names+=("$gname")
-            done < <(echo "$memberships_json" | jq -r '(.data // [])[] | .["group-id"]' 2>/dev/null)
-        else
-            echo -e "    ${GRAY}(no group memberships)${NC}"
-        fi
+    if [[ "$group_count" -gt 0 && "$group_count" != "null" ]]; then
+        while IFS=$'\t' read -r gname gval; do
+            [[ -z "$gname" ]] && continue
+            echo -e "    - ${MAGENTA}${gname}${NC}  ${GRAY}(${gval})${NC}"
+            user_group_names+=("$gname")
+        done < <(echo "$user_json" | jq -r '(.groups // [])[] | [.display // "N/A", .value // "N/A"] | @tsv' 2>/dev/null)
     else
-        echo -e "    ${GRAY}(failed to fetch memberships)${NC}"
+        echo -e "    ${GRAY}(no group memberships)${NC}"
     fi
+    
+    # Additional SCIM attributes
+    echo ""
+    echo -e "  ${CYAN}Additional Attributes:${NC}"
+    echo "$user_json" | jq -r '
+        "  \u001b[0;36m  MFA Active:\u001b[0m     " +
+            (if (.["urn:ietf:params:scim:schemas:oracle:idcs:extension:mfa:User"] // {})["mfa-status"] == "ENROLLED"
+             then "\u001b[0;32mYes\u001b[0m" else "\u001b[1;33mNo\u001b[0m" end),
+        "  \u001b[0;36m  User Type:\u001b[0m      \(.["user-type"] // "N/A")",
+        "  \u001b[0;36m  DB Username:\u001b[0m    \(.["urn:ietf:params:scim:schemas:oracle:idcs:extension:db:User"]["db-user-name"] // "N/A")"
+    ' 2>/dev/null 2>&1 || true
     
     # Search policies referencing this user (via user name, group names, any-user, any-group)
     echo ""
@@ -9610,37 +9672,29 @@ def matches_principal(stmt):
 
 def highlight_stmt(stmt, search_kw=""):
     """Syntax highlight a policy statement - token-based to avoid ANSI-in-regex issues"""
-    # Tokenize: split on whitespace, colorize tokens, rejoin
     tokens = stmt.split()
     result = []
     i = 0
     while i < len(tokens):
         t = tokens[i]
         tl = t.lower()
-        
-        # Allow / Deny
         if tl == 'allow':
             result.append(f'{GREEN}{t}{NC}')
         elif tl == 'deny':
             result.append(f'{RED}{t}{NC}')
-        # any-user / any-group (orange - security risk)
         elif tl == 'any-user':
             result.append(f'{ORANGE}{t}{NC}')
         elif tl == 'any-group':
             result.append(f'{ORANGE}{t}{NC}')
-        # service <name>
         elif tl == 'service' and i + 1 < len(tokens):
             result.append(f'{RED}{t}{NC}')
             i += 1
             result.append(f'{RED}{tokens[i]}{NC}')
-        # dynamic-group <name>
         elif tl == 'dynamic-group' and i + 1 < len(tokens):
             result.append(f'{MAGENTA}{t}{NC}')
             i += 1
             result.append(f'{MAGENTA}{tokens[i]}{NC}')
-        # group <name> (but not dynamic-group or any-group)
         elif tl == 'group' and i + 1 < len(tokens):
-            # Check previous token isn't dynamic- or any-
             prev = tokens[i-1].lower() if i > 0 else ''
             if prev not in ('dynamic-group', 'any-group'):
                 result.append(f'{MAGENTA}{t}{NC}')
@@ -9648,26 +9702,21 @@ def highlight_stmt(stmt, search_kw=""):
                 result.append(f'{MAGENTA}{tokens[i]}{NC}')
             else:
                 result.append(t)
-        # Verbs + resource type
         elif tl in ('manage', 'use', 'read', 'inspect'):
             result.append(f'{YELLOW}{t}{NC}')
             if i + 1 < len(tokens):
                 i += 1
                 result.append(f'{CYAN}{tokens[i]}{NC}')
-        # in compartment <name>
         elif tl == 'compartment' and i + 1 < len(tokens):
             result.append(t)
             i += 1
             result.append(f'{BOLD}{BLUE}{tokens[i]}{NC}')
-        # where
         elif tl == 'where':
             result.append(f'{CYAN}{t}{NC}')
         else:
             result.append(t)
         i += 1
-    
     h = ' '.join(result)
-    # Highlight search keyword if present (on final string, using re.escape for safety)
     if search_kw:
         try:
             h = re.sub(re.escape(search_kw), f'{BG_YELLOW}\\g<0>{NC}', h, flags=re.IGNORECASE)
@@ -9682,7 +9731,6 @@ for p in policies.get('data', []):
     comp_id = p.get('compartment-id', '')
     for stmt in p.get('statements', []):
         if matches_principal(stmt):
-            # If keyword filter provided, apply it
             if search_kw and search_kw.lower() not in stmt.lower():
                 continue
             matches.append((pname, stmt, comp_id))
@@ -9697,7 +9745,6 @@ else:
     print(f"    Found {GREEN}{len(matches)}{NC} matching statement(s)")
     print()
     
-    # Group by policy name
     by_policy = {}
     for pname, stmt, comp_id in matches:
         by_policy.setdefault(pname, []).append(stmt)
@@ -9831,62 +9878,72 @@ USER_POL_SEARCH_EOF
 }
 
 #--------------------------------------------------------------------------------
-# List Groups with Member Count
+# List Groups with Member Count (oci identity-domains group list)
+# Members are embedded in SCIM group response
 #--------------------------------------------------------------------------------
 _identity_list_groups() {
-    local tenancy_id="$1"
-    local domain_name="$2"
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
     
     echo ""
-    local cmd="oci iam group list --compartment-id \"$tenancy_id\" --all"
+    local cmd="oci identity-domains group list --endpoint \"$domain_url\" --attribute-sets all --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
-    echo -e "${GRAY}Fetching groups...${NC}"
+    echo -e "${GRAY}Fetching groups from identity domain...${NC}"
     
     local groups_json
-    groups_json=$(oci iam group list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
+    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
     
-    if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.data' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch groups. Check permissions.${NC}"
+    if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch groups. Check permissions (identity-domains group list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
     
     local group_count
-    group_count=$(echo "$groups_json" | jq '(.data // []) | length')
+    group_count=$(echo "$groups_json" | jq '(.resources // []) | length')
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Groups (${group_count}) ═══${NC}"
     echo ""
     
-    printf "${BOLD}%-3s  %-40s  %-10s  %-15s  %s${NC}\n" \
-        "#" "Group Name" "State" "Created" "Description"
-    printf "${WHITE}%-3s  %-40s  %-10s  %-15s  %s${NC}\n" \
-        "---" "----------------------------------------" "----------" "---------------" "-------------------------------------------"
+    printf "${BOLD}%-3s  %-40s  %-10s  %-8s  %-15s  %s${NC}\n" \
+        "#" "Group Name" "State" "Members" "Created" "Description"
+    printf "${WHITE}%-3s  %-40s  %-10s  %-8s  %-15s  %s${NC}\n" \
+        "---" "----------------------------------------" "----------" "--------" "---------------" "-------------------------------------------"
     
     local idx=0
     declare -A _GRP_IDS
     declare -A _GRP_NAMES
     
-    while IFS=$'\t' read -r g_name g_state g_id g_created g_desc; do
+    while IFS=$'\t' read -r g_name g_active g_id g_created g_desc g_member_count; do
+        [[ -z "$g_name" ]] && continue
         ((idx++))
         _GRP_IDS[$idx]="$g_id"
         _GRP_NAMES[$idx]="$g_name"
         
+        local state_display="ACTIVE"
         local state_color="$GREEN"
-        [[ "$g_state" != "ACTIVE" ]] && state_color="$YELLOW"
-        [[ "$g_state" == "DELETED" ]] && state_color="$RED"
+        if [[ "$g_active" != "true" ]]; then
+            state_display="INACTIVE"
+            state_color="$YELLOW"
+        fi
         
-        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%-15s${NC}  ${GRAY}%s${NC}\n" \
-            "$idx" "${g_name:0:40}" "$g_state" "${g_created:0:10}" "${g_desc:0:43}"
+        local mem_color="$CYAN"
+        [[ "$g_member_count" == "0" ]] && mem_color="$GRAY"
+        
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${mem_color}%-8s${NC}  ${GRAY}%-15s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${g_name:0:40}" "$state_display" "$g_member_count" "${g_created:0:10}" "${g_desc:0:43}"
     done < <(echo "$groups_json" | jq -r '
-        (.data // [])[] | select(.["lifecycle-state"] != "DELETED") |
+        (.resources // [])[] |
         [
-            (.name // "N/A"),
-            (.["lifecycle-state"] // "N/A"),
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
             (.id // "N/A"),
-            (.["time-created"] // "N/A"),
-            (.description // "-")
+            ((.meta // {}).created // "N/A"),
+            (.description // "-"),
+            ((.members // []) | length | tostring)
         ] | @tsv
     ' 2>/dev/null)
     
@@ -9895,58 +9952,55 @@ _identity_list_groups() {
     read -r gchoice
     
     if [[ "$gchoice" =~ ^[0-9]+$ ]] && [[ -n "${_GRP_IDS[$gchoice]:-}" ]]; then
-        _identity_group_detail "${_GRP_IDS[$gchoice]}" "${_GRP_NAMES[$gchoice]}" "$tenancy_id"
+        _identity_group_detail "${_GRP_IDS[$gchoice]}" "${_GRP_NAMES[$gchoice]}" "$domain_url" "$tenancy_id"
     fi
 }
 
 #--------------------------------------------------------------------------------
-# Group Detail View (members + policy references)
+# Group Detail View (oci identity-domains group get)
+# Members are embedded - no separate user-group-membership query needed
 #--------------------------------------------------------------------------------
 _identity_group_detail() {
     local group_id="$1"
     local group_name="$2"
-    local tenancy_id="$3"
+    local domain_url="$3"
+    local tenancy_id="$4"
     
     echo ""
-    local cmd="oci iam group get --group-id \"$group_id\""
+    local cmd="oci identity-domains group get --group-id \"$group_id\" --endpoint \"$domain_url\" --attribute-sets all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     echo -e "${BOLD}${WHITE}═══ Group Details: ${MAGENTA}${group_name}${WHITE} ═══${NC}"
     echo ""
     
-    # Group info
     local group_json
-    group_json=$(oci iam group get --group-id "$group_id" --output json 2>/dev/null)
+    group_json=$(oci identity-domains group get --group-id "$group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
     if [[ -n "$group_json" ]]; then
         echo "$group_json" | jq -r '
-            .data |
-            "  \u001b[0;36mName:\u001b[0m           \u001b[1;37m\(.name // "N/A")\u001b[0m",
-            "  \u001b[0;36mOCID:\u001b[0m           \u001b[1;33m\(.id // "N/A")\u001b[0m",
-            "  \u001b[0;36mState:\u001b[0m          \(.["lifecycle-state"] // "N/A")",
-            "  \u001b[0;36mDescription:\u001b[0m    \(.description // "N/A")",
-            "  \u001b[0;36mCreated:\u001b[0m        \((.["time-created"] // "N/A") | split("T") | .[0])"
+            "  \u001b[0;36mDisplay Name:\u001b[0m    \u001b[1;37m\(.["display-name"] // "N/A")\u001b[0m",
+            "  \u001b[0;36mOCID:\u001b[0m            \u001b[1;33m\(.ocid // "N/A")\u001b[0m",
+            "  \u001b[0;36mSCIM ID:\u001b[0m         \u001b[0;90m\(.id // "N/A")\u001b[0m",
+            "  \u001b[0;36mActive:\u001b[0m          \(if .active // true then "\u001b[0;32mYes\u001b[0m" else "\u001b[1;31mNo\u001b[0m" end)",
+            "  \u001b[0;36mDescription:\u001b[0m     \(.description // "N/A")",
+            "  \u001b[0;36mCreated:\u001b[0m         \(((.meta // {}).created // "N/A") | split("T") | .[0])",
+            "  \u001b[0;36mMembers:\u001b[0m         \((.members // []) | length)"
         ' 2>/dev/null
     fi
     
-    # List members
+    # Members are embedded in the SCIM group response
     echo ""
     echo -e "  ${CYAN}Members:${NC}"
-    local memberships_json
-    memberships_json=$(oci iam user-group-membership list --compartment-id "$tenancy_id" --group-id "$group_id" --all --output json 2>/dev/null)
     
-    if [[ -n "$memberships_json" ]]; then
-        local mem_count
-        mem_count=$(echo "$memberships_json" | jq '(.data // []) | length' 2>/dev/null)
-        
-        if [[ "$mem_count" -gt 0 ]]; then
-            while read -r uid; do
-                local uname
-                uname=$(oci iam user get --user-id "$uid" --query 'data.name' --raw-output 2>/dev/null || echo "$uid")
-                echo -e "    - ${WHITE}${uname}${NC}  ${GRAY}(${uid})${NC}"
-            done < <(echo "$memberships_json" | jq -r '(.data // [])[] | .["user-id"]' 2>/dev/null)
-        else
-            echo -e "    ${GRAY}(no members)${NC}"
-        fi
+    local mem_count
+    mem_count=$(echo "$group_json" | jq '(.members // []) | length' 2>/dev/null)
+    
+    if [[ "$mem_count" -gt 0 && "$mem_count" != "null" ]]; then
+        while IFS=$'\t' read -r uname uval; do
+            [[ -z "$uname" ]] && continue
+            echo -e "    - ${WHITE}${uname}${NC}  ${GRAY}(${uval})${NC}"
+        done < <(echo "$group_json" | jq -r '(.members // [])[] | [.name // .display // "N/A", .value // "N/A"] | @tsv' 2>/dev/null)
+    else
+        echo -e "    ${GRAY}(no members)${NC}"
     fi
     
     # Search policies referencing this group (group name, any-group)
@@ -9982,28 +10036,29 @@ _identity_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Dynamic Groups with Matching Rules
+# List Dynamic Groups (oci identity-domains dynamic-resource-group list)
 #--------------------------------------------------------------------------------
 _identity_list_dynamic_groups() {
-    local tenancy_id="$1"
+    local domain_url="$1"
+    local tenancy_id="$2"
     
     echo ""
-    local cmd="oci iam dynamic-group list --compartment-id \"$tenancy_id\" --all"
+    local cmd="oci identity-domains dynamic-resource-group list --endpoint \"$domain_url\" --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
-    echo -e "${GRAY}Fetching dynamic groups...${NC}"
+    echo -e "${GRAY}Fetching dynamic groups from identity domain...${NC}"
     
     local dg_json
-    dg_json=$(oci iam dynamic-group list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
+    dg_json=$(oci identity-domains dynamic-resource-group list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
-    if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.data' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch dynamic groups. Check permissions.${NC}"
+    if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch dynamic groups. Check permissions (identity-domains dynamic-resource-group list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
     fi
     
     local dg_count
-    dg_count=$(echo "$dg_json" | jq '(.data // []) | length')
+    dg_count=$(echo "$dg_json" | jq '(.resources // []) | length')
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Dynamic Groups (${dg_count}) ═══${NC}"
@@ -10014,29 +10069,34 @@ _identity_list_dynamic_groups() {
     declare -A _DG_NAMES
     
     printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "#" "Dynamic Group Name" "State" "Matching Rule"
+        "#" "Dynamic Group Name" "Active" "Matching Rule"
     printf "${WHITE}%-3s  %-40s  %-10s  %s${NC}\n" \
         "---" "----------------------------------------" "----------" "────────────────────────────────────────────────────────────────"
     
-    while IFS=$'\t' read -r dg_name dg_state dg_id dg_rule dg_desc; do
+    while IFS=$'\t' read -r dg_name dg_active dg_id dg_rule dg_desc; do
+        [[ -z "$dg_name" ]] && continue
         ((idx++))
         _DG_IDS[$idx]="$dg_id"
         _DG_NAMES[$idx]="$dg_name"
         
+        local state_display="Yes"
         local state_color="$GREEN"
-        [[ "$dg_state" != "ACTIVE" ]] && state_color="$YELLOW"
+        if [[ "$dg_active" != "true" ]]; then
+            state_display="No"
+            state_color="$YELLOW"
+        fi
         
         printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-            "$idx" "${dg_name:0:40}" "$dg_state" "${dg_rule:0:65}"
+            "$idx" "${dg_name:0:40}" "$state_display" "${dg_rule:0:65}"
         # Show full rule if truncated
         if [[ ${#dg_rule} -gt 65 ]]; then
             printf "     %-40s  %-10s  ${GRAY}%s${NC}\n" "" "" "${dg_rule:65}"
         fi
     done < <(echo "$dg_json" | jq -r '
-        (.data // [])[] | select(.["lifecycle-state"] != "DELETED") |
+        (.resources // [])[] |
         [
-            (.name // "N/A"),
-            (.["lifecycle-state"] // "N/A"),
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
             (.id // "N/A"),
             (.["matching-rule"] // "N/A"),
             (.description // "-")
@@ -10048,23 +10108,24 @@ _identity_list_dynamic_groups() {
     read -r dgchoice
     
     if [[ "$dgchoice" =~ ^[0-9]+$ ]] && [[ -n "${_DG_IDS[$dgchoice]:-}" ]]; then
-        _identity_dynamic_group_detail "${_DG_IDS[$dgchoice]}" "${_DG_NAMES[$dgchoice]}" "$tenancy_id"
+        _identity_dynamic_group_detail "${_DG_IDS[$dgchoice]}" "${_DG_NAMES[$dgchoice]}" "$domain_url" "$tenancy_id"
     fi
 }
 
 #--------------------------------------------------------------------------------
-# Dynamic Group Detail View
+# Dynamic Group Detail View (oci identity-domains dynamic-resource-group get)
 #--------------------------------------------------------------------------------
 _identity_dynamic_group_detail() {
     local dg_id="$1"
     local dg_name="$2"
-    local tenancy_id="$3"
+    local domain_url="$3"
+    local tenancy_id="$4"
     
     echo ""
-    local cmd="oci iam dynamic-group get --dynamic-group-id \"$dg_id\""
+    local cmd="oci identity-domains dynamic-resource-group get --dynamic-resource-group-id \"$dg_id\" --endpoint \"$domain_url\""
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
     local dg_json
-    dg_json=$(oci iam dynamic-group get --dynamic-group-id "$dg_id" --output json 2>/dev/null)
+    dg_json=$(oci identity-domains dynamic-resource-group get --dynamic-resource-group-id "$dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
     
     if [[ -z "$dg_json" ]]; then
         echo -e "${RED}Failed to fetch dynamic group details${NC}"
@@ -10077,17 +10138,17 @@ _identity_dynamic_group_detail() {
     echo ""
     
     echo "$dg_json" | jq -r '
-        .data |
-        "  \u001b[0;36mName:\u001b[0m           \u001b[1;37m\(.name // "N/A")\u001b[0m",
-        "  \u001b[0;36mOCID:\u001b[0m           \u001b[1;33m\(.id // "N/A")\u001b[0m",
-        "  \u001b[0;36mState:\u001b[0m          \(.["lifecycle-state"] // "N/A")",
-        "  \u001b[0;36mDescription:\u001b[0m    \(.description // "N/A")",
-        "  \u001b[0;36mCreated:\u001b[0m        \((.["time-created"] // "N/A") | split("T") | .[0])"
+        "  \u001b[0;36mDisplay Name:\u001b[0m    \u001b[1;37m\(.["display-name"] // "N/A")\u001b[0m",
+        "  \u001b[0;36mOCID:\u001b[0m            \u001b[1;33m\(.ocid // "N/A")\u001b[0m",
+        "  \u001b[0;36mSCIM ID:\u001b[0m         \u001b[0;90m\(.id // "N/A")\u001b[0m",
+        "  \u001b[0;36mActive:\u001b[0m          \(if .active // true then "\u001b[0;32mYes\u001b[0m" else "\u001b[1;31mNo\u001b[0m" end)",
+        "  \u001b[0;36mDescription:\u001b[0m     \(.description // "N/A")",
+        "  \u001b[0;36mCreated:\u001b[0m         \(((.meta // {}).created // "N/A") | split("T") | .[0])"
     ' 2>/dev/null
     
     echo ""
     echo -e "  ${CYAN}Matching Rule:${NC}"
-    echo "$dg_json" | jq -r '.data["matching-rule"] // "N/A"' 2>/dev/null | sed 's/^/    /'
+    echo "$dg_json" | jq -r '.["matching-rule"] // "N/A"' 2>/dev/null | sed 's/^/    /'
     
     # Search policies referencing this dynamic group
     echo ""
@@ -10122,48 +10183,52 @@ _identity_dynamic_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Identity Providers (Federation)
+# List Identity Providers (oci identity-domains identity-provider list)
 #--------------------------------------------------------------------------------
 _identity_list_identity_providers() {
-    local tenancy_id="$1"
+    local domain_url="$1"
     
     echo ""
-    local cmd="oci iam identity-provider list --compartment-id \"$tenancy_id\" --protocol SAML2 --all"
+    local cmd="oci identity-domains identity-provider list --endpoint \"$domain_url\" --all"
     echo -e "  ${GRAY}Command: ${cmd}${NC}"
-    echo -e "${GRAY}Fetching identity providers...${NC}"
+    echo -e "${GRAY}Fetching identity providers from domain...${NC}"
     
     local idp_json
-    idp_json=$(oci iam identity-provider list --compartment-id "$tenancy_id" --protocol SAML2 --all --output json 2>/dev/null)
+    idp_json=$(oci identity-domains identity-provider list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Identity Providers / Federation ═══${NC}"
     echo ""
     
-    if [[ -z "$idp_json" ]] || ! echo "$idp_json" | jq -e '.data' > /dev/null 2>&1 || \
-       [[ $(echo "$idp_json" | jq '(.data // []) | length' 2>/dev/null) -eq 0 ]]; then
-        echo -e "  ${GRAY}No SAML2 identity providers found.${NC}"
-        echo -e "  ${GRAY}Note: OCI may use identity domains for modern federation.${NC}"
-        echo -e "  ${GRAY}Check the identity domain URL for IdP settings.${NC}"
+    if [[ -z "$idp_json" ]] || ! echo "$idp_json" | jq -e '.resources' > /dev/null 2>&1 || \
+       [[ $(echo "$idp_json" | jq '(.resources // []) | length' 2>/dev/null) -eq 0 ]]; then
+        echo -e "  ${GRAY}No identity providers found in this domain.${NC}"
+        echo -e "  ${GRAY}Note: Check the domain URL in domain details for IdP settings.${NC}"
     else
         printf "${BOLD}%-3s  %-35s  %-12s  %-10s  %s${NC}\n" \
-            "#" "Provider Name" "Protocol" "State" "Description"
+            "#" "Provider Name" "Type" "Enabled" "Description"
         printf "${WHITE}%-3s  %-35s  %-12s  %-10s  %s${NC}\n" \
             "---" "-----------------------------------" "------------" "----------" "---------------------------------------------"
         
         local idx=0
-        while IFS=$'\t' read -r idp_name idp_proto idp_state idp_id idp_desc; do
+        while IFS=$'\t' read -r idp_name idp_type idp_enabled idp_id idp_desc; do
+            [[ -z "$idp_name" ]] && continue
             ((idx++))
-            local state_color="$GREEN"
-            [[ "$idp_state" != "ACTIVE" ]] && state_color="$YELLOW"
+            local en_color="$GREEN"
+            local en_display="Yes"
+            if [[ "$idp_enabled" != "true" ]]; then
+                en_color="$YELLOW"
+                en_display="No"
+            fi
             
-            printf "${YELLOW}%-3s${NC}  ${WHITE}%-35s${NC}  ${CYAN}%-12s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-                "$idx" "${idp_name:0:35}" "$idp_proto" "$idp_state" "${idp_desc:0:45}"
+            printf "${YELLOW}%-3s${NC}  ${WHITE}%-35s${NC}  ${CYAN}%-12s${NC}  ${en_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
+                "$idx" "${idp_name:0:35}" "${idp_type:0:12}" "$en_display" "${idp_desc:0:45}"
         done < <(echo "$idp_json" | jq -r '
-            (.data // [])[] |
+            (.resources // [])[] |
             [
-                (.name // "N/A"),
-                (.protocol // "N/A"),
-                (.["lifecycle-state"] // "N/A"),
+                (.["partner-name"] // .["display-name"] // "N/A"),
+                (.type // "N/A"),
+                (if .enabled // false then "true" else "false" end),
                 (.id // "N/A"),
                 (.description // "-")
             ] | @tsv
@@ -10176,11 +10241,12 @@ _identity_list_identity_providers() {
 }
 
 #--------------------------------------------------------------------------------
-# Search Users by keyword
+# Search Users by keyword (oci identity-domains user list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_users() {
-    local tenancy_id="$1"
-    local domain_name="$2"
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
     
     echo ""
     echo -n -e "  ${WHITE}Enter keyword to search users (name/email): ${NC}"
@@ -10193,7 +10259,7 @@ _identity_search_users() {
     echo -e "${GRAY}Searching users for '${search_kw}'...${NC}"
     
     local users_json
-    users_json=$(oci iam user list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
+    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
     
     if [[ -z "$users_json" ]]; then
         echo -e "${RED}Failed to fetch users${NC}"
@@ -10211,11 +10277,12 @@ _identity_search_users() {
     declare -A _USR_SEARCH_NAMES
     
     printf "${BOLD}%-3s  %-30s  %-35s  %-10s  %s${NC}\n" \
-        "#" "Name" "Email" "State" "Created"
+        "#" "Username" "Email" "State" "Created"
     printf "${WHITE}%-3s  %-30s  %-35s  %-10s  %s${NC}\n" \
         "---" "------------------------------" "-----------------------------------" "----------" "---------------"
     
-    while IFS=$'\t' read -r u_name u_email u_state u_id u_created; do
+    while IFS=$'\t' read -r u_name u_email u_active u_id u_created; do
+        [[ -z "$u_name" ]] && continue
         # Case-insensitive match on name or email
         local search_lower="${search_kw,,}"
         local name_lower="${u_name,,}"
@@ -10226,20 +10293,24 @@ _identity_search_users() {
             _USR_SEARCH_IDS[$idx]="$u_id"
             _USR_SEARCH_NAMES[$idx]="$u_name"
             
+            local state_display="ACTIVE"
             local state_color="$GREEN"
-            [[ "$u_state" != "ACTIVE" ]] && state_color="$YELLOW"
+            if [[ "$u_active" != "true" ]]; then
+                state_display="INACTIVE"
+                state_color="$YELLOW"
+            fi
             
             printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-                "$idx" "${u_name:0:30}" "${u_email:0:35}" "$u_state" "${u_created:0:10}"
+                "$idx" "${u_name:0:30}" "${u_email:0:35}" "$state_display" "${u_created:0:10}"
         fi
     done < <(echo "$users_json" | jq -r '
-        (.data // [])[] | select(.["lifecycle-state"] != "DELETED") |
+        (.resources // [])[] |
         [
-            (.name // "N/A"),
-            (.email // "N/A"),
-            (.["lifecycle-state"] // "N/A"),
+            (.["user-name"] // "N/A"),
+            ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
+            (if .active then "true" else "false" end),
             (.id // "N/A"),
-            (.["time-created"] // "N/A")
+            ((.meta // {}).created // "N/A")
         ] | @tsv
     ' 2>/dev/null)
     
@@ -10252,16 +10323,17 @@ _identity_search_users() {
     read -r uchoice
     
     if [[ "$uchoice" =~ ^[0-9]+$ ]] && [[ -n "${_USR_SEARCH_IDS[$uchoice]:-}" ]]; then
-        _identity_user_detail "${_USR_SEARCH_IDS[$uchoice]}" "${_USR_SEARCH_NAMES[$uchoice]}" "$tenancy_id"
+        _identity_user_detail "${_USR_SEARCH_IDS[$uchoice]}" "${_USR_SEARCH_NAMES[$uchoice]}" "$domain_url" "$tenancy_id"
     fi
 }
 
 #--------------------------------------------------------------------------------
-# Search Groups by keyword
+# Search Groups by keyword (oci identity-domains group list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_groups() {
-    local tenancy_id="$1"
-    local domain_name="$2"
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
     
     echo ""
     echo -n -e "  ${WHITE}Enter keyword to search groups: ${NC}"
@@ -10274,7 +10346,7 @@ _identity_search_groups() {
     echo -e "${GRAY}Searching groups for '${search_kw}'...${NC}"
     
     local groups_json
-    groups_json=$(oci iam group list --compartment-id "$tenancy_id" --all --output json 2>/dev/null)
+    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     if [[ -z "$groups_json" ]]; then
         echo -e "${RED}Failed to fetch groups${NC}"
@@ -10292,11 +10364,12 @@ _identity_search_groups() {
     declare -A _GRP_SEARCH_NAMES
     
     printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
-        "#" "Group Name" "State" "Description"
+        "#" "Group Name" "Active" "Description"
     printf "${WHITE}%-3s  %-40s  %-10s  %s${NC}\n" \
         "---" "----------------------------------------" "----------" "---------------------------------------------"
     
-    while IFS=$'\t' read -r g_name g_state g_id g_desc; do
+    while IFS=$'\t' read -r g_name g_active g_id g_desc; do
+        [[ -z "$g_name" ]] && continue
         local search_lower="${search_kw,,}"
         local name_lower="${g_name,,}"
         local desc_lower="${g_desc,,}"
@@ -10306,17 +10379,21 @@ _identity_search_groups() {
             _GRP_SEARCH_IDS[$idx]="$g_id"
             _GRP_SEARCH_NAMES[$idx]="$g_name"
             
+            local state_display="Yes"
             local state_color="$GREEN"
-            [[ "$g_state" != "ACTIVE" ]] && state_color="$YELLOW"
+            if [[ "$g_active" != "true" ]]; then
+                state_display="No"
+                state_color="$YELLOW"
+            fi
             
             printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
-                "$idx" "${g_name:0:40}" "$g_state" "${g_desc:0:45}"
+                "$idx" "${g_name:0:40}" "$state_display" "${g_desc:0:45}"
         fi
     done < <(echo "$groups_json" | jq -r '
-        (.data // [])[] | select(.["lifecycle-state"] != "DELETED") |
+        (.resources // [])[] |
         [
-            (.name // "N/A"),
-            (.["lifecycle-state"] // "N/A"),
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
             (.id // "N/A"),
             (.description // "-")
         ] | @tsv
@@ -10331,13 +10408,14 @@ _identity_search_groups() {
     read -r gchoice
     
     if [[ "$gchoice" =~ ^[0-9]+$ ]] && [[ -n "${_GRP_SEARCH_IDS[$gchoice]:-}" ]]; then
-        _identity_group_detail "${_GRP_SEARCH_IDS[$gchoice]}" "${_GRP_SEARCH_NAMES[$gchoice]}" "$tenancy_id"
+        _identity_group_detail "${_GRP_SEARCH_IDS[$gchoice]}" "${_GRP_SEARCH_NAMES[$gchoice]}" "$domain_url" "$tenancy_id"
     fi
 }
 
 #--------------------------------------------------------------------------------
 # Search Policies for a User or Group (by name or OCID)
-# Searches: group <name>, dynamic-group <name>, any-user, any-group
+# Searches: group <n>, dynamic-group <n>, any-user, any-group
+# NOTE: This uses the policy cache - no identity-domains API calls needed
 #--------------------------------------------------------------------------------
 _identity_search_policies_for_principal() {
     local tenancy_id="$1"
@@ -10411,41 +10489,57 @@ for p in policies.get('data', []):
             matches.append((pname, stmt))
 
 if not matches:
-    print(f"  {YELLOW}No policy statements found matching '{search}'{NC}")
-    print(f"  {DIM}Tip: Try the exact group/user name as it appears in policies{NC}")
+    print(f"    {YELLOW}No policy statements matching '{search}'{NC}")
 else:
-    print(f"  Found {GREEN}{len(matches)}{NC} matching statement(s)")
+    print(f"    Found {GREEN}{len(matches)}{NC} matching statement(s)")
     print()
     
-    # Group by policy name
     by_policy = {}
     for pname, stmt in matches:
         by_policy.setdefault(pname, []).append(stmt)
     
     for pname, stmts in sorted(by_policy.items()):
-        print(f"  {GREEN}📜 {pname}{NC} {DIM}[{len(stmts)} match{'es' if len(stmts) > 1 else ''}]{NC}")
+        count_label = f"[{len(stmts)} statement{'s' if len(stmts) > 1 else ''}]"
+        print(f"    {GREEN}📜 {pname}{NC} {DIM}{count_label}{NC}")
         for stmt in stmts:
-            # Highlight the search term
-            highlighted = re.sub(
-                re.escape(search), 
-                f'{BG_YELLOW}\\g<0>{NC}', 
-                stmt, 
-                flags=re.IGNORECASE
-            )
-            # Color Allow/Deny
-            highlighted = re.sub(r'\b(Allow)\b', f'{GREEN}\\1{NC}', highlighted, flags=re.IGNORECASE)
-            highlighted = re.sub(r'\b(Deny)\b', f'{RED}\\1{NC}', highlighted, flags=re.IGNORECASE)
-            # Color verbs
-            for v in ['manage', 'use', 'read', 'inspect']:
-                highlighted = re.sub(rf'\b{v}\b', f'{YELLOW}{v}{NC}', highlighted, flags=re.IGNORECASE)
-            # dynamic-group in MAGENTA
-            highlighted = re.sub(r'\b(dynamic-group)\b', f'{MAGENTA}\\1{NC}', highlighted, flags=re.IGNORECASE)
-            highlighted = re.sub(r'(?<!dynamic-)(?<!any-)(\bgroup\b)', f'{MAGENTA}\\1{NC}', highlighted, flags=re.IGNORECASE)
-            # any-user / any-group in ORANGE
-            highlighted = re.sub(r'\bany-user\b', f'{ORANGE}any-user{NC}', highlighted, flags=re.IGNORECASE)
-            highlighted = re.sub(r'\bany-group\b', f'{ORANGE}any-group{NC}', highlighted, flags=re.IGNORECASE)
-            
-            print(f"    └─ {highlighted}")
+            # Token-based syntax highlighting
+            tokens = stmt.split()
+            result = []
+            i = 0
+            while i < len(tokens):
+                t = tokens[i]
+                tl = t.lower()
+                if tl == 'allow':
+                    result.append(f'{GREEN}{t}{NC}')
+                elif tl == 'deny':
+                    result.append(f'{RED}{t}{NC}')
+                elif tl in ('any-user', 'any-group'):
+                    result.append(f'{ORANGE}{t}{NC}')
+                elif tl == 'service' and i + 1 < len(tokens):
+                    result.append(f'{RED}{t}{NC}'); i += 1; result.append(f'{RED}{tokens[i]}{NC}')
+                elif tl == 'dynamic-group' and i + 1 < len(tokens):
+                    result.append(f'{MAGENTA}{t}{NC}'); i += 1; result.append(f'{MAGENTA}{tokens[i]}{NC}')
+                elif tl == 'group' and i + 1 < len(tokens):
+                    prev = tokens[i-1].lower() if i > 0 else ''
+                    if prev not in ('dynamic-group', 'any-group'):
+                        result.append(f'{MAGENTA}{t}{NC}'); i += 1; result.append(f'{MAGENTA}{tokens[i]}{NC}')
+                    else:
+                        result.append(t)
+                elif tl in ('manage', 'use', 'read', 'inspect'):
+                    result.append(f'{YELLOW}{t}{NC}')
+                    if i + 1 < len(tokens): i += 1; result.append(f'{CYAN}{tokens[i]}{NC}')
+                elif tl == 'where':
+                    result.append(f'{CYAN}{t}{NC}')
+                else:
+                    result.append(t)
+                i += 1
+            highlighted = ' '.join(result)
+            # Highlight search term
+            try:
+                highlighted = re.sub(re.escape(search), f'{BG_YELLOW}\\g<0>{NC}', highlighted, flags=re.IGNORECASE)
+            except re.error:
+                pass
+            print(f"      └─ {highlighted}")
         print()
 
 SEARCH_POL_EOF
@@ -10456,31 +10550,44 @@ SEARCH_POL_EOF
 }
 
 #--------------------------------------------------------------------------------
-# Create User
+# Create User (oci identity-domains user create)
 #--------------------------------------------------------------------------------
 _identity_create_user() {
-    local tenancy_id="$1"
-    local domain_name="$2"
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
     
     echo ""
-    echo -e "${BOLD}${WHITE}═══ Create User ═══${NC}"
+    echo -e "${BOLD}${WHITE}═══ Create User (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
     echo ""
     
-    echo -n -e "  ${WHITE}User name (login): ${NC}"
+    echo -n -e "  ${WHITE}Username (login): ${NC}"
     read -r new_user_name
     [[ -z "$new_user_name" ]] && return
     
-    echo -n -e "  ${WHITE}Description: ${NC}"
-    read -r new_user_desc
-    [[ -z "$new_user_desc" ]] && new_user_desc="Created by policy audit tool"
+    echo -n -e "  ${WHITE}First name (given name): ${NC}"
+    read -r new_first_name
+    [[ -z "$new_first_name" ]] && new_first_name="$new_user_name"
     
-    echo -n -e "  ${WHITE}Email (optional): ${NC}"
+    echo -n -e "  ${WHITE}Last name (family name): ${NC}"
+    read -r new_last_name
+    [[ -z "$new_last_name" ]] && new_last_name="User"
+    
+    echo -n -e "  ${WHITE}Email: ${NC}"
     read -r new_user_email
+    
+    echo -n -e "  ${WHITE}Description (optional): ${NC}"
+    read -r new_user_desc
     
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
-    local create_cmd="oci iam user create --compartment-id \"$tenancy_id\" --name \"$new_user_name\" --description \"$new_user_desc\""
-    [[ -n "$new_user_email" ]] && create_cmd+=" --email \"$new_user_email\""
+    
+    # Build the command display
+    local name_json="{\"givenName\":\"$new_first_name\",\"familyName\":\"$new_last_name\"}"
+    local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:User"]'
+    
+    local create_cmd="oci identity-domains user create --endpoint \"$domain_url\" --schemas '$schemas_json' --user-name \"$new_user_name\" --name '$name_json'"
+    [[ -n "$new_user_email" ]] && create_cmd+=" --emails '[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]'"
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
@@ -10493,27 +10600,34 @@ _identity_create_user() {
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
         local result
+        local email_arg=""
+        [[ -n "$new_user_email" ]] && email_arg="--emails [$(printf '{"value":"%s","primary":true,"type":"work"}' "$new_user_email")]"
+        
         if [[ -n "$new_user_email" ]]; then
-            result=$(oci iam user create \
-                --compartment-id "$tenancy_id" \
-                --name "$new_user_name" \
-                --description "$new_user_desc" \
-                --email "$new_user_email" \
+            result=$(oci identity-domains user create \
+                --endpoint "$domain_url" \
+                --schemas "$schemas_json" \
+                --user-name "$new_user_name" \
+                --name "$name_json" \
+                --emails "[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]" \
                 --output json 2>&1)
         else
-            result=$(oci iam user create \
-                --compartment-id "$tenancy_id" \
-                --name "$new_user_name" \
-                --description "$new_user_desc" \
+            result=$(oci identity-domains user create \
+                --endpoint "$domain_url" \
+                --schemas "$schemas_json" \
+                --user-name "$new_user_name" \
+                --name "$name_json" \
                 --output json 2>&1)
         fi
         
-        if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
-            local new_id
-            new_id=$(echo "$result" | jq -r '.data.id')
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            local new_ocid new_scim_id
+            new_ocid=$(echo "$result" | jq -r '.ocid // "N/A"')
+            new_scim_id=$(echo "$result" | jq -r '.id // "N/A"')
             echo -e "  ${GREEN}✓${NC} User created: ${WHITE}${new_user_name}${NC}"
-            echo -e "  ${GRAY}OCID: ${new_id}${NC}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created user $new_user_name ($new_id)" >> "$log_file"
+            echo -e "  ${GRAY}OCID: ${new_ocid}${NC}"
+            echo -e "  ${GRAY}SCIM ID: ${new_scim_id}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created user $new_user_name ($new_ocid)" >> "$log_file"
         else
             echo -e "  ${RED}✗ Failed to create user${NC}"
             echo "$result" | head -5
@@ -10529,10 +10643,11 @@ _identity_create_user() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Group
+# Create Group (oci identity-domains group create)
 #--------------------------------------------------------------------------------
 _identity_create_group() {
-    local tenancy_id="$1"
+    local domain_url="$1"
+    local tenancy_id="$2"
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Create Group ═══${NC}"
@@ -10542,13 +10657,13 @@ _identity_create_group() {
     read -r new_group_name
     [[ -z "$new_group_name" ]] && return
     
-    echo -n -e "  ${WHITE}Description: ${NC}"
+    echo -n -e "  ${WHITE}Description (optional): ${NC}"
     read -r new_group_desc
-    [[ -z "$new_group_desc" ]] && new_group_desc="Created by policy audit tool"
     
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
-    local create_cmd="oci iam group create --compartment-id \"$tenancy_id\" --name \"$new_group_name\" --description \"$new_group_desc\""
+    local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:Group"]'
+    local create_cmd="oci identity-domains group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_group_name\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
@@ -10561,18 +10676,20 @@ _identity_create_group() {
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
         local result
-        result=$(oci iam group create \
-            --compartment-id "$tenancy_id" \
-            --name "$new_group_name" \
-            --description "$new_group_desc" \
+        result=$(oci identity-domains group create \
+            --endpoint "$domain_url" \
+            --schemas "$schemas_json" \
+            --display-name "$new_group_name" \
             --output json 2>&1)
         
-        if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
-            local new_id
-            new_id=$(echo "$result" | jq -r '.data.id')
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            local new_ocid new_scim_id
+            new_ocid=$(echo "$result" | jq -r '.ocid // "N/A"')
+            new_scim_id=$(echo "$result" | jq -r '.id // "N/A"')
             echo -e "  ${GREEN}✓${NC} Group created: ${MAGENTA}${new_group_name}${NC}"
-            echo -e "  ${GRAY}OCID: ${new_id}${NC}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created group $new_group_name ($new_id)" >> "$log_file"
+            echo -e "  ${GRAY}OCID: ${new_ocid}${NC}"
+            echo -e "  ${GRAY}SCIM ID: ${new_scim_id}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created group $new_group_name ($new_ocid)" >> "$log_file"
         else
             echo -e "  ${RED}✗ Failed to create group${NC}"
             echo "$result" | head -5
@@ -10588,10 +10705,11 @@ _identity_create_group() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Dynamic Group
+# Create Dynamic Group (oci identity-domains dynamic-resource-group create)
 #--------------------------------------------------------------------------------
 _identity_create_dynamic_group() {
-    local tenancy_id="$1"
+    local domain_url="$1"
+    local tenancy_id="$2"
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Create Dynamic Group ═══${NC}"
@@ -10620,7 +10738,8 @@ _identity_create_dynamic_group() {
     
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
-    local create_cmd="oci iam dynamic-group create --compartment-id \"$tenancy_id\" --name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
+    local schemas_json='["urn:ietf:params:scim:schemas:oracle:idcs:DynamicResourceGroup"]'
+    local create_cmd="oci identity-domains dynamic-resource-group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
@@ -10633,19 +10752,22 @@ _identity_create_dynamic_group() {
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
         local result
-        result=$(oci iam dynamic-group create \
-            --compartment-id "$tenancy_id" \
-            --name "$new_dg_name" \
+        result=$(oci identity-domains dynamic-resource-group create \
+            --endpoint "$domain_url" \
+            --schemas "$schemas_json" \
+            --display-name "$new_dg_name" \
             --description "$new_dg_desc" \
             --matching-rule "$new_dg_rule" \
             --output json 2>&1)
         
-        if echo "$result" | jq -e '.data.id' > /dev/null 2>&1; then
-            local new_id
-            new_id=$(echo "$result" | jq -r '.data.id')
+        if echo "$result" | jq -e '.ocid // .id' > /dev/null 2>&1; then
+            local new_ocid new_scim_id
+            new_ocid=$(echo "$result" | jq -r '.ocid // "N/A"')
+            new_scim_id=$(echo "$result" | jq -r '.id // "N/A"')
             echo -e "  ${GREEN}✓${NC} Dynamic group created: ${MAGENTA}${new_dg_name}${NC}"
-            echo -e "  ${GRAY}OCID: ${new_id}${NC}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created dynamic-group $new_dg_name ($new_id)" >> "$log_file"
+            echo -e "  ${GRAY}OCID: ${new_ocid}${NC}"
+            echo -e "  ${GRAY}SCIM ID: ${new_scim_id}${NC}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Created dynamic-group $new_dg_name ($new_ocid)" >> "$log_file"
         else
             echo -e "  ${RED}✗ Failed to create dynamic group${NC}"
             echo "$result" | head -5
@@ -11262,6 +11384,783 @@ POL_LIST_EOF
 }
 
 #--------------------------------------------------------------------------------
+# Policy Validation Check - Verify policies for each --manage menu function
+# Checks a specified user, group, or dynamic-group against required policies
+# for every menu option. Reports found (✓) and missing (✗) policies.
+#--------------------------------------------------------------------------------
+_policy_validation_check() {
+    local tenancy_id="$1"
+    
+    # Ensure policy cache is loaded
+    if [[ ! -f "$POLICIES_ALL_CACHE" ]]; then
+        echo ""
+        echo -e "${GRAY}Policy cache not loaded. Fetching...${NC}"
+        _policy_fetch_all "$tenancy_id"
+        if [[ ! -f "$POLICIES_ALL_CACHE" ]]; then
+            echo -e "${RED}Failed to load policies${NC}"
+            echo -e "Press Enter to continue..."
+            read -r
+            return
+        fi
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${WHITE}                                               POLICY VALIDATION CHECK                                                                                ${NC}"
+    echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  This tool validates whether a ${WHITE}user${NC}, ${MAGENTA}group${NC}, or ${MAGENTA}dynamic-group${NC}"
+    echo -e "  has the required policies for each ${YELLOW}--manage${NC} menu function."
+    echo ""
+    echo -e "${BOLD}${BLUE}─── Select Principal Type ───${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1${NC})  ${WHITE}Group${NC}                 - Check policies for a group"
+    echo -e "  ${YELLOW}2${NC})  ${WHITE}Dynamic Group${NC}         - Check policies for a dynamic-group"
+    echo -e "  ${YELLOW}3${NC})  ${WHITE}User (by name)${NC}        - Check policies referencing a specific user"
+    echo -e "  ${YELLOW}4${NC})  ${WHITE}any-user${NC}              - Check what any authenticated user can do"
+    echo ""
+    echo -n -e "${BOLD}${CYAN}[Policy Check] Select type [1-4, back]: ${NC}"
+    read -r ptype_choice
+    
+    local principal_type=""
+    local principal_name=""
+    
+    case "$ptype_choice" in
+        ""|back|b|q) return ;;
+        1) principal_type="group" ;;
+        2) principal_type="dynamic-group" ;;
+        3) principal_type="user" ;;
+        4) 
+            principal_type="any-user"
+            principal_name="any-user"
+            ;;
+        *) echo -e "${RED}Invalid selection${NC}"; sleep 1; return ;;
+    esac
+    
+    # For group/dynamic-group/user, extract list from policies and let user select
+    if [[ "$principal_type" != "any-user" ]]; then
+        echo ""
+        echo -e "${GRAY}Extracting ${principal_type} names referenced in policies...${NC}"
+        
+        local principal_list
+        principal_list=$(python3 - "$POLICIES_ALL_CACHE" "$principal_type" << 'EXTRACT_PRINCIPALS_EOF'
+import json, sys, re
+
+with open(sys.argv[1]) as f:
+    policies = json.load(f)
+ptype = sys.argv[2]
+
+principals = set()
+for p in policies.get('data', []):
+    for stmt in p.get('statements', []):
+        s = stmt.lower()
+        if ptype == 'group':
+            for m in re.finditer(r'(?<!\w)(?<!dynamic-)group\s+([^\s,]+)', s):
+                name = m.group(1).strip("'\"")
+                if name not in ('id', 'in', 'to', 'where'):
+                    principals.add(name)
+        elif ptype == 'dynamic-group':
+            for m in re.finditer(r'dynamic-group\s+([^\s,]+)', s):
+                name = m.group(1).strip("'\"")
+                if name not in ('id', 'in', 'to', 'where'):
+                    principals.add(name)
+        elif ptype == 'user':
+            for m in re.finditer(r'(?<!\w)user\s+([^\s,]+)', s):
+                name = m.group(1).strip("'\"")
+                if name not in ('id', 'in', 'to', 'where', 'of'):
+                    principals.add(name)
+
+for name in sorted(principals):
+    print(name)
+EXTRACT_PRINCIPALS_EOF
+        )
+        
+        if [[ -z "$principal_list" ]]; then
+            echo -e "  ${YELLOW}No ${principal_type} names found in policies.${NC}"
+            echo ""
+            echo -n -e "  ${WHITE}Enter ${principal_type} name manually: ${NC}"
+            read -r principal_name
+            if [[ -z "$principal_name" ]]; then
+                return
+            fi
+        else
+            echo ""
+            echo -e "${BOLD}${WHITE}═══ ${principal_type^}s Referenced in Policies ═══${NC}"
+            echo ""
+            
+            local idx=0
+            declare -A _PRINC_MAP
+            _PRINC_MAP=()
+            while IFS= read -r pname; do
+                [[ -z "$pname" ]] && continue
+                ((idx++))
+                _PRINC_MAP[$idx]="$pname"
+                printf "  ${YELLOW}%3s${NC})  ${MAGENTA}%s${NC}\n" "$idx" "$pname"
+            done <<< "$principal_list"
+            
+            echo ""
+            echo -n -e "  ${WHITE}Select # or type name [1-${idx}, back]: ${NC}"
+            read -r princ_choice
+            
+            if [[ -z "$princ_choice" || "$princ_choice" == "back" || "$princ_choice" == "b" ]]; then
+                return
+            elif [[ "$princ_choice" =~ ^[0-9]+$ ]] && [[ -n "${_PRINC_MAP[$princ_choice]:-}" ]]; then
+                principal_name="${_PRINC_MAP[$princ_choice]}"
+            else
+                principal_name="$princ_choice"
+            fi
+        fi
+    fi
+    
+    echo ""
+    echo -e "${GRAY}Analyzing policies for ${principal_type} '${principal_name}'...${NC}"
+    echo ""
+    
+    # Run the full validation in Python
+    python3 - "$POLICIES_ALL_CACHE" "$principal_type" "$principal_name" << 'POLICY_CHECK_EOF'
+import json, sys, re
+
+pol_file = sys.argv[1]
+ptype = sys.argv[2]
+pname = sys.argv[3]
+
+# Colors
+GREEN = '\033[0;32m'
+RED = '\033[0;31m'
+YELLOW = '\033[1;33m'
+CYAN = '\033[0;36m'
+MAGENTA = '\033[0;35m'
+WHITE = '\033[1;37m'
+GRAY = '\033[0;90m'
+BOLD = '\033[1m'
+DIM = '\033[2m'
+NC = '\033[0m'
+BLUE = '\033[0;34m'
+ORANGE = '\033[38;5;208m'
+BG_GREEN = '\033[42;30m'
+BG_RED = '\033[41;37m'
+
+with open(pol_file) as f:
+    policies = json.load(f)
+
+# Verb hierarchy: manage > use > read > inspect
+VERB_RANK = {"inspect": 1, "read": 2, "use": 3, "manage": 4}
+
+def verb_satisfies(have_verb, need_verb):
+    return VERB_RANK.get(have_verb, 0) >= VERB_RANK.get(need_verb, 0)
+
+# Resource family expansion
+FAMILY_COVERS = {
+    "all-resources": ["*"],
+    "virtual-network-family": [
+        "subnets", "vnics", "vnic-attachments", "network-security-groups",
+        "security-lists", "route-tables", "internet-gateways", "nat-gateways",
+        "service-gateways", "local-peering-gateways", "drgs", "drg-attachments",
+        "drg-route-tables", "drg-route-distributions", "remote-peering-connections",
+        "dns", "dns-zones", "dns-records", "private-ips", "public-ips",
+        "network-load-balancers", "vcns",
+    ],
+    "instance-family": [
+        "instances", "instance-configurations", "instance-pools",
+        "compute-management-family", "instance-agent-command-family",
+        "compute-capacity-reports", "instance-images", "app-catalog-listing",
+        "vnics", "vnic-attachments", "volume-attachments",
+    ],
+    "compute-management-family": [
+        "instances", "instance-configurations", "instance-pools",
+        "instance-images", "app-catalog-listing",
+    ],
+    "cluster-family": [
+        "clusters", "cluster-node-pools", "cluster-workloads",
+        "cluster-pod-shapes", "cluster-addons",
+    ],
+    "object-family": [
+        "buckets", "objects", "objectstorage-namespaces",
+        "object-storage-private-endpoints",
+    ],
+    "file-family": [
+        "file-systems", "mount-targets", "export-sets", "snapshots",
+    ],
+    "volume-family": [
+        "volumes", "volume-attachments", "volume-backups",
+        "boot-volumes", "boot-volume-backups", "block-volumes",
+    ],
+    "resource-manager-family": [
+        "orm-stacks", "orm-jobs", "orm-work-requests",
+    ],
+    "tag-family": [
+        "tag-namespaces", "tag-definitions", "tags",
+    ],
+}
+
+def resource_matches(policy_resource, required_resource):
+    pr = policy_resource.lower().strip()
+    rr = required_resource.lower().strip()
+    if pr == rr:
+        return True
+    if pr == "all-resources":
+        return True
+    if pr in FAMILY_COVERS:
+        covers = FAMILY_COVERS[pr]
+        if "*" in covers:
+            return True
+        if rr in covers:
+            return True
+        for covered in covers:
+            if covered in FAMILY_COVERS:
+                sub = FAMILY_COVERS[covered]
+                if "*" in sub or rr in sub:
+                    return True
+    return False
+
+# Extract effective permissions for the principal
+def matches_principal(stmt):
+    s = stmt.lower()
+    pn = pname.lower()
+    if ptype == "any-user":
+        return "any-user" in s or "any-group" in s
+    elif ptype == "group":
+        if re.search(r'(?<!\w)(?<!dynamic-)group\s+' + re.escape(pn), s):
+            return True
+        if "any-group" in s:
+            return True
+        return False
+    elif ptype == "dynamic-group":
+        if re.search(r'dynamic-group\s+' + re.escape(pn), s):
+            return True
+        return False
+    elif ptype == "user":
+        if re.search(r'(?<!\w)user\s+' + re.escape(pn), s):
+            return True
+        if "any-user" in s:
+            return True
+        return False
+    return False
+
+effective_perms = []
+matched_statements = []
+
+for p in policies.get('data', []):
+    pname_pol = p.get('name', 'Unknown')
+    for stmt in p.get('statements', []):
+        if not matches_principal(stmt):
+            continue
+        matched_statements.append((pname_pol, stmt))
+        s = stmt.lower()
+        where_idx = s.find(' where ')
+        s_clean = s[:where_idx] if where_idx > -1 else s
+        m = re.search(r'\bto\s+(inspect|read|use|manage)\s+(\S+)', s_clean)
+        if m:
+            verb = m.group(1)
+            resource = m.group(2)
+            comp_scope = "tenancy"
+            cm = re.search(r'in\s+compartment\s+(\S+)', s_clean)
+            if cm:
+                comp_scope = "compartment:" + cm.group(1)
+            effective_perms.append((verb, resource, pname_pol, comp_scope))
+
+# Menu requirements
+MENU_REQS = {
+    "o": {
+        "label": "Environment Overview",
+        "section": "Overview",
+        "view": [
+            ("cluster-family", "inspect", "View OKE clusters"),
+            ("cluster-node-pools", "inspect", "View OKE cluster nodepools"),
+            ("compute-management-family", "inspect", "View instances and details"),
+            ("subnets", "inspect", "View subnets of VCN"),
+            ("vnics", "inspect", "View VNICs and NSG membership"),
+            ("virtual-network-family", "inspect", "View VCN and details"),
+            ("network-security-groups", "inspect", "View NSG configurations"),
+            ("dns", "inspect", "View DNS on VCN"),
+            ("object-storage-private-endpoints", "inspect", "View endpoint on subnets"),
+            ("compute-capacity-topology", "inspect", "View capacity topology"),
+            ("compute-hpc-islands", "inspect", "View HPC islands"),
+            ("compute-network-blocks", "inspect", "View network blocks"),
+            ("compute-bare-metal-hosts", "inspect", "View bare metal hosts"),
+            ("compute-gpu-memory-fabrics", "inspect", "View GPU memory fabrics"),
+            ("announcements", "inspect", "View announcements in tenancy"),
+        ],
+        "modify": [],
+    },
+    "1": {
+        "label": "OKE Cluster Environment",
+        "section": "Kubernetes",
+        "view": [
+            ("cluster-family", "inspect", "View OKE clusters"),
+            ("cluster-node-pools", "inspect", "View OKE cluster nodepools"),
+            ("compute-management-family", "inspect", "View instances and details"),
+            ("subnets", "inspect", "View subnets of VCN"),
+            ("vnics", "inspect", "View VNICs and NSG membership"),
+            ("virtual-network-family", "inspect", "View VCN and details"),
+            ("network-security-groups", "inspect", "View NSG configurations"),
+            ("dns", "inspect", "View DNS on VCN"),
+            ("object-storage-private-endpoints", "inspect", "View endpoint on subnets"),
+        ],
+        "modify": [
+            ("cluster-family", "manage", "Create/update/delete OKE clusters"),
+            ("cluster-node-pools", "manage", "Create/update/delete nodepools"),
+            ("compute-management-family", "use", "Launch instances via nodepool"),
+            ("virtual-network-family", "use", "Attach instances to subnets/NSGs"),
+        ],
+    },
+    "2": {
+        "label": "NVIDIA GPU Stack Health",
+        "section": "Kubernetes",
+        "view": [
+            ("cluster-family", "inspect", "View OKE clusters (kubectl context)"),
+        ],
+        "modify": [],
+        "note": "Primarily kubectl operations - requires kubeconfig access",
+    },
+    "3": {
+        "label": "Kubernetes Management",
+        "section": "Kubernetes",
+        "view": [
+            ("cluster-family", "inspect", "View OKE clusters (kubectl context)"),
+            ("compute-management-family", "inspect", "View instance details for node lookup"),
+        ],
+        "modify": [
+            ("cluster-node-pools", "use", "Manage node drain/cordon operations"),
+        ],
+        "note": "Primarily kubectl operations - requires kubeconfig access",
+    },
+    "4": {
+        "label": "Network Resources",
+        "section": "Networking",
+        "view": [
+            ("virtual-network-family", "inspect", "View VCN and details"),
+            ("subnets", "inspect", "View subnets"),
+            ("network-security-groups", "inspect", "View NSG configurations"),
+            ("vnics", "inspect", "View VNICs"),
+            ("dns", "inspect", "View DNS labels and zones"),
+            ("route-tables", "inspect", "View route tables"),
+            ("security-lists", "inspect", "View security lists"),
+        ],
+        "modify": [
+            ("network-security-groups", "manage", "Create/update/delete NSG rules"),
+            ("virtual-network-family", "manage", "Manage network resources"),
+        ],
+    },
+    "5": {
+        "label": "GPU Memory Fabrics & Clusters",
+        "section": "Compute & GPU",
+        "view": [
+            ("compute-management-family", "inspect", "View compute clusters"),
+            ("compute-capacity-topology", "inspect", "View capacity topology"),
+            ("compute-hpc-islands", "inspect", "View HPC islands"),
+            ("compute-network-blocks", "inspect", "View network blocks"),
+            ("compute-bare-metal-hosts", "inspect", "View bare metal hosts"),
+            ("compute-gpu-memory-fabrics", "inspect", "View GPU memory fabrics"),
+        ],
+        "modify": [
+            ("compute-management-family", "manage", "Create/delete compute clusters"),
+        ],
+    },
+    "6": {
+        "label": "Compute Instances",
+        "section": "Compute & GPU",
+        "view": [
+            ("compute-management-family", "inspect", "View instances and details"),
+            ("vnics", "inspect", "View VNICs and IP addresses"),
+            ("volume-family", "inspect", "View attached volumes"),
+            ("subnets", "inspect", "View subnet details"),
+            ("compute-capacity-topology", "inspect", "View capacity topology"),
+        ],
+        "modify": [
+            ("compute-management-family", "manage", "Reboot/stop/start/terminate instances"),
+            ("vnics", "use", "Attach/detach VNICs"),
+            ("volume-family", "manage", "Attach/detach volumes"),
+        ],
+    },
+    "7": {
+        "label": "Instance Configurations",
+        "section": "Compute & GPU",
+        "view": [
+            ("compute-management-family", "inspect", "View instance configurations"),
+            ("instance-configurations", "inspect", "View configuration details"),
+            ("instance-images", "inspect", "View images for configurations"),
+        ],
+        "modify": [
+            ("instance-configurations", "manage", "Create/delete instance configurations"),
+            ("compute-management-family", "manage", "Create configurations from instances"),
+            ("instance-images", "read", "Read images for configuration creation"),
+        ],
+    },
+    "8": {
+        "label": "Compute Clusters",
+        "section": "Compute & GPU",
+        "view": [
+            ("compute-management-family", "inspect", "View compute clusters"),
+            ("compute-capacity-topology", "inspect", "View capacity topology"),
+        ],
+        "modify": [
+            ("compute-management-family", "manage", "Create/delete compute clusters"),
+        ],
+    },
+    "9": {
+        "label": "GPU Instance Tagging",
+        "section": "Compute & GPU",
+        "view": [
+            ("tag-namespaces", "inspect", "View tag namespaces"),
+            ("compute-management-family", "inspect", "View instances for tagging"),
+        ],
+        "modify": [
+            ("tag-namespaces", "manage", "Create/retire tag namespaces"),
+            ("tag-definitions", "manage", "Create/manage tag definitions"),
+            ("compute-management-family", "use", "Apply tags to instances"),
+        ],
+    },
+    "10": {
+        "label": "Capacity Topology",
+        "section": "Compute & GPU",
+        "view": [
+            ("compute-capacity-topology", "inspect", "View capacity topology"),
+            ("compute-bare-metal-hosts", "inspect", "View bare metal host details"),
+            ("compute-hpc-islands", "inspect", "View HPC island details"),
+            ("compute-network-blocks", "inspect", "View network block details"),
+            ("compute-gpu-memory-fabrics", "inspect", "View GPU memory fabrics"),
+        ],
+        "modify": [],
+    },
+    "11": {
+        "label": "Custom Images",
+        "section": "Compute & GPU",
+        "view": [
+            ("instance-images", "inspect", "View custom images"),
+            ("compute-management-family", "inspect", "View instances for image creation"),
+        ],
+        "modify": [
+            ("instance-images", "manage", "Create/import/export/delete images"),
+            ("compute-management-family", "use", "Create image from instance"),
+            ("object-family", "use", "Import/export images via Object Storage"),
+        ],
+    },
+    "12": {
+        "label": "File Storage (FSS)",
+        "section": "Storage",
+        "view": [
+            ("file-family", "inspect", "View file systems and mount targets"),
+            ("virtual-network-family", "inspect", "View subnets for mount targets"),
+        ],
+        "modify": [
+            ("file-family", "manage", "Create/delete file systems, mount targets, exports"),
+            ("virtual-network-family", "use", "Attach mount targets to subnets"),
+        ],
+    },
+    "13": {
+        "label": "Lustre File Systems",
+        "section": "Storage",
+        "view": [
+            ("lustre-file-systems", "inspect", "View Lustre file systems"),
+            ("virtual-network-family", "inspect", "View subnets for Lustre"),
+        ],
+        "modify": [
+            ("lustre-file-systems", "manage", "Create/delete Lustre file systems"),
+            ("virtual-network-family", "use", "Attach Lustre to subnets"),
+            ("object-family", "use", "Link Object Storage to Lustre"),
+        ],
+    },
+    "14": {
+        "label": "Object Storage",
+        "section": "Storage",
+        "view": [
+            ("object-family", "inspect", "View buckets and private endpoints"),
+            ("buckets", "inspect", "View bucket details"),
+            ("object-storage-private-endpoints", "inspect", "View private endpoints"),
+        ],
+        "modify": [
+            ("object-family", "manage", "Create/delete buckets and endpoints"),
+            ("virtual-network-family", "use", "Create private endpoints on subnets"),
+        ],
+    },
+    "15": {
+        "label": "Compartments",
+        "section": "Identity",
+        "view": [
+            ("compartments", "inspect", "View compartments"),
+        ],
+        "modify": [
+            ("compartments", "manage", "Create/delete sub-compartments"),
+        ],
+    },
+    "16": {
+        "label": "Identity Domains",
+        "section": "Identity",
+        "view": [
+            ("domains", "inspect", "View identity domains"),
+            ("identity-domains", "inspect", "View domain users/groups/providers"),
+        ],
+        "modify": [
+            ("identity-domains", "manage", "Create users/groups in domain"),
+        ],
+    },
+    "17": {
+        "label": "Policies",
+        "section": "Identity",
+        "view": [
+            ("policies", "inspect", "View policies"),
+            ("compartments", "inspect", "View compartments for policy listing"),
+        ],
+        "modify": [
+            ("policies", "manage", "Create/update/delete policies"),
+        ],
+    },
+    "18": {
+        "label": "Resource Manager Stacks",
+        "section": "Infrastructure",
+        "view": [
+            ("orm-stacks", "inspect", "View stacks, jobs, and outputs"),
+            ("resource-manager-family", "inspect", "View Resource Manager resources"),
+        ],
+        "modify": [
+            ("orm-stacks", "manage", "Create/update/delete stacks and jobs"),
+        ],
+    },
+    "19": {
+        "label": "Work Requests",
+        "section": "Infrastructure",
+        "view": [
+            ("work-requests", "inspect", "View work requests and logs"),
+            ("compute-management-family", "inspect", "View compute work requests"),
+        ],
+        "modify": [],
+    },
+    "20": {
+        "label": "Maintenance",
+        "section": "Infrastructure",
+        "view": [
+            ("compute-management-family", "inspect", "View instances and maintenance events"),
+            ("compute-capacity-topology", "inspect", "View capacity topology state"),
+            ("announcements", "inspect", "View maintenance announcements"),
+        ],
+        "modify": [
+            ("compute-management-family", "manage", "Reschedule maintenance events"),
+        ],
+    },
+    "21": {
+        "label": "Announcements",
+        "section": "Infrastructure",
+        "view": [
+            ("announcements", "inspect", "View announcements"),
+        ],
+        "modify": [],
+    },
+}
+
+def check_permission(required_resource, required_verb):
+    best_verb = None
+    best_policy = None
+    for verb, resource, pol_name, scope in effective_perms:
+        if resource_matches(resource, required_resource):
+            if verb_satisfies(verb, required_verb):
+                if best_verb is None or VERB_RANK.get(verb, 0) > VERB_RANK.get(best_verb, 0):
+                    best_verb = verb
+                    best_policy = pol_name
+    if best_verb:
+        return (True, best_verb, best_policy)
+    return (False, None, None)
+
+# Display results
+ptype_display = ptype.replace("-", " ").title()
+print(f"{BOLD}{WHITE}══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════{NC}")
+print(f"{BOLD}{WHITE}  Policy Validation: {MAGENTA}{ptype_display} '{pname}'{NC}")
+print(f"{BOLD}{WHITE}══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════{NC}")
+print()
+
+print(f"  {CYAN}Matched policy statements:{NC} {WHITE}{len(matched_statements)}{NC}")
+if effective_perms:
+    unique_perms = set()
+    for v, r, pn, sc in effective_perms:
+        unique_perms.add(f"{v} {r}")
+    print(f"  {CYAN}Effective permissions:{NC}     {WHITE}{len(unique_perms)}{NC} unique resource grants")
+else:
+    print(f"  {YELLOW}⚠  No policy statements found for this principal{NC}")
+print()
+
+total_view_ok = 0
+total_view_miss = 0
+total_modify_ok = 0
+total_modify_miss = 0
+
+current_section = None
+menu_order = ["o", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21"]
+
+for menu_key in menu_order:
+    req = MENU_REQS.get(menu_key, {})
+    label = req.get("label", "Unknown")
+    section = req.get("section", "Other")
+    view_reqs = req.get("view", [])
+    modify_reqs = req.get("modify", [])
+    note = req.get("note", "")
+    
+    if section != current_section:
+        current_section = section
+        print(f"{BOLD}{BLUE}─── {section} ───{NC}")
+        print()
+    
+    all_view_ok = True
+    all_modify_ok = True
+    view_results = []
+    modify_results = []
+    
+    for resource, verb, desc in view_reqs:
+        ok, found_verb, found_pol = check_permission(resource, verb)
+        view_results.append((ok, resource, verb, desc, found_verb, found_pol))
+        if ok:
+            total_view_ok += 1
+        else:
+            all_view_ok = False
+            total_view_miss += 1
+    
+    for resource, verb, desc in modify_reqs:
+        ok, found_verb, found_pol = check_permission(resource, verb)
+        modify_results.append((ok, resource, verb, desc, found_verb, found_pol))
+        if ok:
+            total_modify_ok += 1
+        else:
+            all_modify_ok = False
+            total_modify_miss += 1
+    
+    view_status = f"{GREEN}✓ VIEW OK{NC}" if all_view_ok and view_results else f"{RED}✗ VIEW MISSING{NC}" if not all_view_ok else f"{GRAY}N/A{NC}"
+    modify_status = f"{GREEN}✓ MODIFY OK{NC}" if all_modify_ok and modify_results else f"{RED}✗ MODIFY MISSING{NC}" if not all_modify_ok else f"{GRAY}read-only{NC}"
+    
+    if all_view_ok and (all_modify_ok or not modify_results):
+        overall = f"{BG_GREEN} PASS {NC}"
+    elif all_view_ok and not all_modify_ok:
+        overall = f"{YELLOW} PARTIAL {NC}"
+    else:
+        overall = f"{BG_RED} FAIL {NC}"
+    
+    print(f"  {overall} {YELLOW}{menu_key:>2}){NC} {WHITE}{label}{NC}  [ {view_status} | {modify_status} ]")
+    
+    if note:
+        print(f"       {DIM}{note}{NC}")
+    
+    for ok, resource, verb, desc, found_verb, found_pol in view_results:
+        if ok:
+            print(f"       {GREEN}✓{NC} {GRAY}view:{NC}   {DIM}inspect/read/use/manage{NC} {CYAN}{resource}{NC}  {GRAY}─ {desc}  (have: {GREEN}{found_verb}{NC} via {DIM}{found_pol}{NC}){GRAY}{NC}")
+        else:
+            print(f"       {RED}✗{NC} {WHITE}view:{NC}   {YELLOW}inspect, read, use{NC} or {YELLOW}manage {CYAN}{resource}{NC}  {GRAY}─ {desc}{NC}")
+    
+    for ok, resource, verb, desc, found_verb, found_pol in modify_results:
+        if ok:
+            print(f"       {GREEN}✓{NC} {GRAY}modify:{NC} {DIM}{verb}{NC} {CYAN}{resource}{NC}  {GRAY}─ {desc}  (have: {GREEN}{found_verb}{NC} via {DIM}{found_pol}{NC}){GRAY}{NC}")
+        else:
+            print(f"       {RED}✗{NC} {WHITE}modify:{NC} {YELLOW}{verb} {CYAN}{resource}{NC}  {GRAY}─ {desc}{NC}")
+    
+    print()
+
+# Summary
+print(f"{BOLD}{WHITE}══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════{NC}")
+print(f"{BOLD}{WHITE}  Summary for {MAGENTA}{ptype_display} '{pname}'{NC}")
+print(f"{BOLD}{WHITE}══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════{NC}")
+print()
+
+total_view = total_view_ok + total_view_miss
+total_modify = total_modify_ok + total_modify_miss
+
+view_pct = (total_view_ok * 100 // total_view) if total_view > 0 else 0
+modify_pct = (total_modify_ok * 100 // total_modify) if total_modify > 0 else 0
+
+view_bar_len = 40
+view_filled = (total_view_ok * view_bar_len // total_view) if total_view > 0 else 0
+view_bar = f"{GREEN}{'█' * view_filled}{NC}{GRAY}{'░' * (view_bar_len - view_filled)}{NC}"
+print(f"  {CYAN}View permissions:{NC}   [{view_bar}] {WHITE}{total_view_ok}/{total_view}{NC} ({view_pct}%)")
+
+modify_bar_len = 40
+modify_filled = (total_modify_ok * modify_bar_len // total_modify) if total_modify > 0 else 0
+modify_bar = f"{GREEN}{'█' * modify_filled}{NC}{GRAY}{'░' * (modify_bar_len - modify_filled)}{NC}"
+print(f"  {CYAN}Modify permissions:{NC} [{modify_bar}] {WHITE}{total_modify_ok}/{total_modify}{NC} ({modify_pct}%)")
+
+print()
+
+if total_view_miss > 0 or total_modify_miss > 0:
+    print(f"  {YELLOW}Missing policies can be resolved by:{NC}")
+    print(f"    {WHITE}•{NC} {DIM}Broadest:{NC} {GREEN}Allow{NC} {MAGENTA}{ptype} {pname}{NC} to {YELLOW}manage {CYAN}all-resources{NC} in tenancy")
+    
+    missing_view_res = set()
+    missing_modify_res = set()
+    for menu_key in menu_order:
+        req = MENU_REQS.get(menu_key, {})
+        for resource, verb, desc in req.get("view", []):
+            ok, _, _ = check_permission(resource, verb)
+            if not ok:
+                missing_view_res.add(resource)
+        for resource, verb, desc in req.get("modify", []):
+            ok, _, _ = check_permission(resource, verb)
+            if not ok:
+                missing_modify_res.add(resource)
+    
+    if missing_view_res:
+        view_families = set()
+        for r in missing_view_res:
+            found_fam = False
+            for fam, children in FAMILY_COVERS.items():
+                if fam == "all-resources":
+                    continue
+                if r in children:
+                    view_families.add(fam)
+                    found_fam = True
+                    break
+            if not found_fam:
+                view_families.add(r)
+        for vf in sorted(view_families):
+            print(f"    {WHITE}•{NC} {DIM}View:{NC}   {GREEN}Allow{NC} {MAGENTA}{ptype} {pname}{NC} to {YELLOW}inspect {CYAN}{vf}{NC} in compartment <name>")
+    
+    if missing_modify_res:
+        for mr in sorted(missing_modify_res):
+            print(f"    {WHITE}•{NC} {DIM}Modify:{NC} {GREEN}Allow{NC} {MAGENTA}{ptype} {pname}{NC} to {YELLOW}manage {CYAN}{mr}{NC} in compartment <name>")
+    
+    print()
+
+if matched_statements:
+    print(f"  {BOLD}{WHITE}Matched Policy Statements ({len(matched_statements)}):{NC}")
+    by_policy = {}
+    for pol_name, stmt in matched_statements:
+        by_policy.setdefault(pol_name, []).append(stmt)
+    for pol_name, stmts in sorted(by_policy.items()):
+        print(f"    {GREEN}📜 {pol_name}{NC} {DIM}[{len(stmts)} statement{'s' if len(stmts) > 1 else ''}]{NC}")
+        for stmt in stmts[:5]:
+            tokens = stmt.split()
+            result = []
+            i = 0
+            while i < len(tokens):
+                t = tokens[i]
+                tl = t.lower()
+                if tl == 'allow':
+                    result.append(f'{GREEN}{t}{NC}')
+                elif tl == 'deny':
+                    result.append(f'{RED}{t}{NC}')
+                elif tl in ('any-user', 'any-group'):
+                    result.append(f'{ORANGE}{t}{NC}')
+                elif tl in ('manage', 'use', 'read', 'inspect'):
+                    result.append(f'{YELLOW}{t}{NC}')
+                    if i + 1 < len(tokens): i += 1; result.append(f'{CYAN}{tokens[i]}{NC}')
+                elif tl == 'dynamic-group' and i + 1 < len(tokens):
+                    result.append(f'{MAGENTA}{t}{NC}'); i += 1; result.append(f'{MAGENTA}{tokens[i]}{NC}')
+                elif tl == 'group' and i + 1 < len(tokens):
+                    prev = tokens[i-1].lower() if i > 0 else ''
+                    if prev not in ('dynamic-group', 'any-group'):
+                        result.append(f'{MAGENTA}{t}{NC}'); i += 1; result.append(f'{MAGENTA}{tokens[i]}{NC}')
+                    else:
+                        result.append(t)
+                else:
+                    result.append(t)
+                i += 1
+            print(f"      └─ {' '.join(result)}")
+        if len(stmts) > 5:
+            print(f"      {DIM}... and {len(stmts) - 5} more{NC}")
+    print()
+
+POLICY_CHECK_EOF
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
 # Main Policy Management Menu
 #--------------------------------------------------------------------------------
 manage_policies() {
@@ -11323,9 +12222,12 @@ manage_policies() {
         echo -e "  ${YELLOW}5${NC})  ${WHITE}Filter by Policy Name${NC}         - Match by policy name"
         echo -e "  ${YELLOW}6${NC})  ${WHITE}Export JSON${NC}                   - Export all policies to JSON file"
         echo ""
+        echo -e "${BOLD}${BLUE}─── Validation ───${NC}"
+        echo -e "  ${YELLOW}7${NC})  ${WHITE}Policy Validation Check${NC}       - Verify policies for each --manage menu function"
+        echo ""
         echo -e "  ${CYAN}r${NC})  ${WHITE}Refresh Cache${NC}                - Force re-fetch from OCI API"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Policies] Enter selection [1-6, ${MAGENTA}r${CYAN}/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Policies] Enter selection [1-7, ${MAGENTA}r${CYAN}/back]: ${NC}"
         read -r pol_choice
         
         case "$pol_choice" in
@@ -11511,6 +12413,9 @@ manage_policies() {
                 echo ""
                 echo -e "Press Enter to continue..."
                 read -r
+                ;;
+            7)
+                _policy_validation_check "$tenancy_id"
                 ;;
             r|R|refresh)
                 echo ""
