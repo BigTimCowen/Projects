@@ -112,6 +112,11 @@ NSG_WARNED_CHECKS=0
 NSG_MISSING_RULES=()                     # Accumulate missing rules for --nsg-fix
 declare -A NSG_RULES_CACHE               # Cache fetched rules per NSG
 
+# Cluster CNI / Pod networking globals (populated during discovery)
+CLUSTER_CNI_TYPE=""                       # OCI_VCN_IP_NATIVE or FLANNEL_OVERLAY
+CLUSTER_POD_NSG_IDS=()                   # Pod NSGs from node pool (native CNI)
+CLUSTER_POD_SUBNET_IDS=()                # Pod subnets from node pool (native CNI)
+
 # Instance Metadata Service (IMDS) base URL
 readonly IMDS_BASE="http://169.254.169.254/opc/v2"
 
@@ -655,14 +660,56 @@ check_prerequisites() {
 select_compartment() {
     print_section "Step 1: Select Compartment"
     
-    print_info "Fetching compartments..."
-    
     # TENANCY_ID should be set from IMDS or variables.sh by now
     if [[ -z "${TENANCY_ID:-}" ]]; then
         print_error "TENANCY_ID not set"
         print_info "Either run from an OCI instance or set TENANCY_ID in variables.sh"
         exit 1
     fi
+    
+    #--- Try to default to current compartment (from IMDS or variables.sh) ---
+    local default_cid="${DEFAULT_COMPARTMENT_ID:-}"
+    local default_cname=""
+    
+    if [[ -n "$default_cid" ]]; then
+        # Resolve compartment name
+        if [[ "$default_cid" == "$TENANCY_ID" ]]; then
+            default_cname=$(oci iam tenancy get --tenancy-id "$TENANCY_ID" \
+                --query 'data.name' --raw-output 2>/dev/null || echo "Root")
+            default_cname="${default_cname} (root)"
+        else
+            default_cname=$(oci iam compartment get --compartment-id "$default_cid" \
+                --query 'data.name' --raw-output 2>/dev/null || echo "")
+        fi
+        
+        if [[ -n "$default_cname" ]]; then
+            echo -e "  Current compartment: ${CYAN}${BOLD}${default_cname}${NC}"
+            echo -e "  OCID: ${default_cid}"
+            echo ""
+            
+            if [[ "$USE_DEFAULTS" == "true" ]]; then
+                echo -e "  ${GREEN}[AUTO]${NC} Using current compartment"
+                SELECTED_COMPARTMENT_ID="$default_cid"
+                SELECTED_COMPARTMENT_NAME="$default_cname"
+                print_success "Selected: $SELECTED_COMPARTMENT_NAME"
+                return 0
+            fi
+            
+            read -rp "  Use this compartment? [Y/n]: " use_default </dev/tty
+            if [[ "${use_default,,}" != "n" ]]; then
+                SELECTED_COMPARTMENT_ID="$default_cid"
+                SELECTED_COMPARTMENT_NAME="$default_cname"
+                print_success "Selected: $SELECTED_COMPARTMENT_NAME"
+                return 0
+            fi
+            
+            echo ""
+            print_info "Loading compartment list..."
+        fi
+    fi
+    
+    #--- Full compartment list (shown when user wants a different compartment) ---
+    print_info "Fetching compartments..."
     
     local raw_output
     local compartments
@@ -706,7 +753,6 @@ select_compartment() {
     
     # Find default index - prefer IMDS compartment, then DEFAULT_COMPARTMENT_ID
     local default_idx=""
-    local default_cid="${DEFAULT_COMPARTMENT_ID:-}"
     
     if [[ -n "$default_cid" ]]; then
         default_idx=$(echo "$compartments" | jq --arg cid "$default_cid" \
@@ -2073,15 +2119,17 @@ use_existing_config_flow() {
     
     # Display numbered list
     echo ""
-    printf "  ${BOLD}%-4s %-55s %-15s${NC}\n" "#" "Name" "Created"
-    printf "  %-4s %-55s %-15s\n" "----" "-------------------------------------------------------" "---------------"
+    printf "  ${BOLD}%-4s %-50s %-22s${NC}\n" "#" "Name" "Created"
+    printf "  %-4s %-50s %-22s\n" "----" "--------------------------------------------------" "----------------------"
     
     local i=1
     while IFS= read -r config; do
-        local name created
+        local name created created_fmt
         name=$(echo "$config" | jq -r '.name')
-        created=$(echo "$config" | jq -r '.created' | cut -dT -f1)
-        printf "  %-4s %-55s %-15s\n" "$i)" "${name:0:55}" "$created"
+        created=$(echo "$config" | jq -r '.created')
+        # Format: 2025-12-20T14:37:51Z → 2025-12-20 14:37 UTC
+        created_fmt=$(echo "$created" | sed 's/T/ /; s/:[0-9][0-9]\.[0-9]*Z/ UTC/; s/:[0-9][0-9]Z/ UTC/')
+        printf "  %-4s %-50s %-22s\n" "$i)" "${name:0:50}" "$created_fmt"
         ((i++))
     done < <(echo "$list_json" | jq -c '.[]')
     
@@ -2219,6 +2267,19 @@ use_existing_config_flow() {
         SELECTED_OCPUS="$config_ocpus"
         SELECTED_MEMORY_GB="$config_memory"
     fi
+
+    # Populate NSG IDs from config for pre-flight validation
+    SELECTED_NSG_IDS=()
+    if [[ -n "$config_nsg_json" && "$config_nsg_json" != "[]" && "$config_nsg_json" != "N/A" ]]; then
+        while IFS= read -r nsg_id; do
+            [[ -n "$nsg_id" ]] && SELECTED_NSG_IDS+=("$nsg_id")
+        done < <(echo "$config_nsg_json" | jq -r '.[]' 2>/dev/null)
+    fi
+
+    # Populate subnet ID from config for pre-flight validation
+    if [[ "$config_subnet_id" != "N/A" && "$config_subnet_id" != "null" && -n "$config_subnet_id" ]]; then
+        SELECTED_SUBNET_ID="$config_subnet_id"
+    fi
     
     #---------------------------------------------------------------------------
     # Resolve names from OCIDs for display
@@ -2297,6 +2358,24 @@ use_existing_config_flow() {
         if [[ -s "$decoded_ci_file" ]]; then
             ci_lines=$(wc -l < "$decoded_ci_file")
             cloud_init_display="${ci_lines} lines configured ✓"
+
+            #--- Extract API server from cloud-init early (for summary box + preflight) ---
+            if [[ -z "${SELECTED_API_SERVER_IP:-}" ]]; then
+                local ci_api_ip=""
+
+                # Method 1: /etc/oke/oke-apiserver write_files content
+                ci_api_ip=$(awk '/path:.*oke-apiserver/{getline; if ($1 == "content:") print $2}' "$decoded_ci_file" 2>/dev/null)
+
+                # Method 2: --apiserver-host flag in runcmd
+                if [[ -z "$ci_api_ip" ]]; then
+                    ci_api_ip=$(grep -oP '(?<=--apiserver-host\s)[^\s"]+' "$decoded_ci_file" 2>/dev/null | head -1)
+                fi
+
+                if [[ -n "$ci_api_ip" && "$ci_api_ip" != "__"* && "$ci_api_ip" != "<"* ]]; then
+                    SELECTED_API_SERVER_IP="$ci_api_ip"
+                    SELECTED_API_SERVER_PORT="${SELECTED_API_SERVER_PORT:-6443}"
+                fi
+            fi
         else
             rm -f "$decoded_ci_file"
             decoded_ci_file=""
@@ -2322,6 +2401,9 @@ use_existing_config_flow() {
     printf "${BOLD}║${NC}  %-20s │ %-53s${BOLD}║${NC}\n" "NSG(s)" "${config_nsg_names:0:53}"
     printf "${BOLD}║${NC}  %-20s │ %-53s${BOLD}║${NC}\n" "SSH Key" "$ssh_display"
     printf "${BOLD}║${NC}  %-20s │ %-53s${BOLD}║${NC}\n" "Cloud-Init" "$cloud_init_display"
+    if [[ -n "${SELECTED_API_SERVER_IP:-}" ]]; then
+        printf "${BOLD}║${NC}  %-20s │ %-53s${BOLD}║${NC}\n" "API Server" "${SELECTED_API_SERVER_IP}:${SELECTED_API_SERVER_PORT:-6443}"
+    fi
     echo -e "${BOLD}╠$(printf '═%.0s' $(seq 1 $box_width))╣${NC}"
     printf "${BOLD}║${NC}  %-20s │ %-53s${BOLD}║${NC}\n" "Display Name" "$config_display_name"
     echo -e "${BOLD}╚$(printf '═%.0s' $(seq 1 $box_width))╝${NC}"
@@ -2368,30 +2450,45 @@ use_existing_config_flow() {
     #---------------------------------------------------------------------------
     echo ""
     echo -e "${BOLD}Instance Display Name:${NC}"
-    echo -e "  Current name in config: ${CYAN}${config_display_name}${NC}"
-    read -rp "  Enter new name or press Enter to keep: " name_override </dev/tty
-    
+
+    # Generate a sensible default when config has no name
+    local default_instance_name=""
+    local prefix="${INSTANCE_NAME_PREFIX:-oke-worker}"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+
+    if [[ "$config_display_name" == "N/A" || "$config_display_name" == "null" || -z "$config_display_name" ]]; then
+        # Build default: prefix-clusterShortName-timestamp or prefix-timestamp
+        if [[ -n "${CLUSTER_NAME:-}" ]]; then
+            # Use last segment of cluster name for brevity (e.g. "oke-gpu-quickstart-npejxs" → "npejxs")
+            local cluster_suffix
+            cluster_suffix=$(echo "$CLUSTER_NAME" | rev | cut -d'-' -f1 | rev)
+            default_instance_name="${prefix}-${cluster_suffix}-${ts}"
+        else
+            default_instance_name="${prefix}-${ts}"
+        fi
+        echo -e "  Current name in config: ${YELLOW}N/A (not set)${NC}"
+        echo -e "  Generated default:      ${CYAN}${default_instance_name}${NC}"
+        read -rp "  Enter name or press Enter for default: " name_override </dev/tty
+    else
+        default_instance_name="$config_display_name"
+        echo -e "  Current name in config: ${CYAN}${config_display_name}${NC}"
+        read -rp "  Enter new name or press Enter to keep: " name_override </dev/tty
+    fi
+
     if [[ -n "$name_override" ]]; then
         INSTANCE_NAME_OVERRIDE="$name_override"
         SELECTED_INSTANCE_NAME="$name_override"
-        print_info "Display name will be updated to: $name_override (after launch)"
+        print_info "Display name will be set to: $name_override (after launch)"
         log_message "INFO" "Display name override: $name_override"
     else
-        SELECTED_INSTANCE_NAME="$config_display_name"
-        print_info "Keeping display name: $config_display_name"
-    fi
-    
-    #---------------------------------------------------------------------------
-    # Confirmation
-    #---------------------------------------------------------------------------
-    echo ""
-    if [[ "$AUTO_APPROVE" == "true" ]]; then
-        echo -e "${GREEN}[AUTO-APPROVE]${NC} Proceeding with launch..."
-    else
-        read -rp "Proceed with launch? [Y/n]: " confirm </dev/tty
-        if [[ "${confirm,,}" == "n" ]]; then
-            print_info "Deployment cancelled"
-            exit 0
+        INSTANCE_NAME_OVERRIDE="$default_instance_name"
+        SELECTED_INSTANCE_NAME="$default_instance_name"
+        if [[ "$config_display_name" == "N/A" || "$config_display_name" == "null" || -z "$config_display_name" ]]; then
+            print_info "Display name will be set to: $default_instance_name (after launch)"
+            log_message "INFO" "Display name from generated default: $default_instance_name"
+        else
+            print_info "Keeping display name: $default_instance_name"
         fi
     fi
     
@@ -3062,82 +3159,246 @@ get_instance_details() {
 check_console_history() {
     print_section "Console History"
     
+    if [[ -z "${CREATED_INSTANCE_ID:-}" ]]; then
+        print_warn "No instance ID — skipping console history"
+        return 0
+    fi
+
     echo ""
-    read -rp "Would you like to check the console history? [y/N]: " check_console
+    read -rp "Would you like to check the console history? [y/N]: " check_console </dev/tty
     
     if [[ "${check_console,,}" != "y" ]]; then
         print_info "Skipping console history check"
         return 0
     fi
     
-    print_info "Waiting ${CONSOLE_HISTORY_WAIT_SECONDS:-120}s for console output to be available..."
-    print_info "(Press Ctrl+C to skip waiting)"
-    
-    local wait_time="${CONSOLE_HISTORY_WAIT_SECONDS:-120}"
-    local elapsed=0
-    
-    while [[ $elapsed -lt $wait_time ]]; do
-        printf "\r${BLUE}[%d/%ds]${NC} Waiting for console history..." "$elapsed" "$wait_time"
-        sleep 10
-        elapsed=$((elapsed + 10))
-        
-        # Check if console history is available
-        local history_raw
-        history_raw=$(oci compute console-history list \
-            --compartment-id "$SELECTED_COMPARTMENT_ID" \
-            --instance-id "$CREATED_INSTANCE_ID" \
-            --lifecycle-state SUCCEEDED 2>&1) || true
-        
-        if echo "$history_raw" | jq -e '.data[0].id' &>/dev/null; then
-            local history_id
-            history_id=$(echo "$history_raw" | jq -r '.data[0].id')
-            if [[ -n "$history_id" && "$history_id" != "null" ]]; then
-                break
-            fi
-        fi
-    done
-    echo ""
-    
-    # Capture console history
-    print_info "Capturing console history..."
-    
+    local max_wait="${CONSOLE_HISTORY_WAIT_SECONDS:-180}"
+    local poll_interval=10
+    local history_id=""
+    local history_state=""
+
+    #---------------------------------------------------------------------------
+    # Step 1: Capture a fresh console history snapshot
+    #---------------------------------------------------------------------------
+    print_info "Requesting console history capture..."
+
+    local capture_cmd="oci compute console-history capture \\
+    --instance-id \"$CREATED_INSTANCE_ID\""
+    log_command "Capture console history" "$capture_cmd"
+
     local capture_raw
     capture_raw=$(oci compute console-history capture \
         --instance-id "$CREATED_INSTANCE_ID" 2>&1) || true
-    
-    if ! echo "$capture_raw" | jq -e '.data.id' &>/dev/null; then
-        print_warn "Could not capture console history"
-        return 0
+    log_command_result "$?" "$capture_raw"
+
+    if echo "$capture_raw" | jq -e '.data.id' &>/dev/null; then
+        history_id=$(echo "$capture_raw" | jq -r '.data.id')
+        history_state=$(echo "$capture_raw" | jq -r '.data["lifecycle-state"] // "REQUESTED"')
+        print_info "Capture ID: $history_id"
+        print_info "State: $history_state"
+    else
+        # Capture failed — show the raw error and fall back
+        print_warn "Capture request failed"
+        if [[ -n "$capture_raw" ]]; then
+            echo -e "  ${RED}Response:${NC} $(echo "$capture_raw" | head -5)"
+        fi
+
+        echo ""
+        print_info "Falling back to existing console history..."
+
+        local list_cmd="oci compute console-history list \\
+    --compartment-id \"$SELECTED_COMPARTMENT_ID\" \\
+    --instance-id \"$CREATED_INSTANCE_ID\" \\
+    --sort-by TIMECREATED --sort-order DESC \\
+    --limit 1"
+        log_command "List existing console history" "$list_cmd"
+
+        local list_raw
+        list_raw=$(oci compute console-history list \
+            --compartment-id "$SELECTED_COMPARTMENT_ID" \
+            --instance-id "$CREATED_INSTANCE_ID" \
+            --sort-by TIMECREATED --sort-order DESC \
+            --limit 1 2>&1) || true
+        log_command_result "$?" "$list_raw"
+
+        if echo "$list_raw" | jq -e '.data[0].id' &>/dev/null; then
+            history_id=$(echo "$list_raw" | jq -r '.data[0].id')
+            history_state=$(echo "$list_raw" | jq -r '.data[0]["lifecycle-state"] // "UNKNOWN"')
+            print_info "Found existing capture: $history_id (state: $history_state)"
+        else
+            print_warn "No console history available for this instance"
+            if [[ -n "$list_raw" ]]; then
+                echo -e "  ${RED}Response:${NC} $(echo "$list_raw" | head -5)"
+            fi
+            return 0
+        fi
     fi
-    
-    local history_id
-    history_id=$(echo "$capture_raw" | jq -r '.data.id')
-    
-    # Wait for capture to complete
-    print_info "Waiting for capture to complete..."
-    sleep 15
-    
-    # Get console history content
+
+    #---------------------------------------------------------------------------
+    # Step 2: Poll lifecycle state until SUCCEEDED (or timeout)
+    #---------------------------------------------------------------------------
+    if [[ "$history_state" != "SUCCEEDED" ]]; then
+        print_info "Waiting for capture to complete (timeout: ${max_wait}s)..."
+
+        local poll_cmd="oci compute console-history get \\
+    --instance-console-history-id \"$history_id\" \\
+    --query 'data.\"lifecycle-state\"' --raw-output"
+        log_command "Poll console history state" "$poll_cmd"
+
+        local elapsed=0
+        while [[ $elapsed -lt $max_wait ]]; do
+            printf "\r  ${BLUE}[%d/%ds]${NC} Capture state: %-15s" "$elapsed" "$max_wait" "$history_state"
+            sleep "$poll_interval"
+            elapsed=$((elapsed + poll_interval))
+
+            local status_raw
+            status_raw=$(oci compute console-history get \
+                --instance-console-history-id "$history_id" \
+                --query 'data."lifecycle-state"' --raw-output 2>&1) || true
+
+            if [[ -n "$status_raw" && "$status_raw" != *"ServiceError"* ]]; then
+                history_state="$status_raw"
+            else
+                # Show the error on first failure
+                if [[ $elapsed -eq $poll_interval ]]; then
+                    echo ""
+                    print_warn "Poll returned error: $(echo "$status_raw" | head -3)"
+                fi
+            fi
+
+            if [[ "$history_state" == "SUCCEEDED" ]]; then
+                printf "\r  ${GREEN}[%d/%ds]${NC} Capture state: SUCCEEDED        \n" "$elapsed" "$max_wait"
+                break
+            fi
+
+            if [[ "$history_state" == "FAILED" ]]; then
+                printf "\r  ${RED}[%d/%ds]${NC} Capture state: FAILED           \n" "$elapsed" "$max_wait"
+                print_error "Console history capture failed"
+                return 0
+            fi
+        done
+
+        if [[ "$history_state" != "SUCCEEDED" ]]; then
+            echo ""
+            print_warn "Timed out waiting for capture (state: $history_state)"
+            print_info "You can retrieve it later with:"
+            echo "  oci compute console-history get-content \\"
+            echo "      --instance-console-history-id \"$history_id\" \\"
+            echo "      --file console-output.log"
+            return 0
+        fi
+    else
+        print_info "Capture already completed"
+    fi
+
+    #---------------------------------------------------------------------------
+    # Step 3: Retrieve console history content
+    #---------------------------------------------------------------------------
+    print_info "Retrieving console output..."
+
+    local content_cmd="oci compute console-history get-content \\
+    --instance-console-history-id \"$history_id\" \\
+    --length 1048576 \\
+    --file -"
+    log_command "Get console history content" "$content_cmd"
+
     local content
     content=$(oci compute console-history get-content \
         --instance-console-history-id "$history_id" \
-        --length 10000000 \
-        --file - 2>/dev/null) || true
-    
-    if [[ -n "$content" ]]; then
-        echo ""
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━ CONSOLE OUTPUT ━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo "$content" | tail -100
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo ""
-        
-        # Save full output to file
-        local log_file="console-history-${CREATED_INSTANCE_ID##*.}.log"
-        echo "$content" > "$log_file"
-        print_info "Full console history saved to: $log_file"
-    else
-        print_warn "No console history content available yet"
+        --length 1048576 \
+        --file - 2>&1) || true
+
+    # Check if we got an error instead of content
+    if echo "$content" | grep -q "ServiceError\|\"code\":" 2>/dev/null; then
+        print_warn "get-content returned an error:"
+        echo -e "  ${RED}$(echo "$content" | head -10)${NC}"
+        print_info "You can retry manually with:"
+        echo "  oci compute console-history get-content \\"
+        echo "      --instance-console-history-id \"$history_id\" \\"
+        echo "      --file console-output.log"
+        return 0
     fi
+
+    if [[ -z "$content" ]]; then
+        print_warn "Console history capture succeeded but content is empty"
+        print_info "The instance may still be in early boot. Retry with:"
+        echo "  oci compute console-history get-content \\"
+        echo "      --instance-console-history-id \"$history_id\" \\"
+        echo "      --file console-output.log"
+        return 0
+    fi
+
+    local content_lines
+    content_lines=$(echo "$content" | wc -l)
+    local content_bytes
+    content_bytes=$(echo "$content" | wc -c)
+
+    print_info "Retrieved $content_lines lines ($content_bytes bytes)"
+
+    #---------------------------------------------------------------------------
+    # Step 4: Display and save
+    #---------------------------------------------------------------------------
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━ CONSOLE OUTPUT (last 100 lines of $content_lines) ━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo "$content" | tail -100
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # Save full output to file
+    local log_file="console-history-${CREATED_INSTANCE_ID##*.}.log"
+    echo "$content" > "$log_file"
+    print_info "Full console history: $log_file ($content_lines lines, $content_bytes bytes)"
+    log_message "INFO" "Console history saved: $log_file ($content_lines lines, $content_bytes bytes)"
+
+    #---------------------------------------------------------------------------
+    # Step 5: Quick-scan for common bootstrap issues
+    #---------------------------------------------------------------------------
+    echo ""
+    echo -e "  ${BOLD}Boot Diagnostics:${NC}"
+
+    # Check for cloud-init completion
+    if echo "$content" | grep -qi "Cloud-init.*finished\|Cloud-init v.*finished"; then
+        echo -e "    ${GREEN}✅${NC} cloud-init finished"
+    elif echo "$content" | grep -qi "cloud-init"; then
+        echo -e "    ${YELLOW}⚠️${NC}  cloud-init started but may not have finished"
+    else
+        echo -e "    ${YELLOW}⚠️${NC}  no cloud-init output found (may still be booting)"
+    fi
+
+    # Check for oke-init / kubelet
+    if echo "$content" | grep -qi "oke-init.*complete\|oke-init.*success\|Started oke-init"; then
+        echo -e "    ${GREEN}✅${NC} oke-init service ran"
+    elif echo "$content" | grep -qi "oke-init\|oke.bootstrap\|oke bootstrap"; then
+        echo -e "    ${YELLOW}⚠️${NC}  oke-init referenced but completion not confirmed"
+    fi
+
+    if echo "$content" | grep -qi "kubelet.*started\|Started kubelet\|Starting Kubernetes"; then
+        echo -e "    ${GREEN}✅${NC} kubelet started"
+    fi
+
+    # Check for errors
+    local error_count
+    error_count=$(echo "$content" | grep -cEi "FATAL|panic|kernel BUG|Oops:|segfault|oom-kill|Out of memory" || true)
+    if [[ "$error_count" -gt 0 ]]; then
+        echo -e "    ${RED}❌${NC} $error_count critical error(s) detected in console output"
+        echo ""
+        echo -e "  ${BOLD}Error lines:${NC}"
+        echo "$content" | grep -Ei "FATAL|panic|kernel BUG|Oops:|segfault|oom-kill|Out of memory" | tail -10 | while IFS= read -r line; do
+            echo -e "    ${RED}│${NC} ${line:0:120}"
+        done
+    else
+        echo -e "    ${GREEN}✅${NC} no critical errors (FATAL/panic/OOM) in console output"
+    fi
+
+    # Check for connectivity issues
+    if echo "$content" | grep -qi "Connection timed out.*12250\|Connection refused.*12250\|port 12250.*timed out"; then
+        echo -e "    ${RED}❌${NC} port 12250 connectivity failure detected — check NSG rules"
+    fi
+    if echo "$content" | grep -qi "Connection timed out.*6443\|Connection refused.*6443"; then
+        echo -e "    ${RED}❌${NC} port 6443 connectivity failure detected — check NSG/routing"
+    fi
+
+    echo ""
 }
 
 verify_node_registration() {
@@ -3514,22 +3775,22 @@ delete_instance_configurations() {
 nsg_check_pass() {
     local label="$1"
     echo -e "    ${GREEN}✅ PASS${NC}  $label"
-    ((NSG_TOTAL_CHECKS++))
-    ((NSG_PASSED_CHECKS++))
+    NSG_TOTAL_CHECKS=$((NSG_TOTAL_CHECKS + 1))
+    NSG_PASSED_CHECKS=$((NSG_PASSED_CHECKS + 1))
 }
 
 nsg_check_fail() {
     local label="$1"
     echo -e "    ${RED}❌ FAIL${NC}  $label"
-    ((NSG_TOTAL_CHECKS++))
-    ((NSG_FAILED_CHECKS++))
+    NSG_TOTAL_CHECKS=$((NSG_TOTAL_CHECKS + 1))
+    NSG_FAILED_CHECKS=$((NSG_FAILED_CHECKS + 1))
 }
 
 nsg_check_warn() {
     local label="$1"
     echo -e "    ${YELLOW}⚠️  WARN${NC}  $label"
-    ((NSG_TOTAL_CHECKS++))
-    ((NSG_WARNED_CHECKS++))
+    NSG_TOTAL_CHECKS=$((NSG_TOTAL_CHECKS + 1))
+    NSG_WARNED_CHECKS=$((NSG_WARNED_CHECKS + 1))
 }
 
 # Fetch all rules for an NSG (cached)
@@ -3779,6 +4040,73 @@ nsg_discover_cluster_networking() {
     if ! echo "$cluster_json" | jq -e '.data' &>/dev/null; then
         print_error "Failed to fetch cluster details"
         exit 1
+    fi
+
+    #--- Cluster CNI type ---
+    CLUSTER_CNI_TYPE=$(echo "$cluster_json" | jq -r '
+        .data["cluster-pod-network-options"][0]["cni-type"] //
+        .data.clusterPodNetworkOptions[0].cniType //
+        "UNKNOWN"' 2>/dev/null) || CLUSTER_CNI_TYPE="UNKNOWN"
+    
+    local cni_display="$CLUSTER_CNI_TYPE"
+    case "$CLUSTER_CNI_TYPE" in
+        OCI_VCN_IP_NATIVE) cni_display="VCN-Native Pod Networking" ;;
+        FLANNEL_OVERLAY)   cni_display="Flannel Overlay" ;;
+    esac
+    print_info "Cluster CNI: ${cni_display}"
+
+    #--- Pod networking details from node pools (for native CNI validation) ---
+    CLUSTER_POD_NSG_IDS=()
+    CLUSTER_POD_SUBNET_IDS=()
+
+    if [[ "$CLUSTER_CNI_TYPE" == "OCI_VCN_IP_NATIVE" ]]; then
+        local np_output
+        np_output=$(oci ce node-pool list \
+            --compartment-id "$SELECTED_COMPARTMENT_ID" \
+            --cluster-id "$SELECTED_OKE_CLUSTER_ID" \
+            --all 2>/dev/null) || true
+
+        if echo "$np_output" | jq -e '.data[0]' &>/dev/null; then
+            # Extract pod NSG IDs from node pool pod network config
+            while IFS= read -r nsg_id; do
+                [[ -n "$nsg_id" && "$nsg_id" != "null" ]] && CLUSTER_POD_NSG_IDS+=("$nsg_id")
+            done < <(echo "$np_output" | jq -r '
+                [.data[]
+                    | .["node-config-details"]["node-pool-pod-network-option-details"]["pod-nsg-ids"]? // []
+                    | .[]
+                ] | unique | .[]' 2>/dev/null) || true
+
+            # Extract pod subnet IDs
+            while IFS= read -r sub_id; do
+                [[ -n "$sub_id" && "$sub_id" != "null" ]] && CLUSTER_POD_SUBNET_IDS+=("$sub_id")
+            done < <(echo "$np_output" | jq -r '
+                [.data[]
+                    | .["node-config-details"]["node-pool-pod-network-option-details"]["pod-subnet-ids"]? // []
+                    | .[]
+                ] | unique | .[]' 2>/dev/null) || true
+
+            if [[ ${#CLUSTER_POD_NSG_IDS[@]} -gt 0 ]]; then
+                local pod_nsg_names=()
+                for pid in "${CLUSTER_POD_NSG_IDS[@]}"; do
+                    local pname
+                    pname=$(oci network nsg get --nsg-id "$pid" \
+                        --query 'data."display-name"' --raw-output 2>/dev/null) || pname="${pid:(-8)}"
+                    pod_nsg_names+=("$pname")
+                done
+                print_info "Pod NSG(s): $(IFS=", "; echo "${pod_nsg_names[*]}")"
+            fi
+
+            if [[ ${#CLUSTER_POD_SUBNET_IDS[@]} -gt 0 ]]; then
+                for psid in "${CLUSTER_POD_SUBNET_IDS[@]}"; do
+                    local psname pscidr
+                    psname=$(oci network subnet get --subnet-id "$psid" \
+                        --query 'data."display-name"' --raw-output 2>/dev/null) || psname="unknown"
+                    pscidr=$(oci network subnet get --subnet-id "$psid" \
+                        --query 'data."cidr-block"' --raw-output 2>/dev/null) || pscidr="unknown"
+                    print_info "Pod subnet: ${psname} (${pscidr})"
+                done
+            fi
+        fi
     fi
 
     #--- Control plane endpoint config ---
@@ -4280,6 +4608,390 @@ nsg_check_main() {
 
     echo ""
     print_info "Log file: $LOG_FILE"
+}
+
+#-------------------------------------------------------------------------------
+# CNI Compatibility Check: Validate instance config against cluster CNI type
+#
+# Compares the cluster's CNI (Native vs Flannel) against the instance
+# configuration's VNIC settings (NSGs, subnets) and flags mismatches.
+# Called from preflight_nsg_api_check after cluster networking is discovered.
+#-------------------------------------------------------------------------------
+preflight_cni_check() {
+    if [[ -z "${CLUSTER_CNI_TYPE:-}" || "$CLUSTER_CNI_TYPE" == "UNKNOWN" ]]; then
+        print_warn "Could not determine cluster CNI type — skipping CNI compatibility check"
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}CNI Compatibility Check:${NC}"
+    echo ""
+
+    local cni_issues=0
+    local cni_warnings=0
+
+    case "$CLUSTER_CNI_TYPE" in
+    OCI_VCN_IP_NATIVE)
+        echo -e "  Cluster CNI: ${CYAN}VCN-Native Pod Networking${NC}"
+        echo -e "  Instance Config NSG(s): ${SELECTED_NSG_NAMES:-None}"
+        echo ""
+
+        #---------------------------------------------------------------
+        # Check 1: Pod NSG must be in instance config nsgIds
+        #---------------------------------------------------------------
+        if [[ ${#CLUSTER_POD_NSG_IDS[@]} -eq 0 ]]; then
+            echo -e "    ${YELLOW}⚠️${NC}  No pod NSGs found in node pool config — cannot validate pod NSG assignment"
+            cni_warnings=$((cni_warnings + 1))
+        else
+            local pod_nsg_missing=()
+            for pod_nsg_id in "${CLUSTER_POD_NSG_IDS[@]}"; do
+                local found=false
+                for config_nsg_id in "${SELECTED_NSG_IDS[@]}"; do
+                    if [[ "$config_nsg_id" == "$pod_nsg_id" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+                if [[ "$found" == "false" ]]; then
+                    # Resolve pod NSG name for display
+                    local pod_nsg_name
+                    pod_nsg_name=$(oci network nsg get --nsg-id "$pod_nsg_id" \
+                        --query 'data."display-name"' --raw-output 2>/dev/null) || pod_nsg_name="${pod_nsg_id:(-12)}"
+                    pod_nsg_missing+=("$pod_nsg_name ($pod_nsg_id)")
+                fi
+            done
+
+            if [[ ${#pod_nsg_missing[@]} -eq 0 ]]; then
+                echo -e "    ${GREEN}✅${NC} Pod NSG(s) present in instance config VNIC"
+            else
+                for missing in "${pod_nsg_missing[@]}"; do
+                    echo -e "    ${RED}❌ CRITICAL${NC}  Pod NSG missing from instance config: ${RED}${missing}${NC}"
+                    echo -e "       VCN-Native requires the pod NSG in createVnicDetails.nsgIds."
+                    echo -e "       Without it, the VNIC won't receive pod traffic and bootstrap will fail."
+                    cni_issues=$((cni_issues + 1))
+                done
+            fi
+        fi
+
+        #---------------------------------------------------------------
+        # Check 2: Instance config should have at least 2 NSGs (workers + pods)
+        #---------------------------------------------------------------
+        local config_nsg_count=${#SELECTED_NSG_IDS[@]}
+        if [[ $config_nsg_count -eq 0 ]]; then
+            echo -e "    ${RED}❌ CRITICAL${NC}  Instance config has NO NSGs — VCN-Native requires workers + pods NSGs"
+            cni_issues=$((cni_issues + 1))
+        elif [[ $config_nsg_count -eq 1 ]]; then
+            echo -e "    ${YELLOW}⚠️${NC}  Instance config has only 1 NSG — VCN-Native typically requires workers NSG + pods NSG"
+            echo -e "       This is a known OCI issue: instance configs created from node pools"
+            echo -e "       sometimes drop the pods NSG. Verify the attached NSG covers pod traffic."
+            cni_warnings=$((cni_warnings + 1))
+        else
+            echo -e "    ${GREEN}✅${NC} Instance config has $config_nsg_count NSGs (workers + pods expected)"
+        fi
+
+        #---------------------------------------------------------------
+        # Check 3: Pod subnet must exist (cluster-level sanity)
+        #---------------------------------------------------------------
+        if [[ ${#CLUSTER_POD_SUBNET_IDS[@]} -eq 0 ]]; then
+            echo -e "    ${YELLOW}⚠️${NC}  No pod subnets found in node pool config"
+            echo "       VCN-Native clusters should have a dedicated pod subnet."
+            cni_warnings=$((cni_warnings + 1))
+        else
+            echo -e "    ${GREEN}✅${NC} Pod subnet(s) configured in node pool (${#CLUSTER_POD_SUBNET_IDS[@]} found)"
+        fi
+        ;;
+
+    FLANNEL_OVERLAY)
+        echo -e "  Cluster CNI: ${CYAN}Flannel Overlay${NC}"
+        echo -e "  Instance Config NSG(s): ${SELECTED_NSG_NAMES:-None}"
+        echo ""
+
+        #---------------------------------------------------------------
+        # Check 1: Flannel doesn't need pod NSGs
+        #---------------------------------------------------------------
+        if [[ ${#CLUSTER_POD_NSG_IDS[@]} -gt 0 ]]; then
+            echo -e "    ${YELLOW}⚠️${NC}  Pod NSGs found in node pool config but cluster uses Flannel"
+            echo "       Pod NSGs are not needed for Flannel — verify this is intentional."
+            cni_warnings=$((cni_warnings + 1))
+        fi
+
+        #---------------------------------------------------------------
+        # Check 2: Flannel typically needs just workers NSG
+        #---------------------------------------------------------------
+        local config_nsg_count=${#SELECTED_NSG_IDS[@]}
+        if [[ $config_nsg_count -eq 0 ]]; then
+            echo -e "    ${YELLOW}⚠️${NC}  Instance config has no NSGs — relying on security lists only"
+            cni_warnings=$((cni_warnings + 1))
+        elif [[ $config_nsg_count -eq 1 ]]; then
+            echo -e "    ${GREEN}✅${NC} Instance config has 1 NSG (expected for Flannel)"
+        else
+            echo -e "    ${GREEN}✅${NC} Instance config has $config_nsg_count NSGs"
+        fi
+
+        #---------------------------------------------------------------
+        # Check 3: Flannel needs VXLAN port 8472
+        #---------------------------------------------------------------
+        echo -e "    ${CYAN}ℹ️${NC}  Flannel requires UDP/8472 (VXLAN) between worker nodes"
+        echo "       Ensure this is allowed in worker NSG or security lists."
+        ;;
+
+    *)
+        echo -e "    ${YELLOW}⚠️${NC}  Unknown CNI type: $CLUSTER_CNI_TYPE"
+        cni_warnings=$((cni_warnings + 1))
+        ;;
+    esac
+
+    #--- Summary ---
+    echo ""
+    if [[ $cni_issues -gt 0 ]]; then
+        echo -e "  ${RED}${BOLD}❌ $cni_issues CNI compatibility issue(s) found!${NC}"
+        echo ""
+        log_message "WARN" "CNI check ($CLUSTER_CNI_TYPE): $cni_issues critical issues, $cni_warnings warnings"
+
+        # Count these toward the overall preflight failures
+        NSG_TOTAL_CHECKS=$((NSG_TOTAL_CHECKS + cni_issues + cni_warnings))
+        NSG_FAILED_CHECKS=$((NSG_FAILED_CHECKS + cni_issues))
+        NSG_WARNED_CHECKS=$((NSG_WARNED_CHECKS + cni_warnings))
+    elif [[ $cni_warnings -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠️  $cni_warnings CNI warning(s) — review above${NC}"
+        echo ""
+        log_message "INFO" "CNI check ($CLUSTER_CNI_TYPE): passed with $cni_warnings warnings"
+        NSG_TOTAL_CHECKS=$((NSG_TOTAL_CHECKS + cni_warnings))
+        NSG_WARNED_CHECKS=$((NSG_WARNED_CHECKS + cni_warnings))
+    else
+        echo -e "  ${GREEN}✅ CNI compatibility checks passed ($CLUSTER_CNI_TYPE)${NC}"
+        echo ""
+        log_message "INFO" "CNI check ($CLUSTER_CNI_TYPE): all checks passed"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# Pre-Flight Check: API Server + NSG Rule Validation (Create-New Flow)
+#
+# Runs automatically in the create-new flow after all selections are made.
+# Bridges SELECTED_ globals to NSG_ globals and reuses the NSG validation engine.
+#-------------------------------------------------------------------------------
+preflight_nsg_api_check() {
+    print_section "Pre-Flight: API Server & NSG Validation"
+
+    # Guard: need cluster + API server to proceed
+    if [[ -z "${SELECTED_OKE_CLUSTER_ID:-}" ]]; then
+        print_warn "No OKE cluster selected — skipping pre-flight NSG check"
+        return 0
+    fi
+    if [[ -z "${SELECTED_API_SERVER_IP:-}" ]]; then
+        print_warn "No API server IP — skipping pre-flight connectivity check"
+        return 0
+    fi
+
+    local preflight_failed=false
+
+    #--- Part 1: API Server Connectivity ---
+    echo -e "  ${BOLD}API Server Connectivity:${NC}"
+    echo ""
+    print_info "Control plane endpoint: ${SELECTED_API_SERVER_IP}:${SELECTED_API_SERVER_PORT:-6443}"
+
+    # Only run connectivity tests if we're on an OCI instance (IMDS available)
+    local imds_result
+    imds_result=$(curl -s --connect-timeout 2 -H "Authorization: Bearer Oracle" \
+        "http://169.254.169.254/opc/v2/instance/" 2>/dev/null) || true
+
+    if [[ -n "$imds_result" && "$imds_result" != *"404"* ]]; then
+        # We're on an OCI instance — test connectivity
+        print_info "Running from OCI instance — testing API server connectivity..."
+
+        # Test 6443
+        if nc -zvw5 "$SELECTED_API_SERVER_IP" "${SELECTED_API_SERVER_PORT:-6443}" 2>&1 | grep -qi "succeeded\|connected\|open"; then
+            echo -e "  ${GREEN}✅${NC} TCP/${SELECTED_API_SERVER_PORT:-6443} (K8s API) — reachable"
+        else
+            echo -e "  ${YELLOW}⚠️${NC}  TCP/${SELECTED_API_SERVER_PORT:-6443} (K8s API) — not reachable from this node"
+            echo "     (New worker node may have different routing)"
+        fi
+
+        # Test 12250
+        if nc -zvw5 "$SELECTED_API_SERVER_IP" 12250 2>&1 | grep -qi "succeeded\|connected\|open"; then
+            echo -e "  ${GREEN}✅${NC} TCP/12250 (Bootstrap) — reachable"
+        else
+            echo -e "  ${YELLOW}⚠️${NC}  TCP/12250 (Bootstrap) — not reachable from this node"
+            echo "     (Does not necessarily mean the worker will fail — depends on worker NSG rules)"
+        fi
+    else
+        print_info "Not running on OCI instance (IMDS unavailable) — skipping connectivity test"
+        print_info "NSG rule validation will still verify the rules are in place"
+    fi
+
+    echo ""
+
+    #--- Part 2: Bridge SELECTED_ → NSG_ variables ---
+    # Reset NSG validation state from any prior --nsg-check run
+    NSG_CP_NSG_IDS=()
+    NSG_CP_NSG_NAMES=()
+    NSG_CP_SUBNET_ID=""
+    NSG_CP_SUBNET_CIDR=""
+    NSG_CP_ENDPOINT_IP=""
+    NSG_WORKER_NSG_IDS=()
+    NSG_WORKER_NSG_NAMES=()
+    NSG_WORKER_SUBNET_ID=""
+    NSG_WORKER_SUBNET_CIDR=""
+    NSG_TOTAL_CHECKS=0
+    NSG_PASSED_CHECKS=0
+    NSG_FAILED_CHECKS=0
+    NSG_WARNED_CHECKS=0
+    NSG_MISSING_RULES=()
+    CLUSTER_CNI_TYPE=""
+    CLUSTER_POD_NSG_IDS=()
+    CLUSTER_POD_SUBNET_IDS=()
+    # Clear the rules cache (safe for associative arrays under set -e)
+    for _cache_key in "${!NSG_RULES_CACHE[@]}"; do
+        unset "NSG_RULES_CACHE[$_cache_key]"
+    done
+
+    # Discover CP networking from cluster
+    print_info "Discovering cluster networking..."
+    nsg_discover_cluster_networking
+
+    # Map worker NSGs from create-new selections
+    if [[ ${#SELECTED_NSG_IDS[@]} -eq 0 ]]; then
+        print_warn "No worker NSGs selected — cannot validate NSG rules"
+        print_warn "Instance will rely solely on subnet security lists"
+        return 0
+    fi
+
+    NSG_WORKER_NSG_IDS=("${SELECTED_NSG_IDS[@]}")
+
+    # Resolve worker NSG names
+    for nsg_id in "${NSG_WORKER_NSG_IDS[@]}"; do
+        local nname
+        nname=$(oci network nsg get --nsg-id "$nsg_id" \
+            --query 'data."display-name"' --raw-output 2>/dev/null) || nname="$nsg_id"
+        NSG_WORKER_NSG_NAMES+=("$nname")
+    done
+    print_info "Worker NSG(s): $(IFS=", "; echo "${NSG_WORKER_NSG_NAMES[*]}")"
+
+    # Resolve worker subnet CIDR
+    if [[ -n "${SELECTED_SUBNET_ID:-}" ]]; then
+        NSG_WORKER_SUBNET_ID="$SELECTED_SUBNET_ID"
+        NSG_WORKER_SUBNET_CIDR=$(oci network subnet get \
+            --subnet-id "$SELECTED_SUBNET_ID" \
+            --query 'data."cidr-block"' --raw-output 2>/dev/null) || true
+        print_info "Worker subnet CIDR: ${NSG_WORKER_SUBNET_CIDR:-unknown}"
+    fi
+
+    #--- Part 2b: CNI Compatibility Check ---
+    preflight_cni_check
+
+    #--- Part 3: Run NSG validation ---
+    # Enable fix mode so missing rules can be added
+    local saved_fix_mode="$NSG_FIX_MODE"
+    NSG_FIX_MODE=true
+
+    nsg_validate_rules
+
+    #--- Part 4: Summary + Decision ---
+    echo ""
+    echo -e "  ${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${BOLD}  Pre-Flight NSG Summary${NC}"
+    echo -e "  ${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    local cni_label="$CLUSTER_CNI_TYPE"
+    case "$CLUSTER_CNI_TYPE" in
+        OCI_VCN_IP_NATIVE) cni_label="VCN-Native Pod Networking" ;;
+        FLANNEL_OVERLAY)   cni_label="Flannel Overlay" ;;
+    esac
+    echo -e "  ${BOLD}Cluster CNI:${NC}   $cni_label"
+    echo -e "  ${BOLD}Total checks:${NC}  $NSG_TOTAL_CHECKS"
+    echo -e "  ${GREEN}Passed:${NC}        $NSG_PASSED_CHECKS"
+    echo -e "  ${RED}Failed:${NC}        $NSG_FAILED_CHECKS"
+    echo -e "  ${YELLOW}Warnings:${NC}      $NSG_WARNED_CHECKS"
+    echo ""
+
+    if [[ $NSG_FAILED_CHECKS -eq 0 && $NSG_WARNED_CHECKS -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}✅ All NSG checks passed! Safe to proceed.${NC}"
+        log_message "INFO" "Pre-flight NSG check: all $NSG_TOTAL_CHECKS checks passed"
+        NSG_FIX_MODE="$saved_fix_mode"
+        return 0
+    fi
+
+    if [[ $NSG_FAILED_CHECKS -gt 0 ]]; then
+        echo -e "  ${RED}${BOLD}❌ $NSG_FAILED_CHECKS critical rule(s) missing!${NC}"
+        echo -e "  ${RED}The new node will NOT bootstrap correctly without these rules.${NC}"
+        preflight_failed=true
+    fi
+
+    if [[ $NSG_WARNED_CHECKS -gt 0 && $NSG_FAILED_CHECKS -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠️  $NSG_WARNED_CHECKS non-critical rule(s) missing (warnings only)${NC}"
+    fi
+
+    #--- Part 5: Offer to fix missing rules ---
+    if [[ ${#NSG_MISSING_RULES[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${BOLD}Missing Rules:${NC}"
+        echo ""
+
+        local i=1
+        for rule_data in "${NSG_MISSING_RULES[@]}"; do
+            IFS='|' read -r nsg_id nsg_name direction protocol target port_min port_max target_type label <<< "$rule_data"
+            echo -e "    ${RED}$i)${NC} $label"
+            echo -e "       NSG: $nsg_name | $direction | proto=$protocol | port=$port_min-$port_max"
+            ((i++))
+        done
+
+        echo ""
+        echo -e "  ${BOLD}Options:${NC}"
+        echo -e "    ${BOLD}[1]${NC} Fix all missing rules now, then continue deployment"
+        echo -e "    ${BOLD}[2]${NC} Continue deployment anyway (node may fail to bootstrap)"
+        echo -e "    ${BOLD}[3]${NC} Abort deployment"
+        echo ""
+
+        local fix_choice
+        if [[ "$AUTO_APPROVE" == "true" && "$preflight_failed" == "true" ]]; then
+            print_info "[AUTO-APPROVE] Auto-fixing critical missing rules..."
+            fix_choice="1"
+        else
+            read -rp "  Selection [1-3]: " fix_choice </dev/tty
+        fi
+
+        case "${fix_choice:-2}" in
+            1)
+                echo ""
+                print_info "Adding missing NSG rules..."
+                log_step "PRE-FLIGHT NSG FIX"
+                log_message "INFO" "Adding ${#NSG_MISSING_RULES[@]} missing NSG rules"
+
+                for rule_data in "${NSG_MISSING_RULES[@]}"; do
+                    IFS='|' read -r nsg_id nsg_name direction protocol target port_min port_max target_type label <<< "$rule_data"
+                    echo ""
+                    echo -e "  ${BOLD}Adding: $label${NC}"
+                    nsg_add_rule "$nsg_id" "$nsg_name" "$direction" "$protocol" "$target" "$port_min" "$port_max" "$target_type" "$label"
+                done
+
+                echo ""
+                print_success "All missing rules added. Proceeding with deployment."
+                log_message "INFO" "Pre-flight NSG fix complete — all rules added"
+                ;;
+            2)
+                echo ""
+                if [[ "$preflight_failed" == "true" ]]; then
+                    print_warn "Continuing with missing CRITICAL rules — node bootstrap will likely fail!"
+                    log_message "WARN" "User chose to continue with $NSG_FAILED_CHECKS critical missing rules"
+                else
+                    print_info "Continuing with non-critical warnings..."
+                    log_message "INFO" "User chose to continue with $NSG_WARNED_CHECKS warnings"
+                fi
+                ;;
+            3)
+                echo ""
+                print_info "Deployment aborted. Fix NSG rules and re-run."
+                log_message "INFO" "Deployment aborted by user due to NSG pre-flight failures"
+                exit 0
+                ;;
+            *)
+                print_info "Invalid selection, continuing deployment..."
+                ;;
+        esac
+    fi
+
+    NSG_FIX_MODE="$saved_fix_mode"
 }
 
 #-------------------------------------------------------------------------------
@@ -5054,6 +5766,89 @@ main() {
         #   Compartment → Select config → Show details → Confirm → Launch
         #-----------------------------------------------------------------------
         if use_existing_config_flow; then
+            # Prompt for target OKE cluster (needed for pre-flight NSG validation)
+            if [[ -z "${SELECTED_OKE_CLUSTER_ID:-}" ]]; then
+                print_section "Select Target OKE Cluster"
+                print_info "Fetching active OKE clusters in compartment..."
+
+                local cluster_list_raw
+                cluster_list_raw=$(oci ce cluster list \
+                    --compartment-id "$SELECTED_COMPARTMENT_ID" \
+                    --lifecycle-state ACTIVE \
+                    --all 2>/dev/null) || true
+
+                local cluster_list_json
+                cluster_list_json=$(echo "$cluster_list_raw" | jq -c '[.data[] | {
+                    name: .name,
+                    id: .id,
+                    version: (.["kubernetes-version"] | ltrimstr("v")),
+                    endpoint: ((.endpoints["private-endpoint"] // .endpoints["public-endpoint"] // "unknown") | sub(":.*"; "") | sub("https?://"; ""))
+                }]' 2>/dev/null) || cluster_list_json="[]"
+
+                local cluster_count
+                cluster_count=$(echo "$cluster_list_json" | jq 'length')
+
+                if [[ "$cluster_count" -eq 0 ]]; then
+                    print_warn "No active OKE clusters found — skipping pre-flight NSG check"
+                else
+                    echo ""
+                    printf "  ${BOLD}%-4s %-40s %-10s %-20s${NC}\n" "#" "Cluster Name" "Version" "CP Endpoint"
+                    printf "  %-4s %-40s %-10s %-20s\n" "----" "----------------------------------------" "----------" "--------------------"
+
+                    # Auto-detect: try to match API server IP from instance config
+                    local auto_match_idx=""
+                    local ci=1
+                    while IFS= read -r cl; do
+                        local cname cver cep
+                        cname=$(echo "$cl" | jq -r '.name')
+                        cver=$(echo "$cl" | jq -r '.version')
+                        cep=$(echo "$cl" | jq -r '.endpoint')
+
+                        local marker=""
+                        if [[ -n "${SELECTED_API_SERVER_IP:-}" && "$cep" == "$SELECTED_API_SERVER_IP" ]]; then
+                            auto_match_idx="$ci"
+                            marker=" ${GREEN}← matches config API server${NC}"
+                        fi
+
+                        printf "  %-4s %-40s %-10s %-20s" "$ci)" "$cname" "v$cver" "$cep"
+                        [[ -n "$marker" ]] && echo -e "$marker" || echo ""
+                        ((ci++))
+                    done < <(echo "$cluster_list_json" | jq -c '.[]')
+
+                    local default_sel="${auto_match_idx:-1}"
+                    echo ""
+                    echo -e "  Select the OKE cluster this node will join"
+                    read -rp "  Selection [1-$cluster_count] (default: $default_sel): " cl_selection </dev/tty
+                    cl_selection="${cl_selection:-$default_sel}"
+
+                    if [[ "$cl_selection" =~ ^[0-9]+$ ]] && [[ "$cl_selection" -ge 1 ]] && [[ "$cl_selection" -le "$cluster_count" ]]; then
+                        local selected_cl
+                        selected_cl=$(echo "$cluster_list_json" | jq -c ".[$((cl_selection - 1))]")
+                        SELECTED_OKE_CLUSTER_ID=$(echo "$selected_cl" | jq -r '.id')
+                        SELECTED_OKE_CLUSTER_NAME=$(echo "$selected_cl" | jq -r '.name')
+                        CLUSTER_NAME="$SELECTED_OKE_CLUSTER_NAME"
+                        print_success "Target cluster: $SELECTED_OKE_CLUSTER_NAME"
+                        log_message "INFO" "Target OKE cluster selected: $SELECTED_OKE_CLUSTER_NAME ($SELECTED_OKE_CLUSTER_ID)"
+                    else
+                        print_warn "Invalid selection — skipping pre-flight NSG check"
+                    fi
+                fi
+            fi
+
+            preflight_nsg_api_check
+
+            # Final confirmation — after NSG validation so user knows the full picture
+            echo ""
+            if [[ "$AUTO_APPROVE" == "true" ]]; then
+                echo -e "${GREEN}[AUTO-APPROVE]${NC} Proceeding with launch..."
+            else
+                read -rp "Proceed with launch? [Y/n]: " confirm </dev/tty
+                if [[ "${confirm,,}" == "n" ]]; then
+                    print_info "Deployment cancelled"
+                    exit 0
+                fi
+            fi
+
             # Successfully selected an existing config — launch it
             launch_instance
             wait_for_instance
@@ -5101,6 +5896,9 @@ main() {
     configure_instance_name
     configure_kubeconfig  # Only prompts if not already configured from OKE cluster
     configure_node_labels_taints
+    
+    # Pre-flight: Verify API server reachability and NSG rules
+    preflight_nsg_api_check
     
     # Confirmation
     print_section "Deployment Confirmation"
