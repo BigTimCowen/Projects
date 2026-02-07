@@ -1293,7 +1293,7 @@ fetch_capacity_topology() {
     # Write cache header
     {
         echo "# Capacity Topology Hosts"
-        echo "# Format: InstanceOCID|HostLifecycleState|HostLifecycleDetails|TopologyOCID"
+        echo "# Format: InstanceOCID|HostLifecycleState|HostLifecycleDetails|TopologyOCID|InstanceShape|HPCIslandID|NetworkBlockID|LocalBlockID|TimeCreated|TimeUpdated"
     } > "$CAPACITY_TOPOLOGY_CACHE"
     
     # Get topology IDs - filter out DELETED/TERMINATED states, deduplicate
@@ -1338,7 +1338,7 @@ fetch_capacity_topology() {
         if [[ -n "$hosts_json" ]]; then
             echo "$hosts_json" | jq -r --arg topo "$topo_id" '
                 .data.items[]? | 
-                "\(.["instance-id"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["lifecycle-details"] // "N/A")|\($topo)"
+                "\(.["instance-id"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["lifecycle-details"] // "N/A")|\($topo)|\(.["instance-shape"] // "N/A")|\(.["compute-hpc-island-id"] // "N/A")|\(.["compute-network-block-id"] // "N/A")|\(.["compute-local-block-id"] // "N/A")|\(.["time-created"] // "N/A")|\(.["time-updated"] // "N/A")"
             ' > "$output_file" 2>/dev/null
         fi
     }
@@ -4209,7 +4209,7 @@ list_maintenance_events() {
     echo -e "${GRAY}Region: ${WHITE}$region${NC}  ${GRAY}Compartment: ${WHITE}$(resolve_compartment_name "$compartment_id")${NC} ${GRAY}($compartment_id)${NC}"
     echo -e "${GRAY}Source: oci compute instance-maintenance-event list${NC}  ${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)${NC}"
     case "$filter_type" in
-        named)       echo -e "${YELLOW}Filter: Named instances only + hiding CapTopo=AVAILABLE + hiding SUCCEEDED >2 days old${NC}" ;;
+        named)       echo -e "${YELLOW}Filter: Named instances only + hiding CapTopo=AVAILABLE + hiding time-finished${NC}" ;;
         PROCESSING)  echo -e "${YELLOW}Filter: Showing only PROCESSING events${NC}" ;;
         SUCCEEDED)   echo -e "${YELLOW}Filter: Showing only SUCCEEDED events${NC}" ;;
         CANCELED)    echo -e "${YELLOW}Filter: Showing only CANCELED events${NC}" ;;
@@ -4344,29 +4344,19 @@ list_maintenance_events() {
         local mi_sort_ann="$mi_ann"
         [[ "$mi_ann" == "-" || -z "$mi_ann" ]] && mi_sort_ann="zzz"
         
-        # When named filter: skip instances where ALL their events are SUCCEEDED with window start > 2 days old
+        # When named filter: skip instances where ALL their events are completed (time-finished set)
         if [[ "$filter_type" == "named" ]]; then
             local mi_has_active_event=false
             local mi_evt_line
-            while IFS='|' read -r _eid mi_evt_iid _er _ec mi_evt_lc mi_evt_ws _rest; do
+            while IFS='|' read -r _eid mi_evt_iid _er _ec mi_evt_lc mi_evt_ws _ehd mi_evt_tf; do
                 [[ "$mi_evt_iid" != "$mi_ocid" ]] && continue
-                if [[ "${mi_evt_lc^^}" != "SUCCEEDED" ]]; then
-                    mi_has_active_event=true
-                    break
+                # Skip events with time-finished populated (maintenance completed)
+                if [[ "$mi_evt_tf" != "null" && -n "$mi_evt_tf" ]]; then
+                    continue
                 fi
-                # SUCCEEDED - check if window start is within 2 days
-                if [[ "$mi_evt_ws" != "null" && -n "$mi_evt_ws" ]]; then
-                    local mi_chk_epoch
-                    mi_chk_epoch=$(date -u -d "${mi_evt_ws:0:19}" +%s 2>/dev/null) || mi_chk_epoch=""
-                    if [[ -n "$mi_chk_epoch" ]]; then
-                        local mi_2d_ago=$(( $(date -u +%s) - 172800 ))
-                        if [[ $mi_chk_epoch -ge $mi_2d_ago ]]; then
-                            mi_has_active_event=true
-                            break
-                        fi
-                    fi
-                fi
-            done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")"' "$cache_file" 2>/dev/null)
+                mi_has_active_event=true
+                break
+            done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["time-finished"] // "null")"' "$cache_file" 2>/dev/null)
             
             # Also keep if DEGRADED cap topo (regardless of event state)
             [[ "$mi_cap_topo" == "DEGRADED" ]] && mi_has_active_event=true
@@ -4643,21 +4633,21 @@ list_maintenance_events() {
         "" "" "" "" "" "" "" "" "" "" "" "" "Current UTC:" "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
     
     if [[ "$me_view_mode" == "detail" ]]; then
-        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s %-10s${NC}\n" \
-            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce" "CapTopo"
-        print_separator 275
+        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-22s %-6s %-10s %-10s${NC}\n" \
+            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Time Finished" "Rescd" "Announce" "CapTopo"
+        print_separator 297
     else
         # Compact view: same columns + Fault Code + CapTopo at end, no sub-lines
-        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-6s %-10s %-22s %-10s${NC}\n" \
-            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Rescd" "Announce" "Fault Code" "CapTopo"
-        print_separator 297
+        printf "  ${BOLD}%-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s %-28s %-26s %-22s %-22s %-6s %-10s %-22s %-10s${NC}\n" \
+            "#" "Instance Name" "K8s Node" "Serial" "State" "K8s" "Crdn" "Taints" "Pods" "Maint Reason" "Category" "Lifecycle" "Event Name" "Window Start" "Hard Due Date" "Time Finished" "Rescd" "Announce" "Fault Code" "CapTopo"
+        print_separator 319
     fi
     
     declare -A ME_EVENT_MAP=()
     declare -A ME_INSTANCE_MAP=()
     local me_idx=0
     
-    while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_additional; do
+    while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_time_finished evt_additional; do
         [[ -z "$evt_id" ]] && continue
         
         # Look up instance details
@@ -4694,18 +4684,9 @@ list_maintenance_events() {
             continue
         fi
         
-        # When named filter is active: hide SUCCEEDED events with window start > 2 days old
-        if [[ "$filter_type" == "named" && "${evt_lifecycle^^}" == "SUCCEEDED" ]]; then
-            if [[ "$evt_window_start" != "null" && -n "$evt_window_start" ]]; then
-                local chk_ws_epoch
-                chk_ws_epoch=$(date -u -d "${evt_window_start:0:19}" +%s 2>/dev/null) || chk_ws_epoch=""
-                if [[ -n "$chk_ws_epoch" ]]; then
-                    local two_days_ago=$(( me_now_epoch - 172800 ))
-                    if [[ $chk_ws_epoch -lt $two_days_ago ]]; then
-                        continue
-                    fi
-                fi
-            fi
+        # When named filter is active: hide events where time-finished is populated (maintenance completed)
+        if [[ "$filter_type" == "named" && "$evt_time_finished" != "null" && -n "$evt_time_finished" ]]; then
+            continue
         fi
         
         ((me_idx++))
@@ -4737,7 +4718,7 @@ list_maintenance_events() {
         [[ -z "$inst_announcement" ]] && inst_announcement="-"
         
         # Store mappings (include instance-action)
-        ME_EVENT_MAP[$me_idx]="${evt_id}|${evt_instance_id}|${evt_reason}|${evt_category}|${evt_lifecycle}|${evt_window_start}|${evt_hard_due}|${evt_can_resched}|${evt_display_name}|${inst_name}|${k8s_node}|${inst_shape}|${inst_state}|${evt_instance_action}|${evt_additional}"
+        ME_EVENT_MAP[$me_idx]="${evt_id}|${evt_instance_id}|${evt_reason}|${evt_category}|${evt_lifecycle}|${evt_window_start}|${evt_hard_due}|${evt_can_resched}|${evt_display_name}|${inst_name}|${k8s_node}|${inst_shape}|${inst_state}|${evt_instance_action}|${evt_time_finished}|${evt_additional}"
         ME_INSTANCE_MAP[$me_idx]="${evt_instance_id}"
         
         # Color coding
@@ -4820,6 +4801,14 @@ list_maintenance_events() {
         local hard_due_display="${evt_hard_due:0:19}"
         [[ "$evt_window_start" == "null" || -z "$evt_window_start" ]] && window_display="-"
         [[ "$evt_hard_due" == "null" || -z "$evt_hard_due" ]] && hard_due_display="-"
+        
+        # Time Finished display - only show if not null
+        local time_finished_display="-"
+        local time_finished_color="$GRAY"
+        if [[ "$evt_time_finished" != "null" && -n "$evt_time_finished" ]]; then
+            time_finished_display="${evt_time_finished:0:19}"
+            time_finished_color="$GREEN"
+        fi
         
         # Window Start color coding based on lifecycle and time
         local window_color="$WHITE"
@@ -4922,8 +4911,8 @@ list_maintenance_events() {
             case "$evt_cap_topo" in AVAILABLE) cap_topo_color="$GREEN" ;; DEGRADED) cap_topo_color="$RED" ;; N/A) cap_topo_color="$GRAY" ;; *) cap_topo_color="$YELLOW" ;; esac
             
             # ── Detail view: full row + fault sub-line + blank line ──
-            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${cap_topo_color}%-10s${NC}\n" \
-                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "$evt_cap_topo"
+            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${time_finished_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${cap_topo_color}%-10s${NC}\n" \
+                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "$evt_cap_topo"
             
             # Display fault/additional details as dim sub-line aligned to main row columns
             # ↳ indented 3 spaces, then:  Fault ID→Instance Name  Component→K8s Node  Sev→Serial
@@ -4987,11 +4976,11 @@ list_maintenance_events() {
             local cap_topo_color="$GREEN"
             case "$evt_cap_topo" in AVAILABLE) cap_topo_color="$GREEN" ;; DEGRADED) cap_topo_color="$RED" ;; N/A) cap_topo_color="$GRAY" ;; *) cap_topo_color="$YELLOW" ;; esac
             
-            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${fault_code_color}%-22s${NC} ${cap_topo_color}%-10s${NC}\n" \
-                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo"
+            printf "  ${YELLOW}%-4s${NC} %-30s ${k8s_node_color}%-20s${NC} ${serial_color}%-14s${NC} ${state_color}%-10s${NC} ${k8s_color}%-8s${NC} ${cordon_color}%-6s${NC} ${taint_color}%-8s${NC} ${pods_color}%-5s${NC} ${reason_color}%-22s${NC} %-12s ${lifecycle_color}%-11s${NC} %-28s ${window_color}%-${ws_field_width}s${NC} ${hard_due_color}%-22s${NC} ${time_finished_color}%-22s${NC} ${resched_color}%-6s${NC} ${ann_color}%-10s${NC} ${fault_code_color}%-22s${NC} ${cap_topo_color}%-10s${NC}\n" \
+                "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:${ws_field_width}}" "${hard_due_display:0:22}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo"
         fi
             
-    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
+    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
     
     echo ""
     echo -e "${GRAY}Total: ${WHITE}${me_idx}${GRAY} maintenance event(s)${NC}"
@@ -5222,8 +5211,8 @@ list_maintenance_events() {
                 for ci_idx in "${cordon_indices[@]}"; do
                     local ci_info="${ME_EVENT_MAP[$ci_idx]:-}"
                     [[ -z "$ci_info" ]] && continue
-                    local ci_evt_id ci_inst_id ci_reason ci_category ci_lifecycle ci_window_start ci_hard_due ci_can_resched ci_evt_name ci_inst_name ci_k8s_node ci_shape ci_state ci_instance_action ci_additional
-                    IFS='|' read -r ci_evt_id ci_inst_id ci_reason ci_category ci_lifecycle ci_window_start ci_hard_due ci_can_resched ci_evt_name ci_inst_name ci_k8s_node ci_shape ci_state ci_instance_action ci_additional <<< "$ci_info"
+                    local ci_evt_id ci_inst_id ci_reason ci_category ci_lifecycle ci_window_start ci_hard_due ci_can_resched ci_evt_name ci_inst_name ci_k8s_node ci_shape ci_state ci_instance_action ci_time_finished ci_additional
+                    IFS='|' read -r ci_evt_id ci_inst_id ci_reason ci_category ci_lifecycle ci_window_start ci_hard_due ci_can_resched ci_evt_name ci_inst_name ci_k8s_node ci_shape ci_state ci_instance_action ci_time_finished ci_additional <<< "$ci_info"
                     
                     if [[ "$ci_k8s_node" == "N/A" || -z "$ci_k8s_node" ]]; then
                         cordon_skipped+=("$ci_idx|$ci_inst_name|not a K8s node")
@@ -5344,8 +5333,8 @@ list_maintenance_events() {
                 for di_idx in "${drain_indices[@]}"; do
                     local di_info="${ME_EVENT_MAP[$di_idx]:-}"
                     [[ -z "$di_info" ]] && continue
-                    local di_evt_id di_inst_id di_reason di_category di_lifecycle di_window_start di_hard_due di_can_resched di_evt_name di_inst_name di_k8s_node di_shape di_state di_instance_action di_additional
-                    IFS='|' read -r di_evt_id di_inst_id di_reason di_category di_lifecycle di_window_start di_hard_due di_can_resched di_evt_name di_inst_name di_k8s_node di_shape di_state di_instance_action di_additional <<< "$di_info"
+                    local di_evt_id di_inst_id di_reason di_category di_lifecycle di_window_start di_hard_due di_can_resched di_evt_name di_inst_name di_k8s_node di_shape di_state di_instance_action di_time_finished di_additional
+                    IFS='|' read -r di_evt_id di_inst_id di_reason di_category di_lifecycle di_window_start di_hard_due di_can_resched di_evt_name di_inst_name di_k8s_node di_shape di_state di_instance_action di_time_finished di_additional <<< "$di_info"
                     
                     if [[ "$di_k8s_node" == "N/A" || -z "$di_k8s_node" ]]; then
                         drain_skipped+=("$di_idx|$di_inst_name|not a K8s node")
@@ -5461,8 +5450,8 @@ list_maintenance_events() {
                 for cdi_idx in "${cd_indices[@]}"; do
                     local cdi_info="${ME_EVENT_MAP[$cdi_idx]:-}"
                     [[ -z "$cdi_info" ]] && continue
-                    local cdi_evt_id cdi_inst_id cdi_reason cdi_category cdi_lifecycle cdi_window_start cdi_hard_due cdi_can_resched cdi_evt_name cdi_inst_name cdi_k8s_node cdi_shape cdi_state cdi_instance_action cdi_additional
-                    IFS='|' read -r cdi_evt_id cdi_inst_id cdi_reason cdi_category cdi_lifecycle cdi_window_start cdi_hard_due cdi_can_resched cdi_evt_name cdi_inst_name cdi_k8s_node cdi_shape cdi_state cdi_instance_action cdi_additional <<< "$cdi_info"
+                    local cdi_evt_id cdi_inst_id cdi_reason cdi_category cdi_lifecycle cdi_window_start cdi_hard_due cdi_can_resched cdi_evt_name cdi_inst_name cdi_k8s_node cdi_shape cdi_state cdi_instance_action cdi_time_finished cdi_additional
+                    IFS='|' read -r cdi_evt_id cdi_inst_id cdi_reason cdi_category cdi_lifecycle cdi_window_start cdi_hard_due cdi_can_resched cdi_evt_name cdi_inst_name cdi_k8s_node cdi_shape cdi_state cdi_instance_action cdi_time_finished cdi_additional <<< "$cdi_info"
                     
                     if [[ "$cdi_k8s_node" == "N/A" || -z "$cdi_k8s_node" ]]; then
                         cd_skipped+=("$cdi_idx|$cdi_inst_name|not a K8s node")
@@ -5947,8 +5936,8 @@ list_maintenance_events() {
                     echo -e "${RED}Invalid event number: $si_idx${NC}"
                     continue
                 fi
-                local si_evt_id si_inst_id si_reason si_category si_lifecycle si_window_start si_hard_due si_can_resched si_evt_name si_inst_name si_k8s_node si_shape si_state si_instance_action si_additional
-                IFS='|' read -r si_evt_id si_inst_id si_reason si_category si_lifecycle si_window_start si_hard_due si_can_resched si_evt_name si_inst_name si_k8s_node si_shape si_state si_instance_action si_additional <<< "$si_info"
+                local si_evt_id si_inst_id si_reason si_category si_lifecycle si_window_start si_hard_due si_can_resched si_evt_name si_inst_name si_k8s_node si_shape si_state si_instance_action si_time_finished si_additional
+                IFS='|' read -r si_evt_id si_inst_id si_reason si_category si_lifecycle si_window_start si_hard_due si_can_resched si_evt_name si_inst_name si_k8s_node si_shape si_state si_instance_action si_time_finished si_additional <<< "$si_info"
                 if [[ "$si_can_resched" != "true" ]]; then
                     echo -e "${RED}Event #$si_idx cannot be rescheduled (can-reschedule: ${si_can_resched})${NC}"
                     continue
@@ -5974,8 +5963,8 @@ list_maintenance_events() {
                     echo -e "${RED}  Skipping invalid event #$bi${NC}"
                     continue
                 fi
-                local bi_evt_id bi_inst_id bi_reason bi_category bi_lifecycle bi_window_start bi_hard_due bi_can_resched bi_evt_name bi_inst_name bi_k8s_node bi_shape bi_state bi_instance_action bi_additional
-                IFS='|' read -r bi_evt_id bi_inst_id bi_reason bi_category bi_lifecycle bi_window_start bi_hard_due bi_can_resched bi_evt_name bi_inst_name bi_k8s_node bi_shape bi_state bi_instance_action bi_additional <<< "$bi_info"
+                local bi_evt_id bi_inst_id bi_reason bi_category bi_lifecycle bi_window_start bi_hard_due bi_can_resched bi_evt_name bi_inst_name bi_k8s_node bi_shape bi_state bi_instance_action bi_time_finished bi_additional
+                IFS='|' read -r bi_evt_id bi_inst_id bi_reason bi_category bi_lifecycle bi_window_start bi_hard_due bi_can_resched bi_evt_name bi_inst_name bi_k8s_node bi_shape bi_state bi_instance_action bi_time_finished bi_additional <<< "$bi_info"
                 
                 if [[ "$bi_can_resched" != "true" ]]; then
                     bulk_skipped_events+=("$bi|$bi_inst_name|$bi_evt_name|cannot reschedule")
@@ -6169,8 +6158,8 @@ list_maintenance_events() {
                 continue
             fi
             
-            local d_evt_id d_inst_id d_reason d_category d_lifecycle d_window_start d_hard_due d_can_resched d_evt_name d_inst_name d_k8s_node d_shape d_state d_instance_action d_additional
-            IFS='|' read -r d_evt_id d_inst_id d_reason d_category d_lifecycle d_window_start d_hard_due d_can_resched d_evt_name d_inst_name d_k8s_node d_shape d_state d_instance_action d_additional <<< "$detail_info"
+            local d_evt_id d_inst_id d_reason d_category d_lifecycle d_window_start d_hard_due d_can_resched d_evt_name d_inst_name d_k8s_node d_shape d_state d_instance_action d_time_finished d_additional
+            IFS='|' read -r d_evt_id d_inst_id d_reason d_category d_lifecycle d_window_start d_hard_due d_can_resched d_evt_name d_inst_name d_k8s_node d_shape d_state d_instance_action d_time_finished d_additional <<< "$detail_info"
             
             echo ""
             echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
@@ -6382,9 +6371,9 @@ list_all_announcements() {
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     _display_cache_info \
         "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
+    echo -e "${GRAY}oci announce announcements list --compartment-id \$COMPARTMENT_ID --all${NC}"
     echo ""
     
-    # Fetch announcements
     log_info "Fetching announcements from OCI..."
     
     # Force refresh of announcements cache
@@ -7975,6 +7964,7 @@ display_gpu_management_menu() {
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${MAGENTA}║                                              GPU MEMORY FABRIC & CLUSTER MANAGEMENT                                                                   ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GRAY}oci compute compute-gpu-memory-fabric list | oci compute compute-gpu-memory-cluster list --compartment-id \$COMPARTMENT_ID${NC}"
     echo ""
     
     # ========== ENVIRONMENT INFO ==========
@@ -8184,8 +8174,16 @@ display_gpu_management_menu() {
 interactive_management_main_menu() {
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     local region="${EFFECTIVE_REGION:-$REGION}"
+    local direct_choice="${1:-}"  # Optional: jump directly to this menu item
     
     while true; do
+        
+        # If a direct choice was passed (e.g. --manage 10), skip menu display on first pass
+        local choice
+        if [[ -n "$direct_choice" ]]; then
+            choice="$direct_choice"
+            direct_choice=""  # Clear so subsequent loops show the full menu
+        else
         echo ""
         echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${BOLD}${BLUE}║                                                    OCI RESOURCE MANAGEMENT                                                                            ║${NC}"
@@ -8241,8 +8239,8 @@ interactive_management_main_menu() {
         echo ""
         echo -n -e "${BOLD}${CYAN}Enter selection [o, 1-21, c, q]: ${NC}"
         
-        local choice
         read -r choice
+        fi
         
         # Empty input exits
         if [[ -z "$choice" ]]; then
@@ -8655,6 +8653,7 @@ manage_compartments() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                                         COMPARTMENT MANAGEMENT                                                                         ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci iam compartment list --compartment-id \$TENANCY_ID --all | oci iam tenancy get --tenancy-id \$TENANCY_ID${NC}"
         echo ""
         
         # Show Tenancy (Root) Information prominently
@@ -9261,10 +9260,9 @@ manage_identity_domains() {
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${GREEN}                                                     IDENTITY DOMAINS MANAGEMENT                                                                        ${NC}"
         echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci iam domain list --compartment-id \$TENANCY_ID --all${NC}"
         echo ""
         
-        local cmd="oci iam domain list --compartment-id \"$tenancy_id\" --all"
-        echo -e "  ${GRAY}Command: ${cmd}${NC}"
         echo -e "${GRAY}Fetching identity domains...${NC}"
         
         local domains_json
@@ -9303,7 +9301,7 @@ manage_identity_domains() {
         declare -A _DOM_NAMES
         declare -A _DOM_URLS
         
-        while IFS=$'\t' read -r d_name d_type d_license d_state d_url d_id d_is_default d_compartment; do
+        while IFS=$'\t' read -r d_name d_type d_license d_state d_url d_id d_is_default d_compartment d_replicas d_home_region; do
             ((idx++))
             _DOM_IDS[$idx]="$d_id"
             _DOM_NAMES[$idx]="$d_name"
@@ -9317,7 +9315,12 @@ manage_identity_domains() {
             [[ "$d_is_default" == "true" ]] && default_tag=" ${CYAN}(default)${NC}"
             
             printf "${YELLOW}%-3s${NC}  ${WHITE}%-35s${NC}  ${CYAN}%-12s${NC}  %-15s  ${state_color}%-10s${NC}  ${GRAY}%s${NC}%b\n" \
-                "$idx" "${d_name:0:35}" "${d_type:0:12}" "${d_license:0:15}" "$d_state" "${d_url:0:44}" "$default_tag"
+                "$idx" "${d_name:0:35}" "${d_type:0:12}" "${d_license:0:15}" "$d_state" "$d_url" "$default_tag"
+            
+            # Show replica regions sub-line
+            if [[ -n "$d_replicas" && "$d_replicas" != "-" ]]; then
+                printf "     └─${CYAN}Replica:${NC} ${WHITE}%s${NC}  ${GRAY}(home: %s)${NC}\n" "$d_replicas" "$d_home_region"
+            fi
         done < <(echo "$domains_json" | jq -r '
             (.data // [])[] |
             [
@@ -9328,7 +9331,9 @@ manage_identity_domains() {
                 (.url // "N/A"),
                 (.id // "N/A"),
                 ((.["is-default"] // false) | tostring),
-                (.["compartment-id"] // "N/A")
+                (.["compartment-id"] // "N/A"),
+                ((.["replica-regions"] // []) | map(.region // empty) | join("  ") | if . == "" then "-" else . end),
+                (.["home-region"] // "N/A")
             ] | @tsv
         ' 2>/dev/null)
         
@@ -9392,7 +9397,15 @@ _identity_domain_submenu() {
         echo -e "  ${YELLOW}10${NC}) ${WHITE}Create Group${NC}                  - Create a new group in this domain"
         echo -e "  ${YELLOW}11${NC}) ${WHITE}Create Dynamic Group${NC}          - Create a new dynamic group"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Domain: ${domain_name}] Enter selection [1-11, back]: ${NC}"
+        echo -e "${BOLD}${BLUE}─── Update ───${NC}"
+        echo -e "  ${YELLOW}12${NC}) ${WHITE}Update User${NC}                   - Update user attributes (active, email, name)"
+        echo -e "  ${YELLOW}13${NC}) ${WHITE}Update Group${NC}                  - Update group (name, description, members)"
+        echo -e "  ${YELLOW}14${NC}) ${WHITE}Update Dynamic Group${NC}          - Update dynamic group (name, description, rule)"
+        echo ""
+        echo -e "${BOLD}${BLUE}─── Replication ───${NC}"
+        echo -e "  ${YELLOW}15${NC}) ${WHITE}Replica Regions${NC}               - View replicas / enable replication to new region"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Domain: ${domain_name}] Enter selection [1-15, back]: ${NC}"
         read -r sub_choice
         
         case "$sub_choice" in
@@ -9410,6 +9423,10 @@ _identity_domain_submenu() {
             9)  _identity_create_user "$domain_url" "$tenancy_id" "$domain_name" ;;
             10) _identity_create_group "$domain_url" "$tenancy_id" ;;
             11) _identity_create_dynamic_group "$domain_url" "$tenancy_id" ;;
+            12) _identity_update_user "$domain_url" "$tenancy_id" "$domain_name" ;;
+            13) _identity_update_group "$domain_url" "$tenancy_id" "$domain_name" ;;
+            14) _identity_update_dynamic_group "$domain_url" "$tenancy_id" "$domain_name" ;;
+            15) _identity_replica_regions "$domain_id" "$domain_name" "$tenancy_id" ;;
             *)
                 echo -e "${RED}Invalid selection${NC}"
                 sleep 1
@@ -9425,8 +9442,7 @@ _identity_domain_detail() {
     local domain_id="$1"
     
     echo ""
-    local cmd="oci iam domain get --domain-id \"$domain_id\""
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci iam domain get --domain-id \"${domain_id}\"${NC}"
     echo -e "${GRAY}Fetching domain details...${NC}"
     
     local detail_json
@@ -9471,7 +9487,7 @@ _identity_domain_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Users (oci identity-domains user list)
+# List Users (oci identity-domains users list)
 # Groups are embedded in user SCIM response - no N+1 membership queries needed
 #--------------------------------------------------------------------------------
 _identity_list_users() {
@@ -9480,15 +9496,14 @@ _identity_list_users() {
     local domain_name="$3"
     
     echo ""
-    local cmd="oci identity-domains user list --endpoint \"$domain_url\" --attribute-sets all --all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains users list --endpoint \"${domain_url}\" --attribute-sets all --all${NC}"
     echo -e "${GRAY}Fetching users from identity domain...${NC}"
     
     local users_json
-    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
     
     if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch users. Check permissions (identity-domains user list).${NC}"
+        echo -e "${RED}Failed to fetch users. Check permissions (identity-domains users list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
@@ -9549,7 +9564,7 @@ _identity_list_users() {
 }
 
 #--------------------------------------------------------------------------------
-# User Detail View (oci identity-domains user get)
+# User Detail View (oci identity-domains users get)
 # Groups are embedded - no separate membership query needed
 #--------------------------------------------------------------------------------
 _identity_user_detail() {
@@ -9559,12 +9574,11 @@ _identity_user_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains user get --user-id \"$user_id\" --endpoint \"$domain_url\" --attribute-sets all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains users get --user-id \"${user_id}\" --endpoint \"${domain_url}\" --attribute-sets all${NC}"
     echo -e "${GRAY}Fetching user details...${NC}"
     
     local user_json
-    user_json=$(oci identity-domains user get --user-id "$user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+    user_json=$(oci identity-domains users get --user-id "$user_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
     if [[ -z "$user_json" ]]; then
         echo -e "${RED}Failed to fetch user details${NC}"
@@ -9878,7 +9892,7 @@ USER_POL_SEARCH_EOF
 }
 
 #--------------------------------------------------------------------------------
-# List Groups with Member Count (oci identity-domains group list)
+# List Groups with Member Count (oci identity-domains groups list)
 # Members are embedded in SCIM group response
 #--------------------------------------------------------------------------------
 _identity_list_groups() {
@@ -9887,15 +9901,14 @@ _identity_list_groups() {
     local domain_name="$3"
     
     echo ""
-    local cmd="oci identity-domains group list --endpoint \"$domain_url\" --attribute-sets all --all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains groups list --endpoint \"${domain_url}\" --all${NC}"
     echo -e "${GRAY}Fetching groups from identity domain...${NC}"
     
     local groups_json
-    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch groups. Check permissions (identity-domains group list).${NC}"
+        echo -e "${RED}Failed to fetch groups. Check permissions (identity-domains groups list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
@@ -9957,7 +9970,7 @@ _identity_list_groups() {
 }
 
 #--------------------------------------------------------------------------------
-# Group Detail View (oci identity-domains group get)
+# Group Detail View (oci identity-domains groups get)
 # Members are embedded - no separate user-group-membership query needed
 #--------------------------------------------------------------------------------
 _identity_group_detail() {
@@ -9967,13 +9980,12 @@ _identity_group_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains group get --group-id \"$group_id\" --endpoint \"$domain_url\" --attribute-sets all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains groups get --group-id \"${group_id}\" --endpoint \"${domain_url}\" --attribute-sets all${NC}"
     echo -e "${BOLD}${WHITE}═══ Group Details: ${MAGENTA}${group_name}${WHITE} ═══${NC}"
     echo ""
     
     local group_json
-    group_json=$(oci identity-domains group get --group-id "$group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+    group_json=$(oci identity-domains groups get --group-id "$group_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
     
     if [[ -n "$group_json" ]]; then
         echo "$group_json" | jq -r '
@@ -10036,22 +10048,21 @@ _identity_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Dynamic Groups (oci identity-domains dynamic-resource-group list)
+# List Dynamic Groups (oci identity-domains dynamic-resource-groups list)
 #--------------------------------------------------------------------------------
 _identity_list_dynamic_groups() {
     local domain_url="$1"
     local tenancy_id="$2"
     
     echo ""
-    local cmd="oci identity-domains dynamic-resource-group list --endpoint \"$domain_url\" --all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains dynamic-resource-groups list --endpoint \"${domain_url}\" --all${NC}"
     echo -e "${GRAY}Fetching dynamic groups from identity domain...${NC}"
     
     local dg_json
-    dg_json=$(oci identity-domains dynamic-resource-group list --endpoint "$domain_url" --all --output json 2>/dev/null)
+    dg_json=$(oci identity-domains dynamic-resource-groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.resources' > /dev/null 2>&1; then
-        echo -e "${RED}Failed to fetch dynamic groups. Check permissions (identity-domains dynamic-resource-group list).${NC}"
+        echo -e "${RED}Failed to fetch dynamic groups. Check permissions (identity-domains dynamic-resource-groups list).${NC}"
         echo -e "Press Enter to continue..."
         read -r
         return
@@ -10113,7 +10124,7 @@ _identity_list_dynamic_groups() {
 }
 
 #--------------------------------------------------------------------------------
-# Dynamic Group Detail View (oci identity-domains dynamic-resource-group get)
+# Dynamic Group Detail View (oci identity-domains dynamic-resource-groups get)
 #--------------------------------------------------------------------------------
 _identity_dynamic_group_detail() {
     local dg_id="$1"
@@ -10122,10 +10133,9 @@ _identity_dynamic_group_detail() {
     local tenancy_id="$4"
     
     echo ""
-    local cmd="oci identity-domains dynamic-resource-group get --dynamic-resource-group-id \"$dg_id\" --endpoint \"$domain_url\""
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains dynamic-resource-groups get --dynamic-resource-group-id \"${dg_id}\" --endpoint \"${domain_url}\"${NC}"
     local dg_json
-    dg_json=$(oci identity-domains dynamic-resource-group get --dynamic-resource-group-id "$dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
+    dg_json=$(oci identity-domains dynamic-resource-groups get --dynamic-resource-group-id "$dg_id" --endpoint "$domain_url" --output json 2>/dev/null)
     
     if [[ -z "$dg_json" ]]; then
         echo -e "${RED}Failed to fetch dynamic group details${NC}"
@@ -10183,18 +10193,17 @@ _identity_dynamic_group_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# List Identity Providers (oci identity-domains identity-provider list)
+# List Identity Providers (oci identity-domains identity-providers list)
 #--------------------------------------------------------------------------------
 _identity_list_identity_providers() {
     local domain_url="$1"
     
     echo ""
-    local cmd="oci identity-domains identity-provider list --endpoint \"$domain_url\" --all"
-    echo -e "  ${GRAY}Command: ${cmd}${NC}"
+    echo -e "${GRAY}oci identity-domains identity-providers list --endpoint \"${domain_url}\" --all${NC}"
     echo -e "${GRAY}Fetching identity providers from domain...${NC}"
     
     local idp_json
-    idp_json=$(oci identity-domains identity-provider list --endpoint "$domain_url" --all --output json 2>/dev/null)
+    idp_json=$(oci identity-domains identity-providers list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     echo ""
     echo -e "${BOLD}${WHITE}═══ Identity Providers / Federation ═══${NC}"
@@ -10241,7 +10250,7 @@ _identity_list_identity_providers() {
 }
 
 #--------------------------------------------------------------------------------
-# Search Users by keyword (oci identity-domains user list + client filter)
+# Search Users by keyword (oci identity-domains users list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_users() {
     local domain_url="$1"
@@ -10259,7 +10268,7 @@ _identity_search_users() {
     echo -e "${GRAY}Searching users for '${search_kw}'...${NC}"
     
     local users_json
-    users_json=$(oci identity-domains user list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
     
     if [[ -z "$users_json" ]]; then
         echo -e "${RED}Failed to fetch users${NC}"
@@ -10328,7 +10337,7 @@ _identity_search_users() {
 }
 
 #--------------------------------------------------------------------------------
-# Search Groups by keyword (oci identity-domains group list + client filter)
+# Search Groups by keyword (oci identity-domains groups list + client filter)
 #--------------------------------------------------------------------------------
 _identity_search_groups() {
     local domain_url="$1"
@@ -10346,7 +10355,7 @@ _identity_search_groups() {
     echo -e "${GRAY}Searching groups for '${search_kw}'...${NC}"
     
     local groups_json
-    groups_json=$(oci identity-domains group list --endpoint "$domain_url" --all --output json 2>/dev/null)
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
     
     if [[ -z "$groups_json" ]]; then
         echo -e "${RED}Failed to fetch groups${NC}"
@@ -10550,7 +10559,7 @@ SEARCH_POL_EOF
 }
 
 #--------------------------------------------------------------------------------
-# Create User (oci identity-domains user create)
+# Create User (oci identity-domains users create)
 #--------------------------------------------------------------------------------
 _identity_create_user() {
     local domain_url="$1"
@@ -10586,7 +10595,7 @@ _identity_create_user() {
     local name_json="{\"givenName\":\"$new_first_name\",\"familyName\":\"$new_last_name\"}"
     local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:User"]'
     
-    local create_cmd="oci identity-domains user create --endpoint \"$domain_url\" --schemas '$schemas_json' --user-name \"$new_user_name\" --name '$name_json'"
+    local create_cmd="oci identity-domains users create --endpoint \"$domain_url\" --schemas '$schemas_json' --user-name \"$new_user_name\" --name '$name_json'"
     [[ -n "$new_user_email" ]] && create_cmd+=" --emails '[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]'"
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
@@ -10594,8 +10603,8 @@ _identity_create_user() {
     read -r confirm
     
     if [[ "${confirm,,}" == "y" ]]; then
-        local log_file="${LOG_DIR}/identity_actions.log"
-        mkdir -p "$LOG_DIR"
+        local log_file="${LOGS_DIR}/identity_actions.log"
+        mkdir -p "$LOGS_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
@@ -10604,7 +10613,7 @@ _identity_create_user() {
         [[ -n "$new_user_email" ]] && email_arg="--emails [$(printf '{"value":"%s","primary":true,"type":"work"}' "$new_user_email")]"
         
         if [[ -n "$new_user_email" ]]; then
-            result=$(oci identity-domains user create \
+            result=$(oci identity-domains users create \
                 --endpoint "$domain_url" \
                 --schemas "$schemas_json" \
                 --user-name "$new_user_name" \
@@ -10612,7 +10621,7 @@ _identity_create_user() {
                 --emails "[{\"value\":\"$new_user_email\",\"primary\":true,\"type\":\"work\"}]" \
                 --output json 2>&1)
         else
-            result=$(oci identity-domains user create \
+            result=$(oci identity-domains users create \
                 --endpoint "$domain_url" \
                 --schemas "$schemas_json" \
                 --user-name "$new_user_name" \
@@ -10643,7 +10652,7 @@ _identity_create_user() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Group (oci identity-domains group create)
+# Create Group (oci identity-domains groups create)
 #--------------------------------------------------------------------------------
 _identity_create_group() {
     local domain_url="$1"
@@ -10663,20 +10672,20 @@ _identity_create_group() {
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
     local schemas_json='["urn:ietf:params:scim:schemas:core:2.0:Group"]'
-    local create_cmd="oci identity-domains group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_group_name\""
+    local create_cmd="oci identity-domains groups create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_group_name\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
     read -r confirm
     
     if [[ "${confirm,,}" == "y" ]]; then
-        local log_file="${LOG_DIR}/identity_actions.log"
-        mkdir -p "$LOG_DIR"
+        local log_file="${LOGS_DIR}/identity_actions.log"
+        mkdir -p "$LOGS_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
         local result
-        result=$(oci identity-domains group create \
+        result=$(oci identity-domains groups create \
             --endpoint "$domain_url" \
             --schemas "$schemas_json" \
             --display-name "$new_group_name" \
@@ -10705,7 +10714,7 @@ _identity_create_group() {
 }
 
 #--------------------------------------------------------------------------------
-# Create Dynamic Group (oci identity-domains dynamic-resource-group create)
+# Create Dynamic Group (oci identity-domains dynamic-resource-groups create)
 #--------------------------------------------------------------------------------
 _identity_create_dynamic_group() {
     local domain_url="$1"
@@ -10739,20 +10748,20 @@ _identity_create_dynamic_group() {
     echo ""
     echo -e "${BOLD}${WHITE}Command to execute:${NC}"
     local schemas_json='["urn:ietf:params:scim:schemas:oracle:idcs:DynamicResourceGroup"]'
-    local create_cmd="oci identity-domains dynamic-resource-group create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
+    local create_cmd="oci identity-domains dynamic-resource-groups create --endpoint \"$domain_url\" --schemas '$schemas_json' --display-name \"$new_dg_name\" --description \"$new_dg_desc\" --matching-rule \"$new_dg_rule\""
     echo -e "  ${CYAN}${create_cmd}${NC}"
     echo ""
     echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
     read -r confirm
     
     if [[ "${confirm,,}" == "y" ]]; then
-        local log_file="${LOG_DIR}/identity_actions.log"
-        mkdir -p "$LOG_DIR"
+        local log_file="${LOGS_DIR}/identity_actions.log"
+        mkdir -p "$LOGS_DIR"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $create_cmd" >> "$log_file"
         echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
         
         local result
-        result=$(oci identity-domains dynamic-resource-group create \
+        result=$(oci identity-domains dynamic-resource-groups create \
             --endpoint "$domain_url" \
             --schemas "$schemas_json" \
             --display-name "$new_dg_name" \
@@ -10780,6 +10789,837 @@ _identity_create_dynamic_group() {
     echo ""
     echo -e "Press Enter to continue..."
     read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update User (oci identity-domains users patch)
+# Lists users, lets you select one, then update attributes
+#--------------------------------------------------------------------------------
+_identity_update_user() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update User (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
+    echo -e "${GRAY}oci identity-domains users list --endpoint \"${domain_url}\" --attribute-sets all --all${NC}"
+    echo ""
+    echo -e "${GRAY}Fetching users...${NC}"
+    
+    local users_json
+    users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+    
+    if [[ -z "$users_json" ]] || ! echo "$users_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch users${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    local idx=0
+    declare -A _UPD_USR_IDS
+    declare -A _UPD_USR_NAMES
+    
+    printf "${BOLD}%-3s  %-30s  %-35s  %-10s${NC}\n" \
+        "#" "Username" "Email" "Active"
+    printf "${WHITE}%-3s  %-30s  %-35s  %-10s${NC}\n" \
+        "---" "------------------------------" "-----------------------------------" "----------"
+    
+    while IFS=$'\t' read -r u_name u_email u_active u_id; do
+        [[ -z "$u_name" ]] && continue
+        ((idx++))
+        _UPD_USR_IDS[$idx]="$u_id"
+        _UPD_USR_NAMES[$idx]="$u_name"
+        
+        local state_color="$GREEN"
+        [[ "$u_active" != "true" ]] && state_color="$RED"
+        
+        printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}  ${state_color}%-10s${NC}\n" \
+            "$idx" "${u_name:0:30}" "${u_email:0:35}" "$u_active"
+    done < <(echo "$users_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["user-name"] // "N/A"),
+            ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
+            (if .active then "true" else "false" end),
+            (.id // "N/A")
+        ] | @tsv
+    ' 2>/dev/null)
+    
+    if [[ $idx -eq 0 ]]; then
+        echo -e "  ${YELLOW}No users found${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select user # to update: ${NC}"
+    local uchoice
+    read -r uchoice
+    
+    if ! [[ "$uchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_USR_IDS[$uchoice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 1
+        return
+    fi
+    
+    local sel_id="${_UPD_USR_IDS[$uchoice]}"
+    local sel_name="${_UPD_USR_NAMES[$uchoice]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Updating user: ${GREEN}${sel_name}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1${NC}) Toggle active/inactive"
+    echo -e "  ${YELLOW}2${NC}) Update email"
+    echo -e "  ${YELLOW}3${NC}) Update display name"
+    echo ""
+    echo -n -e "${CYAN}Select update [1-3]: ${NC}"
+    local upd_choice
+    read -r upd_choice
+    
+    local patch_body="" patch_cmd=""
+    local log_file="${LOGS_DIR}/identity_actions.log"
+    mkdir -p "$LOGS_DIR"
+    
+    case "$upd_choice" in
+        1)
+            # Get current state
+            local cur_active
+            cur_active=$(echo "$users_json" | jq -r --arg id "$sel_id" '(.resources // [])[] | select(.id == $id) | .active' 2>/dev/null)
+            local new_active="true"
+            [[ "$cur_active" == "true" ]] && new_active="false"
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"active\",\"value\":${new_active}}]}"
+            patch_cmd="oci identity-domains users patch --user-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '${patch_body}'"
+            echo -e "  ${WHITE}Toggle active: ${cur_active} → ${new_active}${NC}"
+            ;;
+        2)
+            echo -n -e "  ${WHITE}New email: ${NC}"
+            local new_email
+            read -r new_email
+            [[ -z "$new_email" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"emails\",\"value\":[{\"value\":\"${new_email}\",\"primary\":true,\"type\":\"work\"}]}]}"
+            patch_cmd="oci identity-domains users patch --user-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...emails...'"
+            ;;
+        3)
+            echo -n -e "  ${WHITE}New display name: ${NC}"
+            local new_display
+            read -r new_display
+            [[ -z "$new_display" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"displayName\",\"value\":\"${new_display}\"}]}"
+            patch_cmd="oci identity-domains users patch --user-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...displayName...'"
+            ;;
+        *)
+            echo -e "${RED}Invalid selection${NC}"
+            sleep 1
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    echo -e "  ${CYAN}${patch_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "${confirm,,}" == "y" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $patch_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+        
+        local result
+        result=$(oci identity-domains users patch \
+            --user-id "$sel_id" \
+            --endpoint "$domain_url" \
+            --body "$patch_body" \
+            --output json 2>&1)
+        
+        if echo "$result" | jq -e '.["user-name"] // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} User ${WHITE}${sel_name}${NC} updated successfully"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated user $sel_name" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update user${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update Group (oci identity-domains groups patch)
+# Lists groups, lets you select one, then update attributes or members
+#--------------------------------------------------------------------------------
+_identity_update_group() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update Group (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
+    echo -e "${GRAY}oci identity-domains groups list --endpoint \"${domain_url}\" --all${NC}"
+    echo ""
+    echo -e "${GRAY}Fetching groups...${NC}"
+    
+    local groups_json
+    groups_json=$(oci identity-domains groups list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+    
+    if [[ -z "$groups_json" ]] || ! echo "$groups_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch groups${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    local idx=0
+    declare -A _UPD_GRP_IDS
+    declare -A _UPD_GRP_NAMES
+    
+    printf "${BOLD}%-3s  %-40s  %-8s  %s${NC}\n" \
+        "#" "Group Name" "Members" "Description"
+    printf "${WHITE}%-3s  %-40s  %-8s  %s${NC}\n" \
+        "---" "----------------------------------------" "--------" "-------------------------------------------"
+    
+    while IFS=$'\t' read -r g_name g_id g_member_count g_desc; do
+        [[ -z "$g_name" ]] && continue
+        ((idx++))
+        _UPD_GRP_IDS[$idx]="$g_id"
+        _UPD_GRP_NAMES[$idx]="$g_name"
+        
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${CYAN}%-8s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${g_name:0:40}" "$g_member_count" "${g_desc:0:43}"
+    done < <(echo "$groups_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["display-name"] // "N/A"),
+            (.id // "N/A"),
+            ((.members // []) | length | tostring),
+            (.description // "-")
+        ] | @tsv
+    ' 2>/dev/null)
+    
+    if [[ $idx -eq 0 ]]; then
+        echo -e "  ${YELLOW}No groups found${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select group # to update: ${NC}"
+    local gchoice
+    read -r gchoice
+    
+    if ! [[ "$gchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_GRP_IDS[$gchoice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 1
+        return
+    fi
+    
+    local sel_id="${_UPD_GRP_IDS[$gchoice]}"
+    local sel_name="${_UPD_GRP_NAMES[$gchoice]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Updating group: ${MAGENTA}${sel_name}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1${NC}) Update display name"
+    echo -e "  ${YELLOW}2${NC}) Update description"
+    echo -e "  ${YELLOW}3${NC}) Add member (user)"
+    echo -e "  ${YELLOW}4${NC}) Remove member (user)"
+    echo ""
+    echo -n -e "${CYAN}Select update [1-4]: ${NC}"
+    local upd_choice
+    read -r upd_choice
+    
+    local patch_body="" patch_cmd=""
+    local log_file="${LOGS_DIR}/identity_actions.log"
+    mkdir -p "$LOGS_DIR"
+    
+    case "$upd_choice" in
+        1)
+            echo -n -e "  ${WHITE}New display name: ${NC}"
+            local new_name
+            read -r new_name
+            [[ -z "$new_name" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"displayName\",\"value\":\"${new_name}\"}]}"
+            patch_cmd="oci identity-domains groups patch --group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...displayName...'"
+            ;;
+        2)
+            echo -n -e "  ${WHITE}New description: ${NC}"
+            local new_desc
+            read -r new_desc
+            [[ -z "$new_desc" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"description\",\"value\":\"${new_desc}\"}]}"
+            patch_cmd="oci identity-domains groups patch --group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...description...'"
+            ;;
+        3)
+            # List users to add
+            echo -e "${GRAY}Fetching users...${NC}"
+            local users_json
+            users_json=$(oci identity-domains users list --endpoint "$domain_url" --attribute-sets all --all --output json 2>/dev/null)
+            
+            if [[ -z "$users_json" ]]; then
+                echo -e "${RED}Failed to fetch users${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            local uidx=0
+            declare -A _ADD_MEM_IDS
+            declare -A _ADD_MEM_NAMES
+            
+            printf "${BOLD}%-3s  %-30s  %-35s${NC}\n" "#" "Username" "Email"
+            printf "${WHITE}%-3s  %-30s  %-35s${NC}\n" "---" "------------------------------" "-----------------------------------"
+            
+            while IFS=$'\t' read -r u_name u_email u_id; do
+                [[ -z "$u_name" ]] && continue
+                ((uidx++))
+                _ADD_MEM_IDS[$uidx]="$u_id"
+                _ADD_MEM_NAMES[$uidx]="$u_name"
+                printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%-35s${NC}\n" "$uidx" "${u_name:0:30}" "${u_email:0:35}"
+            done < <(echo "$users_json" | jq -r '
+                (.resources // [])[] | select(.active == true) |
+                [
+                    (.["user-name"] // "N/A"),
+                    ((.emails // []) | (map(select(.primary == true)) | .[0].value) // .[0].value // "N/A"),
+                    (.id // "N/A")
+                ] | @tsv
+            ' 2>/dev/null)
+            
+            echo ""
+            echo -n -e "${CYAN}Select user # to add: ${NC}"
+            local mem_choice
+            read -r mem_choice
+            
+            if ! [[ "$mem_choice" =~ ^[0-9]+$ ]] || [[ -z "${_ADD_MEM_IDS[$mem_choice]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                return
+            fi
+            
+            local mem_id="${_ADD_MEM_IDS[$mem_choice]}"
+            local mem_name="${_ADD_MEM_NAMES[$mem_choice]}"
+            
+            # Get the OCID of the user for proper member reference
+            local mem_ocid
+            mem_ocid=$(echo "$users_json" | jq -r --arg id "$mem_id" '(.resources // [])[] | select(.id == $id) | .ocid // .id' 2>/dev/null)
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"${mem_id}\",\"type\":\"User\"}]}]}"
+            patch_cmd="oci identity-domains groups patch --group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...add member ${mem_name}...'"
+            echo -e "  ${WHITE}Adding user ${GREEN}${mem_name}${WHITE} to group ${MAGENTA}${sel_name}${NC}"
+            ;;
+        4)
+            # List current members to remove
+            local grp_detail
+            grp_detail=$(oci identity-domains groups get --group-id "$sel_id" --endpoint "$domain_url" --attribute-sets all --output json 2>/dev/null)
+            
+            if [[ -z "$grp_detail" ]]; then
+                echo -e "${RED}Failed to fetch group details${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                return
+            fi
+            
+            local mem_count
+            mem_count=$(echo "$grp_detail" | jq '(.members // []) | length' 2>/dev/null)
+            
+            if [[ "$mem_count" -eq 0 || "$mem_count" == "null" ]]; then
+                echo -e "  ${YELLOW}Group has no members to remove${NC}"
+                echo -e "Press Enter to continue..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            local ridx=0
+            declare -A _REM_MEM_IDS
+            declare -A _REM_MEM_NAMES
+            
+            printf "${BOLD}%-3s  %-30s  %s${NC}\n" "#" "Member Name" "SCIM ID"
+            printf "${WHITE}%-3s  %-30s  %s${NC}\n" "---" "------------------------------" "-------------------------------------------"
+            
+            while IFS=$'\t' read -r mname mval; do
+                [[ -z "$mname" ]] && continue
+                ((ridx++))
+                _REM_MEM_IDS[$ridx]="$mval"
+                _REM_MEM_NAMES[$ridx]="$mname"
+                printf "${YELLOW}%-3s${NC}  ${WHITE}%-30s${NC}  ${GRAY}%s${NC}\n" "$ridx" "${mname:0:30}" "$mval"
+            done < <(echo "$grp_detail" | jq -r '(.members // [])[] | [.name // .display // "N/A", .value // "N/A"] | @tsv' 2>/dev/null)
+            
+            echo ""
+            echo -n -e "${CYAN}Select member # to remove: ${NC}"
+            local rem_choice
+            read -r rem_choice
+            
+            if ! [[ "$rem_choice" =~ ^[0-9]+$ ]] || [[ -z "${_REM_MEM_IDS[$rem_choice]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                return
+            fi
+            
+            local rem_id="${_REM_MEM_IDS[$rem_choice]}"
+            local rem_name="${_REM_MEM_NAMES[$rem_choice]}"
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"remove\",\"path\":\"members[value eq \\\"${rem_id}\\\"]\"}]}"
+            patch_cmd="oci identity-domains groups patch --group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...remove member ${rem_name}...'"
+            echo -e "  ${WHITE}Removing user ${RED}${rem_name}${WHITE} from group ${MAGENTA}${sel_name}${NC}"
+            ;;
+        *)
+            echo -e "${RED}Invalid selection${NC}"
+            sleep 1
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    echo -e "  ${CYAN}${patch_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "${confirm,,}" == "y" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $patch_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+        
+        local result
+        result=$(oci identity-domains groups patch \
+            --group-id "$sel_id" \
+            --endpoint "$domain_url" \
+            --body "$patch_body" \
+            --output json 2>&1)
+        
+        if echo "$result" | jq -e '.["display-name"] // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} Group ${MAGENTA}${sel_name}${NC} updated successfully"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated group $sel_name" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update group${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Update Dynamic Group (oci identity-domains dynamic-resource-groups patch)
+# Lists dynamic groups, lets you select one, then update attributes
+#--------------------------------------------------------------------------------
+_identity_update_dynamic_group() {
+    local domain_url="$1"
+    local tenancy_id="$2"
+    local domain_name="$3"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ Update Dynamic Group (Identity Domain: ${CYAN}${domain_name}${WHITE}) ═══${NC}"
+    echo -e "${GRAY}oci identity-domains dynamic-resource-groups list --endpoint \"${domain_url}\" --all${NC}"
+    echo ""
+    echo -e "${GRAY}Fetching dynamic groups...${NC}"
+    
+    local dg_json
+    dg_json=$(oci identity-domains dynamic-resource-groups list --endpoint "$domain_url" --all --output json 2>/dev/null)
+    
+    if [[ -z "$dg_json" ]] || ! echo "$dg_json" | jq -e '.resources' > /dev/null 2>&1; then
+        echo -e "${RED}Failed to fetch dynamic groups${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    local idx=0
+    declare -A _UPD_DG_IDS
+    declare -A _UPD_DG_NAMES
+    
+    printf "${BOLD}%-3s  %-40s  %-10s  %s${NC}\n" \
+        "#" "Dynamic Group Name" "Active" "Matching Rule"
+    printf "${WHITE}%-3s  %-40s  %-10s  %s${NC}\n" \
+        "---" "----------------------------------------" "----------" "────────────────────────────────────────────────────────────────"
+    
+    while IFS=$'\t' read -r dg_name dg_active dg_id dg_rule; do
+        [[ -z "$dg_name" ]] && continue
+        ((idx++))
+        _UPD_DG_IDS[$idx]="$dg_id"
+        _UPD_DG_NAMES[$idx]="$dg_name"
+        
+        local state_color="$GREEN"
+        [[ "$dg_active" != "true" ]] && state_color="$YELLOW"
+        
+        printf "${YELLOW}%-3s${NC}  ${MAGENTA}%-40s${NC}  ${state_color}%-10s${NC}  ${GRAY}%s${NC}\n" \
+            "$idx" "${dg_name:0:40}" "$dg_active" "${dg_rule:0:65}"
+    done < <(echo "$dg_json" | jq -r '
+        (.resources // [])[] |
+        [
+            (.["display-name"] // "N/A"),
+            (if .active // true then "true" else "false" end),
+            (.id // "N/A"),
+            (.["matching-rule"] // "N/A")
+        ] | @tsv
+    ' 2>/dev/null)
+    
+    if [[ $idx -eq 0 ]]; then
+        echo -e "  ${YELLOW}No dynamic groups found${NC}"
+        echo -e "Press Enter to continue..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -n -e "${CYAN}Select dynamic group # to update: ${NC}"
+    local dgchoice
+    read -r dgchoice
+    
+    if ! [[ "$dgchoice" =~ ^[0-9]+$ ]] || [[ -z "${_UPD_DG_IDS[$dgchoice]:-}" ]]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 1
+        return
+    fi
+    
+    local sel_id="${_UPD_DG_IDS[$dgchoice]}"
+    local sel_name="${_UPD_DG_NAMES[$dgchoice]}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Updating dynamic group: ${MAGENTA}${sel_name}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1${NC}) Update display name"
+    echo -e "  ${YELLOW}2${NC}) Update description"
+    echo -e "  ${YELLOW}3${NC}) Update matching rule"
+    echo ""
+    echo -n -e "${CYAN}Select update [1-3]: ${NC}"
+    local upd_choice
+    read -r upd_choice
+    
+    local patch_body="" patch_cmd=""
+    local log_file="${LOGS_DIR}/identity_actions.log"
+    mkdir -p "$LOGS_DIR"
+    
+    case "$upd_choice" in
+        1)
+            echo -n -e "  ${WHITE}New display name: ${NC}"
+            local new_name
+            read -r new_name
+            [[ -z "$new_name" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"displayName\",\"value\":\"${new_name}\"}]}"
+            patch_cmd="oci identity-domains dynamic-resource-groups patch --dynamic-resource-group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...displayName...'"
+            ;;
+        2)
+            echo -n -e "  ${WHITE}New description: ${NC}"
+            local new_desc
+            read -r new_desc
+            [[ -z "$new_desc" ]] && return
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"description\",\"value\":\"${new_desc}\"}]}"
+            patch_cmd="oci identity-domains dynamic-resource-groups patch --dynamic-resource-group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...description...'"
+            ;;
+        3)
+            # Show current rule
+            local cur_rule
+            cur_rule=$(echo "$dg_json" | jq -r --arg id "$sel_id" '(.resources // [])[] | select(.id == $id) | .["matching-rule"] // "N/A"' 2>/dev/null)
+            echo -e "  ${GRAY}Current rule: ${cur_rule}${NC}"
+            echo ""
+            echo -e "  ${CYAN}Matching rule examples:${NC}"
+            echo -e "    ${GRAY}All instances in a compartment:${NC}"
+            echo -e "    ${WHITE}Any {instance.compartment.id = 'ocid1.compartment.oc1..xxx'}${NC}"
+            echo -e "    ${GRAY}Specific resource type:${NC}"
+            echo -e "    ${WHITE}Any {resource.type = 'fnfunc', resource.compartment.id = 'ocid1.compartment.oc1..xxx'}${NC}"
+            echo ""
+            echo -n -e "  ${WHITE}New matching rule: ${NC}"
+            local new_rule
+            read -r new_rule
+            [[ -z "$new_rule" ]] && return
+            
+            # Escape quotes in rule for JSON
+            local escaped_rule
+            escaped_rule=$(echo "$new_rule" | sed 's/"/\\"/g')
+            
+            patch_body="{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\"Operations\":[{\"op\":\"replace\",\"path\":\"matchingRule\",\"value\":\"${escaped_rule}\"}]}"
+            patch_cmd="oci identity-domains dynamic-resource-groups patch --dynamic-resource-group-id \"${sel_id}\" --endpoint \"${domain_url}\" --body '...matchingRule...'"
+            ;;
+        *)
+            echo -e "${RED}Invalid selection${NC}"
+            sleep 1
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+    echo -e "  ${CYAN}${patch_cmd}${NC}"
+    echo ""
+    echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    
+    if [[ "${confirm,,}" == "y" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $patch_cmd" >> "$log_file"
+        echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+        
+        local result
+        result=$(oci identity-domains dynamic-resource-groups patch \
+            --dynamic-resource-group-id "$sel_id" \
+            --endpoint "$domain_url" \
+            --body "$patch_body" \
+            --output json 2>&1)
+        
+        if echo "$result" | jq -e '.["display-name"] // .id' > /dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} Dynamic group ${MAGENTA}${sel_name}${NC} updated successfully"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Updated dynamic-group $sel_name" >> "$log_file"
+        else
+            echo -e "  ${RED}✗ Failed to update dynamic group${NC}"
+            echo "$result" | head -5
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+        fi
+    else
+        echo -e "  ${GRAY}Cancelled${NC}"
+    fi
+    
+    echo ""
+    echo -e "Press Enter to continue..."
+    read -r
+}
+
+#--------------------------------------------------------------------------------
+# Replica Regions - View and enable domain replication
+# Replication must be enabled from the domain's home region
+#--------------------------------------------------------------------------------
+_identity_replica_regions() {
+    local domain_id="$1"
+    local domain_name="$2"
+    local tenancy_id="$3"
+    
+    while true; do
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Replica Regions: ${CYAN}${domain_name}${NC} ${BOLD}${WHITE}═══${NC}"
+        echo -e "${GRAY}oci iam domain get --domain-id \"${domain_id}\"${NC}"
+        echo ""
+        echo -e "${GRAY}Fetching domain details...${NC}"
+        
+        local detail_json
+        detail_json=$(oci iam domain get --domain-id "$domain_id" --output json 2>/dev/null)
+        
+        if [[ -z "$detail_json" ]]; then
+            echo -e "${RED}Failed to fetch domain details${NC}"
+            echo -e "Press Enter to return..."
+            read -r
+            return
+        fi
+        
+        local home_region
+        home_region=$(echo "$detail_json" | jq -r '.data["home-region"] // "N/A"' 2>/dev/null)
+        local domain_state
+        domain_state=$(echo "$detail_json" | jq -r '.data["lifecycle-state"] // "N/A"' 2>/dev/null)
+        
+        echo -e "  ${CYAN}Home Region:${NC}    ${WHITE}${home_region}${NC}"
+        echo -e "  ${CYAN}Domain State:${NC}   ${GREEN}${domain_state}${NC}"
+        echo ""
+        
+        # Show current replica regions
+        echo -e "${BOLD}${WHITE}─── Current Replicas ───${NC}"
+        echo ""
+        
+        local replica_count
+        replica_count=$(echo "$detail_json" | jq '(.data["replica-regions"] // []) | length' 2>/dev/null)
+        
+        if [[ "$replica_count" -gt 0 && "$replica_count" != "0" ]]; then
+            printf "${BOLD}%-3s  %-25s  %-15s  %s${NC}\n" \
+                "#" "Region" "State" "URL"
+            printf "${WHITE}%-3s  %-25s  %-15s  %s${NC}\n" \
+                "---" "-------------------------" "---------------" "--------------------------------------------"
+            
+            local ridx=0
+            while IFS=$'\t' read -r r_region r_state r_url; do
+                [[ -z "$r_region" ]] && continue
+                ((ridx++))
+                
+                local r_state_color="$GREEN"
+                [[ "$r_state" != "READY" && "$r_state" != "AVAILABLE" ]] && r_state_color="$YELLOW"
+                [[ "$r_state" == "FAILED" ]] && r_state_color="$RED"
+                
+                printf "${YELLOW}%-3s${NC}  ${WHITE}%-25s${NC}  ${r_state_color}%-15s${NC}  ${GRAY}%s${NC}\n" \
+                    "$ridx" "$r_region" "$r_state" "$r_url"
+            done < <(echo "$detail_json" | jq -r '
+                (.data["replica-regions"] // [])[] |
+                [
+                    (.region // "N/A"),
+                    (.state // "N/A"),
+                    (.url // "N/A")
+                ] | @tsv
+            ' 2>/dev/null)
+        else
+            echo -e "  ${GRAY}(no replica regions configured)${NC}"
+        fi
+        
+        echo ""
+        echo -e "${BOLD}${WHITE}─── Actions ───${NC}"
+        echo ""
+        echo -e "  ${YELLOW}1${NC}) ${WHITE}Enable Replication${NC}  - Replicate this domain to a new region"
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Replicas: ${domain_name}] Enter selection [1, back]: ${NC}"
+        local rep_choice
+        read -r rep_choice
+        
+        case "$rep_choice" in
+            ""|back|b|q)
+                return
+                ;;
+            1)
+                # Enable replication - must list subscribed regions and exclude home + existing replicas
+                echo ""
+                echo -e "${GRAY}oci iam region-subscription list --tenancy-id \"${tenancy_id}\"${NC}"
+                echo -e "${GRAY}Fetching subscribed regions...${NC}"
+                
+                local regions_json
+                regions_json=$(oci iam region-subscription list --tenancy-id "$tenancy_id" --output json 2>/dev/null)
+                
+                if [[ -z "$regions_json" ]]; then
+                    echo -e "${RED}Failed to fetch subscribed regions${NC}"
+                    echo -e "Press Enter to continue..."
+                    read -r
+                    continue
+                fi
+                
+                # Build list of already-replicated regions (including home)
+                local existing_regions
+                existing_regions=$(echo "$detail_json" | jq -r '
+                    [(.data["home-region"] // empty)] +
+                    [(.data["replica-regions"] // [])[] | .region // empty] |
+                    map(ascii_downcase) | .[]
+                ' 2>/dev/null)
+                
+                # Show available regions (subscribed minus home minus existing replicas)
+                echo ""
+                echo -e "${BOLD}${WHITE}─── Available Regions for Replication ───${NC}"
+                echo -e "  ${GRAY}(excluding home region and existing replicas)${NC}"
+                echo ""
+                
+                local aidx=0
+                declare -A _AVAIL_REGIONS
+                
+                printf "${BOLD}%-3s  %-25s  %-15s${NC}\n" "#" "Region" "Status"
+                printf "${WHITE}%-3s  %-25s  %-15s${NC}\n" "---" "-------------------------" "---------------"
+                
+                while IFS=$'\t' read -r reg_name reg_key reg_status reg_is_home; do
+                    [[ -z "$reg_name" ]] && continue
+                    local reg_lower="${reg_name,,}"
+                    
+                    # Skip if already home or replicated
+                    local skip=false
+                    while IFS= read -r existing; do
+                        [[ "${existing,,}" == "$reg_lower" ]] && skip=true && break
+                    done <<< "$existing_regions"
+                    
+                    [[ "$skip" == "true" ]] && continue
+                    [[ "$reg_is_home" == "true" ]] && continue
+                    
+                    ((aidx++))
+                    _AVAIL_REGIONS[$aidx]="$reg_name"
+                    
+                    local status_color="$GREEN"
+                    [[ "$reg_status" != "READY" ]] && status_color="$YELLOW"
+                    
+                    printf "${YELLOW}%-3s${NC}  ${WHITE}%-25s${NC}  ${status_color}%-15s${NC}\n" \
+                        "$aidx" "$reg_name" "$reg_status"
+                done < <(echo "$regions_json" | jq -r '
+                    (.data // [])[] |
+                    [
+                        (.["region-name"] // "N/A"),
+                        (.["region-key"] // "N/A"),
+                        (.status // "N/A"),
+                        ((.["is-home-region"] // false) | tostring)
+                    ] | @tsv
+                ' 2>/dev/null)
+                
+                if [[ $aidx -eq 0 ]]; then
+                    echo -e "  ${YELLOW}No additional regions available for replication${NC}"
+                    echo -e "  ${GRAY}All subscribed regions are already replicated or are the home region${NC}"
+                    echo -e "Press Enter to continue..."
+                    read -r
+                    continue
+                fi
+                
+                echo ""
+                echo -n -e "${CYAN}Select region # to enable replication: ${NC}"
+                local reg_choice
+                read -r reg_choice
+                
+                if ! [[ "$reg_choice" =~ ^[0-9]+$ ]] || [[ -z "${_AVAIL_REGIONS[$reg_choice]:-}" ]]; then
+                    echo -e "${RED}Invalid selection${NC}"
+                    sleep 1
+                    continue
+                fi
+                
+                local target_region="${_AVAIL_REGIONS[$reg_choice]}"
+                
+                echo ""
+                echo -e "${BOLD}${WHITE}Command to execute:${NC}"
+                echo -e "  ${YELLOW}NOTE: Replication must be enabled from the home region (${WHITE}${home_region}${YELLOW})${NC}"
+                
+                local enable_cmd="oci iam domain enable-replication-to-region --domain-id \"${domain_id}\" --replica-region \"${target_region}\" --region \"${home_region}\""
+                echo -e "  ${CYAN}${enable_cmd}${NC}"
+                echo ""
+                echo -n -e "  ${YELLOW}Proceed? (y/N): ${NC}"
+                local confirm
+                read -r confirm
+                
+                if [[ "${confirm,,}" == "y" ]]; then
+                    local log_file="${LOGS_DIR}/identity_actions.log"
+                    mkdir -p "$LOGS_DIR"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $enable_cmd" >> "$log_file"
+                    echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
+                    
+                    local result
+                    result=$(oci iam domain enable-replication-to-region \
+                        --domain-id "$domain_id" \
+                        --replica-region "$target_region" \
+                        --region "$home_region" \
+                        2>&1)
+                    
+                    local exit_code=$?
+                    if [[ $exit_code -eq 0 ]]; then
+                        echo -e "  ${GREEN}✓${NC} Replication enabled to ${WHITE}${target_region}${NC}"
+                        echo -e "  ${GRAY}Replication may take several minutes to complete${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Enabled replication to $target_region for domain $domain_name" >> "$log_file"
+                    else
+                        echo -e "  ${RED}✗ Failed to enable replication${NC}"
+                        echo "$result" | head -5
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $result" >> "$log_file"
+                    fi
+                    
+                    echo ""
+                    echo -e "Press Enter to continue..."
+                    read -r
+                else
+                    echo -e "  ${GRAY}Cancelled${NC}"
+                fi
+                ;;
+            *)
+                echo -e "${RED}Invalid selection${NC}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 #================================================================================
@@ -10971,6 +11811,7 @@ NC = '\033[0m'
 RED = '\033[0;31m'
 BLUE = '\033[0;34m'
 ORANGE = '\033[38;5;208m'
+DARK_GREEN = '\033[38;5;22m'
 BOLD_BLUE = '\033[1;34m'
 BG_YELLOW = '\033[43;30m'
 
@@ -11184,7 +12025,7 @@ def print_compartment(comp_id, prefix="", is_last=True, depth=0):
         match_info = ""
         if filter_type in ['keyword', 'service'] and filter_patterns and matched_stmts:
             match_info = f" {GREEN}({len(matched_stmts)} match){NC}"
-        print(f"{policy_prefix}{pol_branch}{GREEN}📜 {pol_name}{NC} {DIM}[{stmt_count} statements]{NC}{match_info}")
+        print(f"{policy_prefix}{pol_branch}{DARK_GREEN}📜 {pol_name}{NC} {DIM}[{stmt_count} statements]{NC}{match_info}")
         stmts_to_show = matched_stmts if filter_type in ['keyword', 'service'] and filter_patterns else all_stmts
         for j, stmt in enumerate(stmts_to_show):
             is_last_stmt = (j == len(stmts_to_show) - 1)
@@ -12194,7 +13035,7 @@ manage_policies() {
         _display_cache_info \
             "${POLICIES_ALL_CACHE}|Policies" \
             "${POLICIES_COMPS_CACHE}|Compartments"
-        echo ""
+        echo -e "${GRAY}oci iam policy list --compartment-id \$TENANCY_ID --all | oci iam compartment list --compartment-id \$TENANCY_ID --all${NC}"
         
         # Show cache status
         local pol_count comp_count cache_age_str=""
@@ -12406,8 +13247,8 @@ manage_policies() {
                 echo -e "  ${GREEN}✓${NC} Exported ${WHITE}${export_count}${NC} policies to: ${CYAN}${export_file}${NC}"
                 
                 # Log the export action
-                local log_file="${LOG_DIR}/policy_actions.log"
-                mkdir -p "$LOG_DIR"
+                local log_file="${LOGS_DIR}/policy_actions.log"
+                mkdir -p "$LOGS_DIR"
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXPORT: jq '.' \"$POLICIES_ALL_CACHE\" > \"$export_file\"" >> "$log_file"
                 echo -e "  ${GRAY}Logged to: ${log_file}${NC}"
                 echo ""
@@ -12737,6 +13578,7 @@ manage_oke_cluster() {
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     _display_cache_info \
         "${OKE_ENV_CACHE}|OKE Env"
+    echo -e "${GRAY}oci ce cluster get --cluster-id \$OKE_CLUSTER_ID | oci ce node-pool list --cluster-id \$OKE_CLUSTER_ID${NC}"
     
     # Fetch/refresh cache
     fetch_oke_environment "$compartment_id" "$region"
@@ -12984,8 +13826,8 @@ manage_oke_cluster() {
         nodepool_count=$(echo "$nodepools_json" | jq '(.data // []) | length')
         
         if [[ "$nodepool_count" -gt 0 ]]; then
-            printf "${BOLD}%-5s %-30s %-12s %-8s %-25s %s${NC}\n" "#" "Node Pool Name" "State" "Size" "Shape" "K8s Version"
-            printf "${WHITE}%-5s %-30s %-12s %-8s %-25s %s${NC}\n" "-----" "------------------------------" "------------" "--------" "-------------------------" "---------------"
+            printf "${BOLD}%-5s %-30s %-12s %-8s %-25s %-15s${NC}\n" "#" "Node Pool Name" "State" "Size" "Shape" "K8s Version"
+            printf "${WHITE}%-5s %-30s %-12s %-8s %-25s %-15s${NC}\n" "-----" "------------------------------" "------------" "--------" "-------------------------" "---------------"
             
             while IFS=$'\t' read -r np_name np_state np_size np_shape np_version np_id; do
                 [[ -z "$np_name" ]] && continue
@@ -12996,7 +13838,30 @@ manage_oke_cluster() {
                 local state_color="$GREEN"
                 [[ "$np_state" != "ACTIVE" ]] && state_color="$YELLOW"
                 [[ "$np_state" == "FAILED" || "$np_state" == "DELETED" ]] && state_color="$RED"
-                printf "${YELLOW}%-5s${NC} %-30s ${state_color}%-12s${NC} %-8s %-25s %s\n" "np${np_idx}" "${np_name:0:30}" "$np_state" "$np_size" "${np_shape:0:25}" "$np_version"
+                printf "${YELLOW}%-5s${NC} %-30s ${state_color}%-12s${NC} %-8s %-25s %-15s\n" "np${np_idx}" "${np_name:0:30}" "$np_state" "$np_size" "${np_shape:0:25}" "$np_version"
+                
+                # Resolve and display subnet(s) for this node pool with tree connectors
+                local np_subnet_ids
+                np_subnet_ids=$(echo "$nodepools_json" | jq -r --arg npid "$np_id" '
+                    (.data // [])[] | select(.id == $npid) |
+                    ((.["node-config-details"]["placement-configs"] // []) | map(.["subnet-id"] // "N/A") | unique | join(","))
+                ' 2>/dev/null)
+                
+                if [[ -n "$np_subnet_ids" && "$np_subnet_ids" != "N/A" ]]; then
+                    IFS=',' read -ra subnet_array <<< "$np_subnet_ids"
+                    local s_idx=0
+                    local s_total=${#subnet_array[@]}
+                    for subnet_id in "${subnet_array[@]}"; do
+                        [[ -z "$subnet_id" || "$subnet_id" == "N/A" ]] && continue
+                        ((s_idx++))
+                        local subnet_name
+                        subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
+                        echo -e "      ${GRAY}├── Subnet:${NC}    ${GREEN}${subnet_name}${NC} ${YELLOW}${subnet_id}${NC}"
+                    done
+                else
+                    echo -e "      ${GRAY}├── Subnet:${NC}    ${GRAY}N/A${NC}"
+                fi
+                echo -e "      ${GRAY}└── Node Pool:${NC} ${YELLOW}${np_id}${NC}"
             done < <(echo "$nodepools_json" | jq -r '
                 (.data // [])[] |
                 [
@@ -13008,42 +13873,6 @@ manage_oke_cluster() {
                     (.id // "N/A")
                 ] | @tsv
             ' 2>/dev/null)
-            
-            # Show node pool details with resolved subnet names
-            echo ""
-            echo -e "${BOLD}${WHITE}── Node Pool Details ──${NC}"
-            
-            # Process each node pool
-            for i in $(seq 1 $np_idx); do
-                local np_id="${NP_MAP[$i]}"
-                local np_name="${NP_NAME_MAP[$i]}"
-                
-                # Get subnet IDs from nodepools_json
-                local np_subnet_ids
-                np_subnet_ids=$(echo "$nodepools_json" | jq -r --arg npid "$np_id" '
-                    (.data // [])[] | select(.id == $npid) |
-                    ((.["node-config-details"]["placement-configs"] // []) | map(.["subnet-id"] // "N/A") | unique | join(","))
-                ' 2>/dev/null)
-                
-                echo ""
-                echo -e "  ${YELLOW}[np${i}]${NC} ${CYAN}$np_name${NC}"
-                
-                # Show → Subnet(s) with resolved names
-                if [[ -n "$np_subnet_ids" && "$np_subnet_ids" != "N/A" ]]; then
-                    IFS=',' read -ra subnet_array <<< "$np_subnet_ids"
-                    for subnet_id in "${subnet_array[@]}"; do
-                        [[ -z "$subnet_id" || "$subnet_id" == "N/A" ]] && continue
-                        local subnet_name
-                        subnet_name=$(oci network subnet get --subnet-id "$subnet_id" --query 'data."display-name"' --raw-output 2>/dev/null) || subnet_name="N/A"
-                        echo -e "       ${GRAY}→ Subnet:${NC}    ${GREEN}$subnet_name${NC} ${YELLOW}($subnet_id)${NC}"
-                    done
-                else
-                    echo -e "       ${GRAY}→ Subnet:${NC}    N/A"
-                fi
-                
-                # Show → Node Pool OCID
-                echo -e "       ${GRAY}→ Node Pool:${NC} ${YELLOW}($np_id)${NC}"
-            done
         else
             echo -e "${YELLOW}No node pools configured${NC}"
         fi
@@ -13857,6 +14686,7 @@ manage_network_resources() {
         "${DRG_CACHE}|DRG" \
         "${LPG_CACHE}|LPG" \
         "${OS_PE_CACHE}|OS PEs"
+    echo -e "${GRAY}oci network subnet list | oci network nsg list | oci network route-table list | oci network security-list list --compartment-id \$COMPARTMENT_ID${NC}"
     echo ""
     local stored_in_file=0
     if [[ -f "$variables_file" ]] && grep -q "^NETWORK_COMPARTMENT_ID=" "$variables_file" 2>/dev/null; then
@@ -17868,8 +18698,6 @@ drg_view_details() {
         read -r
     fi
 }
-
-
 #--------------------------------------------------------------------------------
 # DRG - Search Additional Compartments
 #--------------------------------------------------------------------------------
@@ -20013,22 +20841,248 @@ resolve_k8s_node_name() {
         '.items[] | select(.spec.providerID | contains($ocid)) | .metadata.name' 2>/dev/null | head -1
 }
 
+#--------------------------------------------------------------------------------
+# Search instances in Compute Instances view (--manage 6)
+# Searches across: name, state, shape, AD, OCID, K8s node name
+# Supports: keyword search with BG_YELLOW highlighting, OCID paste for details
+#--------------------------------------------------------------------------------
+_compute_search_instances() {
+    local instances_json="$1"
+    local k8s_lookup="$2"
+    local pods_per_node="$3"
+    
+    # Pre-build searchable data: iid|name|state|shape|ad|ocid|k8s_node|cordon|taint|pods|time_created
+    local search_data=""
+    local idx=0
+    
+    search_data=$(echo "$instances_json" | jq -r '
+        .data[] |
+        select(.["lifecycle-state"] != "TERMINATED") |
+        "\(.["time-created"] // "N/A")|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["availability-domain"])|\(.id)"
+    ' 2>/dev/null | sort -t'|' -k1,1 | while IFS='|' read -r time_created name state shape ad ocid; do
+        ((idx++))
+        local iid="i${idx}"
+        
+        # K8s info
+        local k8s_node="" k8s_status="No" cordon_status="-" taint_status="-" pod_count="-"
+        local k8s_match
+        k8s_match=$(echo "$k8s_lookup" | grep "$ocid" 2>/dev/null)
+        if [[ -n "$k8s_match" ]]; then
+            k8s_node=$(echo "$k8s_match" | cut -d'|' -f2)
+            local k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
+            local new_node_taint=$(echo "$k8s_match" | cut -d'|' -f4)
+            local unschedulable=$(echo "$k8s_match" | cut -d'|' -f5)
+            
+            [[ "$k8s_ready" == "True" ]] && k8s_status="Ready" || k8s_status="NotRdy"
+            [[ "$unschedulable" == "true" ]] && cordon_status="Yes"
+            [[ "$new_node_taint" != "N/A" && -n "$new_node_taint" ]] && taint_status="newNode"
+            
+            local node_pods
+            node_pods=$(echo "$pods_per_node" | grep "^${k8s_node}|" | cut -d'|' -f2)
+            [[ -n "$node_pods" ]] && pod_count="$node_pods" || pod_count="0"
+        fi
+        
+        local time_display="$time_created"
+        if [[ "$time_display" != "N/A" && -n "$time_display" ]]; then
+            time_display="${time_display:0:16}"
+            time_display="${time_display/T/ }"
+        fi
+        
+        local ad_short="${ad##*:}"
+        local shape_trunc="${shape:0:24}"
+        
+        # Output: searchable_text|display fields
+        echo "${iid}|${name}|${state}|${k8s_status}|${cordon_status}|${taint_status}|${pod_count}|${shape_trunc}|${ad_short}|${time_display}|${ocid}|${k8s_node}"
+    done)
+    
+    while true; do
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Search Instances] Enter search term (Enter=back): ${NC}"
+        local search_term
+        read -r search_term
+        
+        [[ -z "$search_term" ]] && return
+        
+        # If user pasted an instance OCID, show instance details
+        if [[ "$search_term" == ocid1.instance.* ]]; then
+            while true; do
+                display_instance_details "$search_term"
+                local ret=$?
+                [[ $ret -ne 2 ]] && break
+            done
+            continue
+        fi
+        
+        # Escape regex special characters
+        local search_escaped
+        search_escaped=$(printf '%s' "$search_term" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+        
+        # Filter matching lines (case-insensitive across all fields)
+        local matched_lines
+        matched_lines=$(echo "$search_data" | grep -i "$search_escaped" 2>/dev/null)
+        
+        local match_count=0
+        [[ -n "$matched_lines" ]] && match_count=$(echo "$matched_lines" | grep -c . 2>/dev/null)
+        
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Search Results: '${YELLOW}${search_term}${WHITE}' ($match_count matches) ═══${NC}"
+        echo ""
+        
+        if [[ "$match_count" -eq 0 ]]; then
+            echo -e "  ${GRAY}No matches found for '${search_term}'${NC}"
+            continue
+        fi
+        
+        printf "${BOLD}%-5s %-55s %-10s %-8s %-8s %-10s %-5s %-24s %-18s %-18s %s${NC}\n" \
+            "ID" "Display Name" "State" "K8s" "Cordon" "Taint" "Pods" "Shape" "Avail Domain" "Created" "Instance OCID"
+        print_separator 268
+        
+        echo "$matched_lines" | while IFS='|' read -r iid name state k8s_status cordon_status taint_status pod_count shape_trunc ad_short time_display ocid k8s_node; do
+            [[ -z "$iid" ]] && continue
+            
+            # Build plain-text row
+            local row
+            row=$(printf "%-5s %-55s %-10s %-8s %-8s %-10s %-5s %-24s %-18s %-18s %s" \
+                "$iid" "$name" "$state" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$shape_trunc" "$ad_short" "$time_display" "$ocid")
+            
+            # Apply BG_YELLOW highlight to matching text (case-insensitive)
+            local highlighted
+            highlighted=$(echo "$row" | sed -E "s/(${search_escaped})/\x1b[43m\1\x1b[0m/gI" 2>/dev/null)
+            [[ -z "$highlighted" ]] && highlighted="$row"
+            
+            echo -e "$highlighted"
+        done
+        
+        echo ""
+        echo -e "  ${GRAY}Search again, paste an instance OCID for details, or press Enter to go back${NC}"
+    done
+}
+
+#--------------------------------------------------------------------------------
+# Search instances in Properties View (--manage 6, p)
+# Searches across: name, state, shape, image, created by, cloud-init FP
+#--------------------------------------------------------------------------------
+_compute_search_properties() {
+    local tmp_data="$1"
+    local instances_json="$2"
+    
+    if [[ ! -f "$tmp_data" ]]; then
+        echo -e "${RED}No instance data to search${NC}"
+        return
+    fi
+    
+    # Resolve nodepool names once
+    declare -A _PROP_NP_CACHE=()
+    local np_ocids
+    np_ocids=$(awk -F'|' '{print $13}' "$tmp_data" | grep '^ocid1.nodepool\.' | sort -u)
+    if [[ -n "$np_ocids" ]]; then
+        while read -r np_ocid; do
+            [[ -z "$np_ocid" ]] && continue
+            local np_name
+            np_name=$(oci ce node-pool get --node-pool-id "$np_ocid" --region "${EFFECTIVE_REGION:-$REGION}" --query 'data.name' --raw-output 2>/dev/null)
+            [[ -n "$np_name" && "$np_name" != "null" ]] && _PROP_NP_CACHE["$np_ocid"]="$np_name"
+        done <<< "$np_ocids"
+    fi
+    
+    while true; do
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Search Properties] Enter search term (Enter=back): ${NC}"
+        local search_term
+        read -r search_term
+        
+        [[ -z "$search_term" ]] && return
+        
+        # Escape regex special characters
+        local search_escaped
+        search_escaped=$(printf '%s' "$search_term" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+        
+        # For CreatedBy columns, we need to also search the resolved names
+        # Build an augmented version: original line + resolved created_by appended
+        local augmented_data=""
+        augmented_data=$(while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp; do
+            local resolved_by="$created_by"
+            if [[ "$created_by" == ocid1.instance.* ]]; then
+                local rn
+                rn=$(echo "$instances_json" | jq -r --arg id "$created_by" '.data[] | select(.id == $id) | .["display-name"] // empty' 2>/dev/null)
+                [[ -n "$rn" ]] && resolved_by="$rn"
+            elif [[ "$created_by" == ocid1.nodepool.* && -n "${_PROP_NP_CACHE[$created_by]:-}" ]]; then
+                resolved_by="${_PROP_NP_CACHE[$created_by]}"
+            fi
+            echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${launch_mode}|${created_by}|${created_on}|${ci_fp}|${resolved_by}"
+        done < <(sort -t'|' -k1,1 "$tmp_data"))
+        
+        # Filter matching lines (search against augmented data including resolved names)
+        local matched_lines
+        matched_lines=$(echo "$augmented_data" | grep -i "$search_escaped" 2>/dev/null)
+        
+        local match_count=0
+        [[ -n "$matched_lines" ]] && match_count=$(echo "$matched_lines" | grep -c . 2>/dev/null)
+        
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Search Results: '${YELLOW}${search_term}${WHITE}' ($match_count matches) ═══${NC}"
+        echo ""
+        
+        if [[ "$match_count" -eq 0 ]]; then
+            echo -e "  ${GRAY}No matches found for '${search_term}'${NC}"
+            continue
+        fi
+        
+        printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s${NC}\n" \
+            "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "LaunchMode" "CreatedBy" "CreatedOn" "CI"
+        print_separator 325
+        
+        echo "$matched_lines" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp resolved_by; do
+            [[ -z "$name" ]] && continue
+            
+            local gpu_disp="$gpus"
+            [[ "$gpus" == "0" ]] && gpu_disp="-"
+            
+            local name_t="${name:0:35}"
+            local shape_t="${shape:0:22}"
+            local created_by_display="${resolved_by:-$created_by}"
+            
+            # Build plain-text row
+            local row
+            row=$(printf "%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s" \
+                "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$launch_mode" "$created_by_display" "$created_on" "$ci_fp")
+            
+            # Apply BG_YELLOW highlight to matching text (case-insensitive)
+            local highlighted
+            highlighted=$(echo "$row" | sed -E "s/(${search_escaped})/\x1b[43m\1\x1b[0m/gI" 2>/dev/null)
+            [[ -z "$highlighted" ]] && highlighted="$row"
+            
+            echo -e "$highlighted"
+        done
+        
+        echo ""
+        echo -e "  ${GRAY}Search again or press Enter to go back${NC}"
+    done
+}
+
 manage_compute_instances() {
+    local filter_label="${1:-}"       # Optional: e.g., "GPU Cluster: fabric-tpqrq"
+    local filter_ocids="${2:-}"       # Optional: pipe-separated instance OCIDs to filter to
     local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
     local region="${EFFECTIVE_REGION:-$REGION}"
     
     while true; do
         echo ""
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}${CYAN}                                                         COMPUTE INSTANCE MANAGEMENT                                                                    ${NC}"
+        if [[ -n "$filter_label" ]]; then
+            echo -e "${BOLD}${CYAN}                                            COMPUTE INSTANCE MANAGEMENT  ${YELLOW}(${filter_label})${NC}"
+        else
+            echo -e "${BOLD}${CYAN}                                                         COMPUTE INSTANCE MANAGEMENT                                                                    ${NC}"
+        fi
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         _display_cache_info \
             "${INSTANCE_LIST_CACHE}|Instances"
+        echo -e "${GRAY}oci compute instance list --compartment-id \$COMPARTMENT_ID --all${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
         echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
         echo -e "  ${CYAN}Compartment:${NC} ${WHITE}$(resolve_compartment_name "${compartment_id}")${NC} ${GRAY}(${compartment_id})${NC}"
+        [[ -n "$filter_label" ]] && echo -e "  ${CYAN}Filter:${NC}      ${YELLOW}${filter_label}${NC}"
         echo ""
         
         # Fetch instances (with caching - 5 minute TTL)
@@ -20055,6 +21109,13 @@ manage_compute_instances() {
             echo -e "Press Enter to return..."
             read -r
             return
+        fi
+        
+        # Apply filter if provided (filter_ocids is pipe-separated list of instance OCIDs)
+        if [[ -n "$filter_ocids" ]]; then
+            instances_json=$(echo "$instances_json" | jq --arg ids "$filter_ocids" '
+                .data |= [.[] | select(.id as $id | ($ids | split("|")) | index($id))]
+            ')
         fi
         
         # Build instance index map
@@ -20200,6 +21261,7 @@ manage_compute_instances() {
         echo -e "  ${YELLOW}i#${NC}         - View instance details (e.g., 'i1', 'i5')"
         echo -e "  ${YELLOW}ocid1...${NC}   - View instance by OCID directly"
         echo -e "  ${YELLOW}p${NC}          - View all instances with OCI properties (shape, mem, boot vol, cloud-init)"
+        echo -e "  ${YELLOW}s${NC}          - Search instances (name, state, shape, OCID, K8s node)"
         echo -e "  ${ORANGE}taint${NC}      - Apply newNode=true:NoSchedule taint (e.g., 'taint i1', 'taint i1,i3', 'taint all')"
         echo -e "  ${ORANGE}untaint${NC}    - Remove newNode=true:NoSchedule taint (e.g., 'untaint i1', 'untaint i1-i5')"
         echo -e "  ${ORANGE}cordon${NC}     - Cordon K8s node(s) (e.g., 'cordon i1', 'cordon i1,i3')"
@@ -20215,7 +21277,7 @@ manage_compute_instances() {
         echo -e "${GRAY}  $0 <instance-ocid> --details        # Full details (network, volumes)${NC}"
         echo -e "${GRAY}  $0 <instance-ocid> --console-history # Boot logs (debug cloud-init)${NC}"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Compute Instances] Enter selection [i#/taint/untaint/cordon/uncordon/cdt/terminate/p/bvr/r/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Compute Instances] Enter selection [i#/s/taint/untaint/cordon/uncordon/cdt/terminate/p/bvr/r/back]: ${NC}"
         
         local input
         read -r input
@@ -21125,6 +22187,9 @@ manage_compute_instances() {
         fi
         
         case "$input" in
+            s|S|search|SEARCH)
+                _compute_search_instances "$instances_json" "$k8s_lookup" "$pods_per_node"
+                ;;
             properties|PROPERTIES|props|p)
                 display_instances_properties_view
                 ;;
@@ -22222,23 +23287,25 @@ display_instances_properties_view() {
             "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$launch_mode" "$created_by_display" "$created_on" "$ci_fp"
     done
     
-    rm -f "$tmp_data"
-    
     echo ""
     print_separator 325
     echo ""
     
     echo -e "${BOLD}${WHITE}Options:${NC}"
+    echo -e "  ${YELLOW}s${NC}       - Search instances (name, shape, image, created by, etc.)"
     echo -e "  ${CYAN}legend${NC}  - Show column legend"
     echo -e "  ${MAGENTA}r${NC}       - Clear cache and re-fetch all data"
     echo -e "  ${CYAN}Enter${NC}   - Return to menu"
     echo ""
-    echo -n -e "${CYAN}Action [legend/r/Enter]: ${NC}"
+    echo -n -e "${CYAN}Action [s/legend/r/Enter]: ${NC}"
     
     local action
     read -r action
     
     case "$action" in
+        s|S|search|SEARCH)
+            _compute_search_properties "$tmp_data" "$instances_json"
+            ;;
         legend|LEGEND|l|L)
             echo ""
             echo -e "${BOLD}${WHITE}Column Legend:${NC}"
@@ -22264,12 +23331,15 @@ display_instances_properties_view() {
             rm -f "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE"
             echo -e "${GREEN}Cache cleared. Re-running...${NC}"
             sleep 1
+            rm -f "$tmp_data"
             display_instances_properties_view
-            ;;
-        *)
             return
             ;;
+        *)
+            ;;
     esac
+    
+    rm -f "$tmp_data"
 }
 
 #--------------------------------------------------------------------------------
@@ -22309,6 +23379,8 @@ instance_actions_menu() {
         echo -e "  ${YELLOW}7${NC}) ${WHITE}Cordon K8s Node${NC}        - Mark node as unschedulable"
         echo -e "  ${YELLOW}8${NC}) ${WHITE}Uncordon K8s Node${NC}      - Mark node as schedulable"
         echo -e "  ${YELLOW}10${NC}) ${WHITE}Cordon & Drain${NC}        - Cordon then drain (combo)"
+        echo -e "  ${ORANGE}11${NC}) ${WHITE}Taint newNode${NC}          - Apply newNode=true:NoSchedule taint"
+        echo -e "  ${ORANGE}12${NC}) ${WHITE}Untaint newNode${NC}        - Remove newNode=true:NoSchedule taint"
     fi
     echo -e "  ${RED}5${NC}) ${WHITE}Terminate Instance${NC}     - ${RED}PERMANENTLY DELETE${NC} instance"
     echo ""
@@ -22318,7 +23390,7 @@ instance_actions_menu() {
     echo ""
     
     local prompt_range="1-5,9"
-    [[ -n "$k8s_node_name" ]] && prompt_range="1-9"
+    [[ -n "$k8s_node_name" ]] && prompt_range="1-12"
     echo -n -e "${BOLD}${CYAN}Select action [${prompt_range}/Enter]: ${NC}"
     
     local action
@@ -22564,6 +23636,84 @@ instance_actions_menu() {
                     fi
                 else
                     echo -e "${YELLOW}Cordon & drain cancelled${NC}"
+                fi
+                echo ""
+                echo -e "Press Enter to continue..."
+                read -r
+            fi
+            ;;
+        11)
+            # Taint newNode=true:NoSchedule
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                local taint_log="${LOGS_DIR}/gpu_cluster_actions.log"
+                mkdir -p "$LOGS_DIR" 2>/dev/null
+                local cmd="kubectl taint node ${k8s_node_name} newNode=true:NoSchedule"
+                echo ""
+                echo -e "${BOLD}${CYAN}═══ Apply Taint: newNode=true:NoSchedule ═══${NC}"
+                echo -e "  Node: ${GREEN}$k8s_node_name${NC}"
+                echo ""
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo ""
+                echo -n -e "${CYAN}Apply taint? [y/N]: ${NC}"
+                read -r confirm
+                if [[ "$confirm" =~ ^[Yy] ]]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$taint_log"
+                    local result; result=$(eval "$cmd" 2>&1)
+                    if [[ $? -eq 0 ]]; then
+                        echo -e "${GREEN}✓ Taint applied${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Tainted ${k8s_node_name} (${instance_name})" >> "$taint_log"
+                    elif [[ "$result" == *"already has"* || "$result" == *"already exists"* ]]; then
+                        echo -e "${YELLOW}⚠ Taint already present${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: ${k8s_node_name} already tainted" >> "$taint_log"
+                    else
+                        echo -e "${RED}✗ Failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Taint ${k8s_node_name}: ${result}" >> "$taint_log"
+                    fi
+                    echo -e "${GRAY}Log: ${taint_log}${NC}"
+                else
+                    echo -e "${YELLOW}Cancelled${NC}"
+                fi
+                echo ""
+                echo -e "Press Enter to continue..."
+                read -r
+            fi
+            ;;
+        12)
+            # Untaint newNode=true:NoSchedule
+            if [[ -z "$k8s_node_name" ]]; then
+                echo -e "${RED}This instance is not a Kubernetes node${NC}"
+                sleep 1
+            else
+                local taint_log="${LOGS_DIR}/gpu_cluster_actions.log"
+                mkdir -p "$LOGS_DIR" 2>/dev/null
+                local cmd="kubectl taint node ${k8s_node_name} newNode=true:NoSchedule-"
+                echo ""
+                echo -e "${BOLD}${GREEN}═══ Remove Taint: newNode=true:NoSchedule ═══${NC}"
+                echo -e "  Node: ${GREEN}$k8s_node_name${NC}"
+                echo ""
+                echo -e "${GRAY}$ ${cmd}${NC}"
+                echo ""
+                echo -n -e "${CYAN}Remove taint? [y/N]: ${NC}"
+                read -r confirm
+                if [[ "$confirm" =~ ^[Yy] ]]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: ${cmd}" >> "$taint_log"
+                    local result; result=$(eval "$cmd" 2>&1)
+                    if [[ $? -eq 0 ]]; then
+                        echo -e "${GREEN}✓ Taint removed${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Untainted ${k8s_node_name} (${instance_name})" >> "$taint_log"
+                    elif [[ "$result" == *"not found"* ]]; then
+                        echo -e "${YELLOW}⚠ Taint not present${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIPPED: ${k8s_node_name} taint not found" >> "$taint_log"
+                    else
+                        echo -e "${RED}✗ Failed: ${result}${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: Untaint ${k8s_node_name}: ${result}" >> "$taint_log"
+                    fi
+                    echo -e "${GRAY}Log: ${taint_log}${NC}"
+                else
+                    echo -e "${YELLOW}Cancelled${NC}"
                 fi
                 echo ""
                 echo -e "Press Enter to continue..."
@@ -23212,17 +24362,24 @@ display_instance_details() {
             echo -e "  ${GRAY}1) View cloud-init    2) Save cloud-init    3) Compare cloud-init${NC}    ${CYAN}4${NC}) Console history"
         fi
         
-        # Line 2: Instance lifecycle actions
-        echo -e "  ${RED}5${NC}) Reboot             ${RED}6${NC}) Force reboot       ${RED}7${NC}) Stop instance         ${GREEN}8${NC}) Start instance     ${RED}9${NC}) ${RED}TERMINATE${NC}"
-        
-        # Line 3: Unhealthy tagging options
-        echo -e "  ${YELLOW}t${NC}) Tag unhealthy (keep running)     ${GREEN}rt${NC}) Remove unhealthy tag     ${RED}x${NC}) ${RED}Tag unhealthy + TERMINATE${NC}"
-        
-        # Line 4: K8s node actions (only if in K8s)
+        # Line 2: K8s node actions (only if in K8s)
         if [[ -n "$k8s_node_name" ]]; then
             echo -e "  ${ORANGE}d${NC}) Drain K8s node     ${ORANGE}c${NC}) Cordon node        ${ORANGE}u${NC}) Uncordon node      ${ORANGE}cd${NC}) Cordon & Drain"
+        fi
+        
+        # Line 3: Instance lifecycle actions
+        echo -e "  ${RED}5${NC}) Reboot             ${RED}6${NC}) Force reboot       ${RED}7${NC}) Stop instance         ${GREEN}8${NC}) Start instance"
+        
+        # Line 4: Destructive actions
+        echo -e "  ${RED}9${NC}) ${RED}TERMINATE${NC}          ${RED}x${NC}) ${RED}Tag unhealthy + TERMINATE${NC}"
+        
+        # Line 5: Boot Volume Replacement (only if in K8s)
+        if [[ -n "$k8s_node_name" ]]; then
             echo -e "  ${GREEN}bvr${NC}) Boot Volume Replacement (upgrade node image/K8s version)"
         fi
+        
+        # Line 6: Unhealthy tagging options
+        echo -e "  ${YELLOW}t${NC}) Tag unhealthy (keep running)     ${GREEN}rt${NC}) Remove unhealthy tag"
         
         echo ""
         echo -e "  ${CYAN}Enter${NC}) Return to list"
@@ -24264,9 +25421,10 @@ compare_instance_cloud_init() {
     echo -e "${BOLD}${WHITE}Compare against:${NC}"
     echo -e "  ${YELLOW}1${NC}) Another Compute Instance"
     echo -e "  ${YELLOW}2${NC}) An Instance Configuration"
+    echo -e "  ${YELLOW}3${NC}) A Local File"
     echo -e "  ${CYAN}q${NC}) Cancel"
     echo ""
-    echo -n -e "${CYAN}Select option [1/2/q]: ${NC}"
+    echo -n -e "${CYAN}Select option [1/2/3/q]: ${NC}"
     
     local choice
     read -r choice
@@ -24277,6 +25435,9 @@ compare_instance_cloud_init() {
             ;;
         2)
             compare_instance_to_config "$instance_ocid" "$instance_name" "$instance_ud_b64"
+            ;;
+        3)
+            compare_instance_to_file "$instance_ocid" "$instance_name" "$instance_ud_b64"
             ;;
         *)
             return
@@ -24568,6 +25729,124 @@ compare_instance_to_config() {
     read -r
 }
 
+#--------------------------------------------------------------------------------
+# Compare instance cloud-init to a local file
+# Args: $1 = instance OCID, $2 = instance display name, $3 = instance user_data base64
+#--------------------------------------------------------------------------------
+compare_instance_to_file() {
+    local instance_ocid="$1"
+    local instance_name="$2"
+    local instance_ud_b64="$3"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}═══ Compare Instance Cloud-Init to Local File ═══${NC}"
+    echo ""
+    echo -e "${WHITE}Instance:${NC} ${GREEN}$instance_name${NC}"
+    echo ""
+    
+    # Search for cloud-init files in current directory
+    local ci_files=()
+    local ci_idx=0
+    while IFS= read -r -d '' ci_file; do
+        ((ci_idx++))
+        ci_files[$ci_idx]="$ci_file"
+    done < <(find . -maxdepth 1 \( -name 'cloud-init*.yml' -o -name 'cloud-init*.yaml' -o -name 'cloud-init*.txt' -o -name '*.cloud-init' \) -print0 2>/dev/null | sort -z)
+    
+    local local_file=""
+    if [[ $ci_idx -gt 0 ]]; then
+        echo -e "${BOLD}${WHITE}Cloud-init files in current directory:${NC}"
+        for fi in $(seq 1 $ci_idx); do
+            printf "  ${YELLOW}%-3s${NC} %s\n" "$fi" "${ci_files[$fi]}"
+        done
+        echo ""
+        echo -n -e "${CYAN}Select file # or enter path manually (Enter=cancel): ${NC}"
+        local file_choice
+        read -r file_choice
+        
+        [[ -z "$file_choice" ]] && return
+        
+        if [[ "$file_choice" =~ ^[0-9]+$ ]] && [[ -n "${ci_files[$file_choice]:-}" ]]; then
+            local_file="${ci_files[$file_choice]}"
+        else
+            local_file="$file_choice"
+        fi
+    else
+        echo -e "${GRAY}No cloud-init*.yml / cloud-init*.yaml files found in current directory${NC}"
+        echo ""
+        echo -n -e "${CYAN}Enter path to local file (Enter=cancel): ${NC}"
+        read -r local_file
+        [[ -z "$local_file" ]] && return
+    fi
+    
+    # Expand ~ to home directory
+    local_file="${local_file/#\~/$HOME}"
+    
+    if [[ ! -f "$local_file" ]]; then
+        echo -e "${RED}File not found: ${local_file}${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    local local_basename
+    local_basename=$(basename "$local_file")
+    
+    # Decode instance cloud-init to temp file
+    local tmp_instance
+    tmp_instance=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+    
+    if [[ -n "$instance_ud_b64" && "$instance_ud_b64" != "null" ]]; then
+        decode_user_data_to_file "$instance_ud_b64" "$tmp_instance" || echo "# Failed to decode" > "$tmp_instance"
+    else
+        echo "# No user_data" > "$tmp_instance"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}                                           CLOUD-INIT COMPARISON (Instance vs File)                                                                    ${NC}"
+    echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${WHITE}Comparing:${NC}"
+    echo -e "  ${RED}- Instance:${NC}   ${GREEN}$instance_name${NC} ${GRAY}($instance_ocid)${NC}"
+    echo -e "  ${GREEN}+ Local File:${NC} ${BLUE}$local_basename${NC} ${GRAY}($local_file)${NC}"
+    echo ""
+    
+    if diff -q "$tmp_instance" "$local_file" > /dev/null 2>&1; then
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                                                 ✓ CLOUD-INIT IS IDENTICAL                                                                              ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    else
+        echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║                                                 ✗ CLOUD-INIT DIFFERS                                                                                    ║${NC}"
+        echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${BOLD}${WHITE}Differences:${NC}"
+        echo ""
+        
+        local diff_output
+        diff_output=$(diff -u "$tmp_instance" "$local_file" 2>/dev/null | tail -n +4)
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^@@ ]]; then
+                echo -e "${YELLOW}${line}${NC}"
+            elif [[ "$line" =~ ^- ]]; then
+                echo -e "${RED}${line}${NC}  ${GRAY}← $instance_name${NC}"
+            elif [[ "$line" =~ ^\+ ]]; then
+                echo -e "${GREEN}${line}${NC}  ${GRAY}← $local_basename${NC}"
+            elif [[ "$line" =~ ^[[:space:]] ]]; then
+                echo -e "${GRAY}${line}${NC}"
+            fi
+        done <<< "$diff_output"
+    fi
+    
+    # Cleanup
+    rm -f "$tmp_instance"
+    
+    echo ""
+    echo -e "Press Enter to return..."
+    read -r
+}
+
 #===============================================================================
 # INSTANCE CONFIGURATION MANAGEMENT
 #===============================================================================
@@ -24597,6 +25876,7 @@ manage_instance_configurations() {
         fetch_instance_configurations > /dev/null 2>&1
         
         echo -e "${BOLD}${WHITE}═══ Instance Configurations ═══${NC}"
+        echo -e "${GRAY}oci compute-management instance-configuration list --compartment-id \$COMPARTMENT_ID --all${NC}"
         echo ""
         printf "${BOLD}%-5s %-55s %-20s %s${NC}\n" "ID" "Name" "Created" "OCID"
         print_separator 160
@@ -24640,12 +25920,11 @@ manage_instance_configurations() {
         echo -e "  ${GREEN}c${NC}           - Create a new Instance Configuration"
         echo -e "  ${YELLOW}re${NC}          - Rename an Instance Configuration (with recommended name)"
         echo -e "  ${RED}d${NC}           - Delete Instance Configuration(s) (d i1, d i1,i3, d all)"
-        echo -e "  ${CYAN}comp${NC}        - Compare full configuration between two instance configurations"
-        echo -e "  ${CYAN}diff${NC}        - Quick cloud-init diff (config vs config, or config vs local file)"
+        echo -e "  ${CYAN}comp${NC}        - Compare (config vs config, config vs instance, or config vs local file)"
         echo -e "  ${MAGENTA}r${NC}           - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Instance Configs] Enter selection [i#/c/re/d/comp/diff/r/back]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Instance Configs] Enter selection [i#/c/re/d/comp/r/back]: ${NC}"
         
         local input
         read -r input
@@ -24672,11 +25951,8 @@ manage_instance_configurations() {
             ua|UA|update-all|UPDATE-ALL)
                 update_all_clusters_instance_config
                 ;;
-            comp|COMP|compare|COMPARE)
+            comp|COMP|compare|COMPARE|diff|DIFF)
                 compare_instance_configurations
-                ;;
-            diff|DIFF)
-                diff_instance_config_cloudinit
                 ;;
             r|R|refresh|REFRESH)
                 echo -e "${YELLOW}Refreshing cache...${NC}"
@@ -24711,6 +25987,7 @@ view_instance_configuration_detail() {
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${GREEN}                       INSTANCE CONFIGURATION DETAILS                          ${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ic_ocid}${NC}"
     
     local ic_json
     ic_json=$(oci compute-management instance-configuration get \
@@ -24812,13 +26089,14 @@ view_instance_configuration_detail() {
     if [[ "$has_user_data" == "true" ]]; then
         echo -e "  ${MAGENTA}view${NC}     - View decoded cloud-init user-data"
         echo -e "  ${MAGENTA}save${NC}     - Save user-data to file"
+        echo -e "  ${CYAN}comp${NC}     - Compare vs another config, instance, or local file"
     fi
     echo -e "  ${GREEN}json${NC}     - Output raw JSON of instance configuration"
     echo -e "  ${YELLOW}rename${NC}   - Rename this instance configuration"
     echo -e "  ${RED}delete${NC}   - Delete this instance configuration"
     echo -e "  ${CYAN}Enter${NC}    - Return to menu"
     echo ""
-    echo -n -e "${CYAN}Action [view/save/json/rename/delete/Enter]: ${NC}"
+    echo -n -e "${CYAN}Action [view/save/comp/json/rename/delete/Enter]: ${NC}"
     
     local action
     read -r action
@@ -24916,6 +26194,144 @@ view_instance_configuration_detail() {
         delete|DELETE|d|D)
             delete_single_instance_configuration "$ic_ocid" "$ic_name"
             ;;
+        comp|COMP|compare|COMPARE|diff|DIFF)
+            echo ""
+            echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+            echo -e "${BOLD}${MAGENTA}                    COMPARE: ${ic_name}${NC}"
+            echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo -e "${WHITE}Compare this config against:${NC}"
+            echo -e "  ${YELLOW}1${NC}) Another Instance Configuration  ${GRAY}(full field + cloud-init comparison)${NC}"
+            echo -e "  ${YELLOW}2${NC}) A Running Instance               ${GRAY}(full field + cloud-init comparison)${NC}"
+            if [[ "$has_user_data" == "true" ]]; then
+                echo -e "  ${YELLOW}3${NC}) A Local File                     ${GRAY}(cloud-init diff only)${NC}"
+            fi
+            echo -e "  ${CYAN}q${NC}) Cancel"
+            echo ""
+            echo -n -e "${CYAN}Select mode [1/2/3/q]: ${NC}"
+            local comp_mode
+            read -r comp_mode
+            
+            case "$comp_mode" in
+                1)
+                    # vs another IC - use full comparison
+                    fetch_instance_configurations > /dev/null 2>&1
+                    
+                    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+                        echo -e "${RED}No instance configurations found${NC}"
+                    else
+                        local cmp_idx=0
+                        declare -A CMP_IC_MAP=()
+                        
+                        echo ""
+                        printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
+                        print_separator 80
+                        
+                        while IFS='|' read -r cmp_ocid cmp_name _; do
+                            [[ "$cmp_ocid" =~ ^#.*$ ]] && continue
+                            [[ -z "$cmp_ocid" ]] && continue
+                            [[ "$cmp_ocid" == "$ic_ocid" ]] && continue  # Skip current
+                            
+                            ((cmp_idx++))
+                            CMP_IC_MAP[$cmp_idx]="$cmp_ocid|$cmp_name"
+                            printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$cmp_idx" "$cmp_name"
+                        done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+                        
+                        if [[ $cmp_idx -eq 0 ]]; then
+                            echo -e "${GRAY}No other instance configurations to compare against${NC}"
+                        else
+                            echo ""
+                            echo -n -e "${CYAN}Select configuration (1-${cmp_idx}): ${NC}"
+                            local cmp_choice
+                            read -r cmp_choice
+                            
+                            if [[ -n "${CMP_IC_MAP[$cmp_choice]:-}" ]]; then
+                                local cmp_ocid2 cmp_name2
+                                IFS='|' read -r cmp_ocid2 cmp_name2 <<< "${CMP_IC_MAP[$cmp_choice]}"
+                                
+                                echo ""
+                                echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${cmp_ocid2}${NC}"
+                                echo -e "${YELLOW}Fetching configuration...${NC}"
+                                
+                                local cmp_json2
+                                cmp_json2=$(oci compute-management instance-configuration get \
+                                    --instance-configuration-id "$cmp_ocid2" \
+                                    --output json 2>/dev/null)
+                                
+                                if [[ -n "$cmp_json2" ]] && echo "$cmp_json2" | jq -e '.data' > /dev/null 2>&1; then
+                                    local cmp_launch1 cmp_launch2
+                                    cmp_launch1=$(echo "$ic_json" | jq '.data["instance-details"]["launch-details"]')
+                                    cmp_launch2=$(echo "$cmp_json2" | jq '.data["instance-details"]["launch-details"]')
+                                    _do_field_comparison "$cmp_launch1" "$ic_name" "$cmp_launch2" "$cmp_name2"
+                                else
+                                    echo -e "${RED}Failed to fetch configuration${NC}"
+                                fi
+                            else
+                                echo -e "${RED}Invalid selection${NC}"
+                            fi
+                        fi
+                    fi
+                    ;;
+                2)
+                    # vs Running Instance
+                    _compare_ic_vs_instance "$ic_json" "$ic_name"
+                    ;;
+                3)
+                    if [[ "$has_user_data" != "true" ]]; then
+                        echo -e "${YELLOW}No user-data in this configuration${NC}"
+                    else
+                        # vs Local File - cloud-init diff only
+                        echo ""
+                        local cmp_ci_files=()
+                        local cmp_ci_idx=0
+                        while IFS= read -r -d '' cmp_ci_file; do
+                            ((cmp_ci_idx++))
+                            cmp_ci_files[$cmp_ci_idx]="$cmp_ci_file"
+                        done < <(find . -maxdepth 1 \( -name 'cloud-init*.yml' -o -name 'cloud-init*.yaml' \) -print0 2>/dev/null | sort -z)
+                        
+                        local cmp_local_file=""
+                        if [[ $cmp_ci_idx -gt 0 ]]; then
+                            echo -e "${BOLD}${WHITE}Cloud-init files in current directory:${NC}"
+                            for cfi in $(seq 1 $cmp_ci_idx); do
+                                printf "  ${YELLOW}%-3s${NC} %s\n" "$cfi" "${cmp_ci_files[$cfi]}"
+                            done
+                            echo ""
+                            echo -n -e "${CYAN}Select file # or enter path manually: ${NC}"
+                            local cmp_file_choice
+                            read -r cmp_file_choice
+                            
+                            if [[ "$cmp_file_choice" =~ ^[0-9]+$ ]] && [[ -n "${cmp_ci_files[$cmp_file_choice]:-}" ]]; then
+                                cmp_local_file="${cmp_ci_files[$cmp_file_choice]}"
+                            else
+                                cmp_local_file="$cmp_file_choice"
+                            fi
+                        else
+                            echo -n -e "${CYAN}Enter path to local cloud-init file: ${NC}"
+                            read -r cmp_local_file
+                        fi
+                        
+                        # Expand ~ to home directory
+                        cmp_local_file="${cmp_local_file/#\~/$HOME}"
+                        
+                        if [[ -z "$cmp_local_file" ]]; then
+                            echo -e "${YELLOW}No file specified${NC}"
+                        elif [[ ! -f "$cmp_local_file" ]]; then
+                            echo -e "${RED}File not found: $cmp_local_file${NC}"
+                        else
+                            local cmp_tmp_cfg
+                            cmp_tmp_cfg=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+                            decode_user_data_to_file "$user_data_b64" "$cmp_tmp_cfg" || echo "# Failed to decode" > "$cmp_tmp_cfg"
+                            _display_cloudinit_diff "$cmp_tmp_cfg" "$ic_name" "$cmp_local_file" "$(basename "$cmp_local_file")"
+                        fi
+                    fi
+                    ;;
+                *)
+                    ;;
+            esac
+            echo ""
+            echo -n -e "${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
         *)
             # Return to menu
             ;;
@@ -24923,105 +26339,136 @@ view_instance_configuration_detail() {
 }
 
 #--------------------------------------------------------------------------------
-# Compare two Instance Configurations
+# Build a launch-details-like JSON from a running instance
+# This normalizes instance data so _do_field_comparison can work on it
+# Args: $1=instance_ocid
+# Returns: JSON on stdout matching IC launch-details structure
 #--------------------------------------------------------------------------------
-compare_instance_configurations() {
-    echo ""
-    echo -e "${BOLD}${MAGENTA}═══ Compare Instance Configurations ═══${NC}"
-    echo ""
+_build_launch_json_from_instance() {
+    local inst_ocid="$1"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
     
-    # Refresh cache
-    fetch_instance_configurations > /dev/null 2>&1
-    
-    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        echo -e "${RED}No instance configurations found${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    # List configs
-    local ic_idx=0
-    declare -A COMPARE_IC_MAP=()
-    
-    printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
-    print_separator 80
-    
-    while IFS='|' read -r ic_ocid ic_name _; do
-        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
-        [[ -z "$ic_ocid" ]] && continue
-        
-        ((ic_idx++))
-        COMPARE_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
-        printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic_idx" "$ic_name"
-    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
-    
-    if [[ $ic_idx -lt 2 ]]; then
-        echo ""
-        echo -e "${YELLOW}Need at least 2 instance configurations to compare${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    echo ""
-    echo -n -e "${CYAN}Select first configuration (1-${ic_idx}): ${NC}"
-    local choice1
-    read -r choice1
-    
-    if [[ -z "${COMPARE_IC_MAP[$choice1]:-}" ]]; then
-        echo -e "${RED}Invalid selection${NC}"
-        return
-    fi
-    
-    echo -n -e "${CYAN}Select second configuration (1-${ic_idx}): ${NC}"
-    local choice2
-    read -r choice2
-    
-    if [[ -z "${COMPARE_IC_MAP[$choice2]:-}" ]]; then
-        echo -e "${RED}Invalid selection${NC}"
-        return
-    fi
-    
-    local ocid1 name1 ocid2 name2
-    IFS='|' read -r ocid1 name1 <<< "${COMPARE_IC_MAP[$choice1]}"
-    IFS='|' read -r ocid2 name2 <<< "${COMPARE_IC_MAP[$choice2]}"
-    
-    echo ""
-    echo -e "${BOLD}Comparing:${NC}"
-    echo -e "  ${GREEN}A:${NC} $name1"
-    echo -e "  ${BLUE}B:${NC} $name2"
-    echo ""
-    echo -e "${YELLOW}Fetching full configuration details...${NC}"
-    
-    # Get FULL instance configuration JSON for both
-    local json1 json2
-    json1=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ocid1" \
+    # Fetch instance details
+    echo -e "${GRAY}oci compute instance get --instance-id ${inst_ocid}${NC}" >&2
+    local inst_json
+    inst_json=$(oci compute instance get \
+        --instance-id "$inst_ocid" \
         --output json 2>/dev/null)
     
-    json2=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ocid2" \
-        --output json 2>/dev/null)
-    
-    if [[ -z "$json1" || -z "$json2" ]]; then
-        echo -e "${RED}Failed to fetch configuration details${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
+    if [[ -z "$inst_json" ]] || ! echo "$inst_json" | jq -e '.data' > /dev/null 2>&1; then
+        echo "{}" 
+        return 1
     fi
     
-    # Extract launch-details for comparison
-    local launch1 launch2
-    launch1=$(echo "$json1" | jq '.data["instance-details"]["launch-details"]')
-    launch2=$(echo "$json2" | jq '.data["instance-details"]["launch-details"]')
+    # Extract base fields
+    local shape ad image_id metadata agent_config shape_config
+    shape=$(echo "$inst_json" | jq -r '.data.shape // "N/A"')
+    ad=$(echo "$inst_json" | jq -r '.data["availability-domain"] // "N/A"')
+    image_id=$(echo "$inst_json" | jq -r '.data["image-id"] // "N/A"')
+    metadata=$(echo "$inst_json" | jq '.data.metadata // {}')
+    agent_config=$(echo "$inst_json" | jq '.data["agent-config"] // {}')
+    shape_config=$(echo "$inst_json" | jq '.data["shape-config"] // {}')
+    
+    # Fetch boot volume attachment → boot volume details
+    echo -e "${GRAY}oci compute boot-volume-attachment list --instance-id ${inst_ocid}${NC}" >&2
+    local bv_att_json bv_id bv_size bv_vpus
+    bv_att_json=$(oci compute boot-volume-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$inst_ocid" \
+        --availability-domain "$ad" \
+        --region "$region" \
+        --output json 2>/dev/null)
+    
+    bv_id=$(echo "$bv_att_json" | jq -r '.data[0]["boot-volume-id"] // empty' 2>/dev/null)
+    bv_size="N/A"
+    bv_vpus="N/A"
+    
+    if [[ -n "$bv_id" ]]; then
+        echo -e "${GRAY}oci bv boot-volume get --boot-volume-id ..${bv_id: -20}${NC}" >&2
+        local bv_json
+        bv_json=$(oci bv boot-volume get \
+            --boot-volume-id "$bv_id" \
+            --region "$region" \
+            --output json 2>/dev/null)
+        bv_size=$(echo "$bv_json" | jq -r '.data["size-in-gbs"] // "N/A"' 2>/dev/null)
+        bv_vpus=$(echo "$bv_json" | jq -r '.data["vpus-per-gb"] // "N/A"' 2>/dev/null)
+    fi
+    
+    # Fetch primary VNIC → subnet, NSGs
+    echo -e "${GRAY}oci compute vnic-attachment list --instance-id ${inst_ocid}${NC}" >&2
+    local vnic_att_json vnic_id subnet_id nsg_ids
+    vnic_att_json=$(oci compute vnic-attachment list \
+        --compartment-id "$compartment_id" \
+        --instance-id "$inst_ocid" \
+        --region "$region" \
+        --output json 2>/dev/null)
+    
+    vnic_id=$(echo "$vnic_att_json" | jq -r '.data[0]["vnic-id"] // empty' 2>/dev/null)
+    subnet_id="N/A"
+    nsg_ids="[]"
+    
+    if [[ -n "$vnic_id" ]]; then
+        echo -e "${GRAY}oci network vnic get --vnic-id ..${vnic_id: -20}${NC}" >&2
+        local vnic_json
+        vnic_json=$(oci network vnic get \
+            --vnic-id "$vnic_id" \
+            --region "$region" \
+            --output json 2>/dev/null)
+        subnet_id=$(echo "$vnic_json" | jq -r '.data["subnet-id"] // "N/A"' 2>/dev/null)
+        nsg_ids=$(echo "$vnic_json" | jq '.data["nsg-ids"] // []' 2>/dev/null)
+    fi
+    
+    # Build launch-details-compatible JSON
+    jq -n \
+        --arg shape "$shape" \
+        --arg ad "$ad" \
+        --arg image_id "$image_id" \
+        --arg bv_size "$bv_size" \
+        --arg bv_vpus "$bv_vpus" \
+        --arg subnet_id "$subnet_id" \
+        --argjson nsg_ids "$nsg_ids" \
+        --argjson metadata "$metadata" \
+        --argjson agent_config "$agent_config" \
+        --argjson shape_config "$shape_config" \
+        '{
+            "shape": $shape,
+            "shape-config": $shape_config,
+            "availability-domain": $ad,
+            "source-details": {
+                "image-id": $image_id,
+                "boot-volume-size-in-gbs": $bv_size,
+                "boot-volume-vpus-per-gb": $bv_vpus
+            },
+            "create-vnic-details": {
+                "subnet-id": $subnet_id,
+                "nsg-ids": $nsg_ids
+            },
+            "metadata": $metadata,
+            "agent-config": $agent_config
+        }'
+}
+
+#--------------------------------------------------------------------------------
+# Field-by-field comparison of two launch-details-like JSON objects
+# Args: $1=json_a, $2=name_a, $3=json_b, $4=name_b
+# Works for IC vs IC, IC vs Instance, etc.
+#--------------------------------------------------------------------------------
+_do_field_comparison() {
+    local launch1="$1"
+    local name1="$2"
+    local launch2="$3"
+    local name2="$4"
     
     echo ""
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${MAGENTA}                                                    CONFIGURATION COMPARISON                                                                            ${NC}"
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${BOLD}Comparing:${NC}"
+    echo -e "  ${GREEN}A:${NC} $name1"
+    echo -e "  ${BLUE}B:${NC} $name2"
     
-    # Compare key fields individually
     local has_diff=false
     
     # Shape
@@ -25039,7 +26486,7 @@ compare_instance_configurations() {
         has_diff=true
     fi
     
-    # Shape Config (for flex shapes)
+    # Shape Config (OCPUs + Memory)
     local sc1_ocpus sc1_mem sc2_ocpus sc2_mem
     sc1_ocpus=$(echo "$launch1" | jq -r '.["shape-config"].ocpus // empty')
     sc1_mem=$(echo "$launch1" | jq -r '.["shape-config"]["memory-in-gbs"] // empty')
@@ -25087,8 +26534,8 @@ compare_instance_configurations() {
     
     # Boot Volume Size
     local bvsize1 bvsize2
-    bvsize1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // "N/A"')
-    bvsize2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // "N/A"')
+    bvsize1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // .["source-details"].bootVolumeSizeInGBs // "N/A"')
+    bvsize2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-size-in-gbs"] // .["source-details"].bootVolumeSizeInGBs // "N/A"')
     echo ""
     echo -e "${BOLD}${WHITE}Boot Volume Size (GB):${NC}"
     if [[ "$bvsize1" == "$bvsize2" ]]; then
@@ -25102,8 +26549,8 @@ compare_instance_configurations() {
     
     # Boot Volume VPUs
     local bvvpus1 bvvpus2
-    bvvpus1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // "N/A"')
-    bvvpus2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // "N/A"')
+    bvvpus1=$(echo "$launch1" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // .["source-details"].bootVolumeVpusPerGB // "N/A"')
+    bvvpus2=$(echo "$launch2" | jq -r '.["source-details"]["boot-volume-vpus-per-gb"] // .["source-details"].bootVolumeVpusPerGB // "N/A"')
     echo ""
     echo -e "${BOLD}${WHITE}Boot Volume VPUs/GB:${NC}"
     if [[ "$bvvpus1" == "$bvvpus2" ]]; then
@@ -25117,8 +26564,8 @@ compare_instance_configurations() {
     
     # Image ID - show full OCID with name
     local img1 img2
-    img1=$(echo "$launch1" | jq -r '.["source-details"]["image-id"] // "N/A"')
-    img2=$(echo "$launch2" | jq -r '.["source-details"]["image-id"] // "N/A"')
+    img1=$(echo "$launch1" | jq -r '.["source-details"]["image-id"] // .["source-details"].imageId // "N/A"')
+    img2=$(echo "$launch2" | jq -r '.["source-details"]["image-id"] // .["source-details"].imageId // "N/A"')
     
     # Fetch image names
     local img1_name="(fetching...)" img2_name="(fetching...)"
@@ -25161,7 +26608,7 @@ compare_instance_configurations() {
         has_diff=true
     fi
     
-    # NSG IDs - show full OCIDs
+    # NSG IDs
     local nsg1 nsg2
     nsg1=$(echo "$launch1" | jq -r '.["create-vnic-details"]["nsg-ids"] // []' | jq -r '.[]' 2>/dev/null | sort)
     nsg2=$(echo "$launch2" | jq -r '.["create-vnic-details"]["nsg-ids"] // []' | jq -r '.[]' 2>/dev/null | sort)
@@ -25170,9 +26617,7 @@ compare_instance_configurations() {
     if [[ "$nsg1" == "$nsg2" ]]; then
         if [[ -n "$nsg1" ]]; then
             echo -e "  ${GREEN}✓ Same:${NC}"
-            echo "$nsg1" | while read -r nsg; do
-                echo -e "    $nsg"
-            done
+            echo "$nsg1" | while read -r nsg; do echo -e "    $nsg"; done
         else
             echo -e "  ${GREEN}✓ Same:${NC} (none)"
         fi
@@ -25180,17 +26625,13 @@ compare_instance_configurations() {
         echo -e "  ${RED}✗ Different:${NC}"
         echo -e "    ${GREEN}$name1:${NC}"
         if [[ -n "$nsg1" ]]; then
-            echo "$nsg1" | while read -r nsg; do
-                echo -e "      $nsg"
-            done
+            echo "$nsg1" | while read -r nsg; do echo -e "      $nsg"; done
         else
             echo -e "      (none)"
         fi
         echo -e "    ${BLUE}$name2:${NC}"
         if [[ -n "$nsg2" ]]; then
-            echo "$nsg2" | while read -r nsg; do
-                echo -e "      $nsg"
-            done
+            echo "$nsg2" | while read -r nsg; do echo -e "      $nsg"; done
         else
             echo -e "      (none)"
         fi
@@ -25208,7 +26649,6 @@ compare_instance_configurations() {
         echo -e "  ${GREEN}✓ Same agent plugin configuration${NC}"
     else
         echo -e "  ${RED}✗ Different agent plugin configuration:${NC}"
-        # Show per-plugin differences
         local all_plugins
         all_plugins=$(echo -e "${agent1}\n${agent2}" | jq -r '.[].name' 2>/dev/null | sort -u)
         while read -r plugin; do
@@ -25219,7 +26659,6 @@ compare_instance_configurations() {
             [[ -z "$state1" ]] && state1="(not set)"
             [[ -z "$state2" ]] && state2="(not set)"
             if [[ "$state1" == "$state2" ]]; then
-                echo -e "    ${GREEN}✓${NC} %-45s ${GRAY}%s${NC}\n" "$plugin" "$state1" | xargs -0 printf 2>/dev/null || \
                 echo -e "    ${GREEN}✓${NC} ${WHITE}$plugin:${NC} $state1"
             else
                 echo -e "    ${RED}✗${NC} ${WHITE}$plugin:${NC}"
@@ -25230,14 +26669,13 @@ compare_instance_configurations() {
         has_diff=true
     fi
     
-    # Metadata fields (excluding user_data which we'll handle separately)
+    # Metadata fields (excluding user_data)
     echo ""
     echo -e "${BOLD}${WHITE}Metadata Fields:${NC}"
     local meta1_keys meta2_keys
     meta1_keys=$(echo "$launch1" | jq -r '.metadata // {} | keys[]' 2>/dev/null | grep -v '^user_data$' | sort)
     meta2_keys=$(echo "$launch2" | jq -r '.metadata // {} | keys[]' 2>/dev/null | grep -v '^user_data$' | sort)
     
-    # Find all unique keys
     local all_meta_keys
     all_meta_keys=$(echo -e "${meta1_keys}\n${meta2_keys}" | sort -u | grep -v '^$')
     
@@ -25261,7 +26699,7 @@ compare_instance_configurations() {
         done <<< "$all_meta_keys"
     fi
     
-    # User Data comparison - improved display
+    # Cloud-init user-data comparison
     echo ""
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${MAGENTA}                                                  CLOUD-INIT USER-DATA COMPARISON                                                                       ${NC}"
@@ -25305,32 +26743,29 @@ compare_instance_configurations() {
         echo -e "${RED}✗ Cloud-init user-data is DIFFERENT${NC}"
         echo ""
         
-        # Show side-by-side differences with context
+        local added removed
+        added=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | grep -c '^+[^+]' || true)
+        removed=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | grep -c '^-[^-]' || true)
+        echo -e "${GRAY}  Changes: ${RED}-${removed} lines removed${NC}  ${GREEN}+${added} lines added${NC}"
+        echo ""
+        
         echo -e "${BOLD}${WHITE}Differences found:${NC}"
         echo ""
         
-        # Use diff to find changed lines and display them more clearly
         local diff_output
-        diff_output=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | tail -n +4)  # Skip header lines
+        diff_output=$(diff -u "$tmp1" "$tmp2" 2>/dev/null | tail -n +4)
         
         local in_change=false
-        local line_num=0
         while IFS= read -r line; do
-            ((line_num++))
-            
             if [[ "$line" =~ ^@@ ]]; then
-                # Context marker - show section
                 echo ""
                 echo -e "${YELLOW}${line}${NC}"
                 in_change=true
             elif [[ "$line" =~ ^- ]]; then
-                # Line removed (in config 1 only)
                 echo -e "${RED}${line}${NC}  ${GRAY}← ${name1}${NC}"
             elif [[ "$line" =~ ^\+ ]]; then
-                # Line added (in config 2 only)
                 echo -e "${GREEN}${line}${NC}  ${GRAY}← ${name2}${NC}"
             elif [[ "$line" =~ ^[[:space:]] ]] && [[ "$in_change" == "true" ]]; then
-                # Context line
                 echo -e "${GRAY}${line}${NC}"
             fi
         done <<< "$diff_output"
@@ -25367,30 +26802,30 @@ compare_instance_configurations() {
         case "$post_action" in
             view-a|VIEW-A)
                 echo ""
-                echo -e "${BOLD}${GREEN}═══ Cloud-Init: $name1 ═══${NC}"
+                echo -e "${BOLD}${GREEN}═══ Cloud-Init: $name1 (${lines1} lines) ═══${NC}"
                 echo -e "${GRAY}$(printf '━%.0s' $(seq 1 120))${NC}"
-                cat "$tmp1"
+                nl -ba "$tmp1"
                 echo -e "${GRAY}$(printf '━%.0s' $(seq 1 120))${NC}"
                 echo ""
                 ;;
             view-b|VIEW-B)
                 echo ""
-                echo -e "${BOLD}${BLUE}═══ Cloud-Init: $name2 ═══${NC}"
+                echo -e "${BOLD}${BLUE}═══ Cloud-Init: $name2 (${lines2} lines) ═══${NC}"
                 echo -e "${GRAY}$(printf '━%.0s' $(seq 1 120))${NC}"
-                cat "$tmp2"
+                nl -ba "$tmp2"
                 echo -e "${GRAY}$(printf '━%.0s' $(seq 1 120))${NC}"
                 echo ""
                 ;;
             save-a|SAVE-A)
                 local safe_name1
-                safe_name1=$(echo "$name1" | tr ' /' '_-')
+                safe_name1=$(echo "$name1" | tr ' /()' '_---')
                 local save_file1="cloud-init-${safe_name1}-$(date +%Y%m%d_%H%M%S).yml"
                 cp "$tmp1" "$save_file1"
                 echo -e "${GREEN}✓ Saved: ${WHITE}${save_file1}${NC}"
                 ;;
             save-b|SAVE-B)
                 local safe_name2
-                safe_name2=$(echo "$name2" | tr ' /' '_-')
+                safe_name2=$(echo "$name2" | tr ' /()' '_---')
                 local save_file2="cloud-init-${safe_name2}-$(date +%Y%m%d_%H%M%S).yml"
                 cp "$tmp2" "$save_file2"
                 echo -e "${GREEN}✓ Saved: ${WHITE}${save_file2}${NC}"
@@ -25399,8 +26834,8 @@ compare_instance_configurations() {
                 local timestamp_save
                 timestamp_save=$(date +%Y%m%d_%H%M%S)
                 local safe_n1 safe_n2
-                safe_n1=$(echo "$name1" | tr ' /' '_-')
-                safe_n2=$(echo "$name2" | tr ' /' '_-')
+                safe_n1=$(echo "$name1" | tr ' /()' '_---')
+                safe_n2=$(echo "$name2" | tr ' /()' '_---')
                 local sf1="cloud-init-${safe_n1}-${timestamp_save}.yml"
                 local sf2="cloud-init-${safe_n2}-${timestamp_save}.yml"
                 cp "$tmp1" "$sf1"
@@ -25422,266 +26857,420 @@ compare_instance_configurations() {
 }
 
 #--------------------------------------------------------------------------------
-# Quick cloud-init diff between two instance configs or against a local file
+# Compare IC vs Running Instance
+# Args: $1=ic_json (full IC JSON), $2=ic_name
 #--------------------------------------------------------------------------------
-diff_instance_config_cloudinit() {
+_compare_ic_vs_instance() {
+    local ic_json="$1"
+    local ic_name="$2"
+    local compartment_id="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+    local region="${EFFECTIVE_REGION:-$REGION}"
+    
+    echo ""
+    echo -e "${BOLD}${WHITE}Select a running instance to compare against:${NC}"
+    echo ""
+    
+    # Fetch instances
+    echo -e "${GRAY}oci compute instance list --compartment-id \$COMPARTMENT_ID --all${NC}"
+    echo -e "${YELLOW}Fetching instances...${NC}"
+    
+    local instances_json
+    instances_json=$(oci compute instance list \
+        --compartment-id "$compartment_id" \
+        --region "$region" \
+        --all \
+        --output json 2>/dev/null)
+    
+    if [[ -z "$instances_json" ]] || ! echo "$instances_json" | jq -e '.data[0]' > /dev/null 2>&1; then
+        echo -e "${RED}No instances found${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # List non-terminated instances
+    local cinst_idx=0
+    declare -A CINST_MAP=()
+    
+    echo ""
+    printf "${BOLD}%-4s %-55s %-12s %-24s %s${NC}\n" "#" "Display Name" "State" "Shape" "Instance OCID"
+    print_separator 180
+    
+    echo "$instances_json" | jq -r '
+        .data[] |
+        select(.["lifecycle-state"] != "TERMINATED") |
+        "\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.id)"
+    ' 2>/dev/null | sort -t'|' -k1,1 | while IFS='|' read -r inst_name inst_state inst_shape inst_ocid; do
+        [[ -z "$inst_ocid" ]] && continue
+        ((cinst_idx++))
+        echo "${cinst_idx}|${inst_ocid}|${inst_name}" >> "${TEMP_DIR}/cinst_map_$$"
+        
+        local state_color="$GREEN"
+        case "$inst_state" in
+            RUNNING) state_color="$GREEN" ;;
+            STOPPED) state_color="$RED" ;;
+            *) state_color="$YELLOW" ;;
+        esac
+        
+        printf "${YELLOW}%-4s${NC} %-55s ${state_color}%-12s${NC} %-24s ${YELLOW}%s${NC}\n" \
+            "$cinst_idx" "$inst_name" "$inst_state" "$inst_shape" "$inst_ocid"
+    done
+    
+    # Read map from subshell temp file
+    if [[ -f "${TEMP_DIR}/cinst_map_$$" ]]; then
+        while IFS='|' read -r idx ocid name; do
+            CINST_MAP[$idx]="$ocid|$name"
+        done < "${TEMP_DIR}/cinst_map_$$"
+        rm -f "${TEMP_DIR}/cinst_map_$$"
+    fi
+    
+    local cinst_total=${#CINST_MAP[@]}
+    if [[ $cinst_total -eq 0 ]]; then
+        echo -e "${GRAY}No instances available${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    echo ""
+    echo -e "${GRAY}Total: ${cinst_total} instances${NC}"
+    echo ""
+    echo -n -e "${CYAN}Select instance (1-${cinst_total}) or paste OCID: ${NC}"
+    local cinst_choice
+    read -r cinst_choice
+    
+    local cinst_ocid="" cinst_name=""
+    
+    if [[ "$cinst_choice" == ocid1.instance.* ]]; then
+        cinst_ocid="$cinst_choice"
+        cinst_name=$(echo "$instances_json" | jq -r --arg id "$cinst_ocid" '.data[] | select(.id == $id) | .["display-name"] // "Unknown"' 2>/dev/null)
+        [[ -z "$cinst_name" || "$cinst_name" == "null" ]] && cinst_name="Instance ..${cinst_ocid: -20}"
+    elif [[ -n "${CINST_MAP[$cinst_choice]:-}" ]]; then
+        IFS='|' read -r cinst_ocid cinst_name <<< "${CINST_MAP[$cinst_choice]}"
+    else
+        echo -e "${RED}Invalid selection${NC}"
+        return
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Fetching instance details for: ${WHITE}${cinst_name}${NC}"
+    
+    # Build launch-details JSON from instance
+    local inst_launch_json
+    inst_launch_json=$(_build_launch_json_from_instance "$cinst_ocid")
+    
+    if [[ -z "$inst_launch_json" || "$inst_launch_json" == "{}" ]]; then
+        echo -e "${RED}Failed to fetch instance details${NC}"
+        echo -e "Press Enter to return..."
+        read -r
+        return
+    fi
+    
+    # Extract IC launch details
+    local ic_launch_json
+    ic_launch_json=$(echo "$ic_json" | jq '.data["instance-details"]["launch-details"]')
+    
+    # Run comparison
+    _do_field_comparison "$ic_launch_json" "$ic_name (Config)" "$inst_launch_json" "$cinst_name (Instance)"
+}
+
+#--------------------------------------------------------------------------------
+# Unified Compare: IC vs IC, IC vs Instance, IC vs Local File
+# Replaces old compare_instance_configurations + diff_instance_config_cloudinit
+#--------------------------------------------------------------------------------
+compare_instance_configurations() {
     echo ""
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${MAGENTA}                                              CLOUD-INIT DIFF                                                                                            ${NC}"
+    echo -e "${BOLD}${MAGENTA}                                              COMPARE INSTANCE CONFIGURATIONS                                                                          ${NC}"
     echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    echo -e "${WHITE}Compare cloud-init user-data between:${NC}"
-    echo -e "  ${YELLOW}1${NC}) Two Instance Configurations"
-    echo -e "  ${YELLOW}2${NC}) Instance Configuration vs Local File"
+    echo -e "${WHITE}Compare mode:${NC}"
+    echo -e "  ${YELLOW}1${NC}) Instance Config vs Instance Config   ${GRAY}(full field + cloud-init comparison)${NC}"
+    echo -e "  ${YELLOW}2${NC}) Instance Config vs Running Instance   ${GRAY}(full field + cloud-init comparison)${NC}"
+    echo -e "  ${YELLOW}3${NC}) Instance Config vs Local File         ${GRAY}(cloud-init diff only)${NC}"
     echo -e "  ${CYAN}q${NC}) Cancel"
     echo ""
-    echo -n -e "${CYAN}Select mode [1/2/q]: ${NC}"
+    echo -n -e "${CYAN}Select mode [1/2/3/q]: ${NC}"
     local mode_choice
     read -r mode_choice
     
     case "$mode_choice" in
         1)
-            _diff_config_vs_config
+            # IC vs IC - full comparison
+            fetch_instance_configurations > /dev/null 2>&1
+            
+            if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+                echo -e "${RED}No instance configurations found${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            # List configs
+            local ic_idx=0
+            declare -A COMPARE_IC_MAP=()
+            
+            echo ""
+            printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
+            print_separator 80
+            
+            while IFS='|' read -r ic_ocid ic_name _; do
+                [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+                [[ -z "$ic_ocid" ]] && continue
+                
+                ((ic_idx++))
+                COMPARE_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
+                printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic_idx" "$ic_name"
+            done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+            
+            if [[ $ic_idx -lt 2 ]]; then
+                echo ""
+                echo -e "${YELLOW}Need at least 2 instance configurations to compare${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            echo -n -e "${CYAN}Select first configuration (1-${ic_idx}): ${NC}"
+            local choice1
+            read -r choice1
+            
+            if [[ -z "${COMPARE_IC_MAP[$choice1]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                return
+            fi
+            
+            echo -n -e "${CYAN}Select second configuration (1-${ic_idx}): ${NC}"
+            local choice2
+            read -r choice2
+            
+            if [[ -z "${COMPARE_IC_MAP[$choice2]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                return
+            fi
+            
+            local ocid1 name1 ocid2 name2
+            IFS='|' read -r ocid1 name1 <<< "${COMPARE_IC_MAP[$choice1]}"
+            IFS='|' read -r ocid2 name2 <<< "${COMPARE_IC_MAP[$choice2]}"
+            
+            echo ""
+            echo -e "${BOLD}Comparing:${NC}"
+            echo -e "  ${GREEN}A:${NC} $name1"
+            echo -e "  ${BLUE}B:${NC} $name2"
+            echo ""
+            echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ocid1}${NC}"
+            echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ocid2}${NC}"
+            echo ""
+            echo -e "${YELLOW}Fetching full configuration details...${NC}"
+            
+            local json1 json2
+            json1=$(oci compute-management instance-configuration get \
+                --instance-configuration-id "$ocid1" \
+                --output json 2>/dev/null)
+            json2=$(oci compute-management instance-configuration get \
+                --instance-configuration-id "$ocid2" \
+                --output json 2>/dev/null)
+            
+            if [[ -z "$json1" || -z "$json2" ]]; then
+                echo -e "${RED}Failed to fetch configuration details${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            local launch1 launch2
+            launch1=$(echo "$json1" | jq '.data["instance-details"]["launch-details"]')
+            launch2=$(echo "$json2" | jq '.data["instance-details"]["launch-details"]')
+            
+            _do_field_comparison "$launch1" "$name1" "$launch2" "$name2"
             ;;
         2)
-            _diff_config_vs_file
+            # IC vs Instance
+            fetch_instance_configurations > /dev/null 2>&1
+            
+            if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+                echo -e "${RED}No instance configurations found${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            # Select IC
+            local ic2_idx=0
+            declare -A COMP2_IC_MAP=()
+            
+            echo ""
+            printf "${BOLD}%-4s %-60s${NC}\n" "#" "Instance Configuration Name"
+            print_separator 80
+            
+            while IFS='|' read -r ic_ocid ic_name _; do
+                [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+                [[ -z "$ic_ocid" ]] && continue
+                
+                ((ic2_idx++))
+                COMP2_IC_MAP[$ic2_idx]="$ic_ocid|$ic_name"
+                printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic2_idx" "$ic_name"
+            done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+            
+            if [[ $ic2_idx -eq 0 ]]; then
+                echo -e "${GRAY}No instance configurations found${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            echo -n -e "${CYAN}Select instance configuration (1-${ic2_idx}): ${NC}"
+            local ic2_choice
+            read -r ic2_choice
+            
+            if [[ -z "${COMP2_IC_MAP[$ic2_choice]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                return
+            fi
+            
+            local ic2_ocid ic2_name
+            IFS='|' read -r ic2_ocid ic2_name <<< "${COMP2_IC_MAP[$ic2_choice]}"
+            
+            echo ""
+            echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ic2_ocid}${NC}"
+            echo -e "${YELLOW}Fetching configuration...${NC}"
+            
+            local ic2_json
+            ic2_json=$(oci compute-management instance-configuration get \
+                --instance-configuration-id "$ic2_ocid" \
+                --output json 2>/dev/null)
+            
+            if [[ -z "$ic2_json" ]] || ! echo "$ic2_json" | jq -e '.data' > /dev/null 2>&1; then
+                echo -e "${RED}Failed to fetch configuration${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            _compare_ic_vs_instance "$ic2_json" "$ic2_name"
+            ;;
+        3)
+            # IC vs Local File - cloud-init diff only
+            fetch_instance_configurations > /dev/null 2>&1
+            
+            if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
+                echo -e "${RED}No instance configurations found${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            # Select IC
+            local ic3_idx=0
+            declare -A COMP3_IC_MAP=()
+            
+            echo ""
+            printf "${BOLD}%-4s %-60s${NC}\n" "#" "Instance Configuration Name"
+            print_separator 80
+            
+            while IFS='|' read -r ic_ocid ic_name _; do
+                [[ "$ic_ocid" =~ ^#.*$ ]] && continue
+                [[ -z "$ic_ocid" ]] && continue
+                
+                ((ic3_idx++))
+                COMP3_IC_MAP[$ic3_idx]="$ic_ocid|$ic_name"
+                printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic3_idx" "$ic_name"
+            done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
+            
+            if [[ $ic3_idx -eq 0 ]]; then
+                echo -e "${GRAY}No instance configurations found${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            echo -n -e "${CYAN}Select instance configuration (1-${ic3_idx}): ${NC}"
+            local ic3_choice
+            read -r ic3_choice
+            
+            if [[ -z "${COMP3_IC_MAP[$ic3_choice]:-}" ]]; then
+                echo -e "${RED}Invalid selection${NC}"
+                return
+            fi
+            
+            local ic3_ocid ic3_name
+            IFS='|' read -r ic3_ocid ic3_name <<< "${COMP3_IC_MAP[$ic3_choice]}"
+            
+            # Select local file
+            echo ""
+            local ci_files=()
+            local ci_idx=0
+            while IFS= read -r -d '' ci_file; do
+                ((ci_idx++))
+                ci_files[$ci_idx]="$ci_file"
+            done < <(find . -maxdepth 1 \( -name 'cloud-init*.yml' -o -name 'cloud-init*.yaml' \) -print0 2>/dev/null | sort -z)
+            
+            local local_file=""
+            if [[ $ci_idx -gt 0 ]]; then
+                echo -e "${BOLD}${WHITE}Cloud-init files in current directory:${NC}"
+                for fi in $(seq 1 $ci_idx); do
+                    printf "  ${YELLOW}%-3s${NC} %s\n" "$fi" "${ci_files[$fi]}"
+                done
+                echo ""
+                echo -n -e "${CYAN}Select file # or enter path manually: ${NC}"
+                local file_choice
+                read -r file_choice
+                
+                if [[ "$file_choice" =~ ^[0-9]+$ ]] && [[ -n "${ci_files[$file_choice]:-}" ]]; then
+                    local_file="${ci_files[$file_choice]}"
+                else
+                    local_file="$file_choice"
+                fi
+            else
+                echo -n -e "${CYAN}Enter path to local cloud-init file: ${NC}"
+                read -r local_file
+            fi
+            
+            # Expand ~ to home directory
+            local_file="${local_file/#\~/$HOME}"
+            
+            if [[ ! -f "$local_file" ]]; then
+                echo -e "${RED}File not found: ${local_file}${NC}"
+                echo -e "Press Enter to return..."
+                read -r
+                return
+            fi
+            
+            echo ""
+            echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ic3_ocid}${NC}"
+            echo -e "${YELLOW}Fetching cloud-init from instance configuration...${NC}"
+            
+            local ic3_json
+            ic3_json=$(oci compute-management instance-configuration get \
+                --instance-configuration-id "$ic3_ocid" \
+                --output json 2>/dev/null)
+            
+            local ud_b64=""
+            if [[ -n "$ic3_json" ]] && echo "$ic3_json" | jq -e '.data' > /dev/null 2>&1; then
+                ud_b64=$(echo "$ic3_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
+            fi
+            
+            local tmp_config
+            tmp_config=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
+            
+            if [[ -n "$ud_b64" && "$ud_b64" != "null" ]]; then
+                decode_user_data_to_file "$ud_b64" "$tmp_config" || echo "# Failed to decode" > "$tmp_config"
+            else
+                echo "# No user_data" > "$tmp_config"
+            fi
+            
+            _display_cloudinit_diff "$tmp_config" "$ic3_name" "$local_file" "$(basename "$local_file") (local)"
+            
+            rm -f "$tmp_config"
             ;;
         *)
             return
             ;;
     esac
-}
-
-#--------------------------------------------------------------------------------
-# Internal: Diff cloud-init between two instance configurations
-#--------------------------------------------------------------------------------
-_diff_config_vs_config() {
-    # Refresh cache
-    fetch_instance_configurations > /dev/null 2>&1
-    
-    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        echo -e "${RED}No instance configurations found${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    # List configs
-    local ic_idx=0
-    declare -A DIFF_IC_MAP=()
-    
-    echo ""
-    printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
-    print_separator 80
-    
-    while IFS='|' read -r ic_ocid ic_name _; do
-        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
-        [[ -z "$ic_ocid" ]] && continue
-        
-        ((ic_idx++))
-        DIFF_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
-        printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic_idx" "$ic_name"
-    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
-    
-    if [[ $ic_idx -lt 2 ]]; then
-        echo ""
-        echo -e "${YELLOW}Need at least 2 instance configurations to compare${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    echo ""
-    echo -n -e "${CYAN}Select first configuration (1-${ic_idx}): ${NC}"
-    local choice1
-    read -r choice1
-    
-    if [[ -z "${DIFF_IC_MAP[$choice1]:-}" ]]; then
-        echo -e "${RED}Invalid selection${NC}"
-        return
-    fi
-    
-    echo -n -e "${CYAN}Select second configuration (1-${ic_idx}): ${NC}"
-    local choice2
-    read -r choice2
-    
-    if [[ -z "${DIFF_IC_MAP[$choice2]:-}" ]]; then
-        echo -e "${RED}Invalid selection${NC}"
-        return
-    fi
-    
-    local ocid1 name1 ocid2 name2
-    IFS='|' read -r ocid1 name1 <<< "${DIFF_IC_MAP[$choice1]}"
-    IFS='|' read -r ocid2 name2 <<< "${DIFF_IC_MAP[$choice2]}"
-    
-    echo ""
-    echo -e "${YELLOW}Fetching cloud-init from both configurations...${NC}"
-    
-    # Fetch full JSON first then extract with jq (same method as detail view)
-    local ic_json1 ic_json2 ud1 ud2
-    
-    ic_json1=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ocid1" \
-        --output json 2>/dev/null)
-    if [[ -n "$ic_json1" ]] && echo "$ic_json1" | jq -e '.data' > /dev/null 2>&1; then
-        ud1=$(echo "$ic_json1" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
-    fi
-    
-    ic_json2=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ocid2" \
-        --output json 2>/dev/null)
-    if [[ -n "$ic_json2" ]] && echo "$ic_json2" | jq -e '.data' > /dev/null 2>&1; then
-        ud2=$(echo "$ic_json2" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
-    fi
-    
-    # Create temp files
-    local tmp1 tmp2
-    tmp1=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
-    tmp2=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
-    
-    if [[ -n "$ud1" && "$ud1" != "null" ]]; then
-        decode_user_data_to_file "$ud1" "$tmp1" || echo "# Failed to decode" > "$tmp1"
-    else
-        echo "# No user_data" > "$tmp1"
-    fi
-    
-    if [[ -n "$ud2" && "$ud2" != "null" ]]; then
-        decode_user_data_to_file "$ud2" "$tmp2" || echo "# Failed to decode" > "$tmp2"
-    else
-        echo "# No user_data" > "$tmp2"
-    fi
-    
-    # Display the diff
-    _display_cloudinit_diff "$tmp1" "$name1" "$tmp2" "$name2"
-    
-    # Cleanup happens in _display_cloudinit_diff
-}
-
-#--------------------------------------------------------------------------------
-# Internal: Diff instance config cloud-init vs a local file
-#--------------------------------------------------------------------------------
-_diff_config_vs_file() {
-    # Refresh cache
-    fetch_instance_configurations > /dev/null 2>&1
-    
-    if [[ ! -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        echo -e "${RED}No instance configurations found${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    # List configs
-    local ic_idx=0
-    declare -A DIFF_IC_MAP=()
-    
-    echo ""
-    printf "${BOLD}%-4s %-60s${NC}\n" "#" "Name"
-    print_separator 80
-    
-    while IFS='|' read -r ic_ocid ic_name _; do
-        [[ "$ic_ocid" =~ ^#.*$ ]] && continue
-        [[ -z "$ic_ocid" ]] && continue
-        
-        ((ic_idx++))
-        DIFF_IC_MAP[$ic_idx]="$ic_ocid|$ic_name"
-        printf "${YELLOW}%-4s${NC} ${WHITE}%-60s${NC}\n" "$ic_idx" "$ic_name"
-    done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
-    
-    if [[ $ic_idx -eq 0 ]]; then
-        echo -e "${GRAY}No instance configurations found${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    echo ""
-    echo -n -e "${CYAN}Select instance configuration (1-${ic_idx}): ${NC}"
-    local choice
-    read -r choice
-    
-    if [[ -z "${DIFF_IC_MAP[$choice]:-}" ]]; then
-        echo -e "${RED}Invalid selection${NC}"
-        return
-    fi
-    
-    local ic_ocid ic_name
-    IFS='|' read -r ic_ocid ic_name <<< "${DIFF_IC_MAP[$choice]}"
-    
-    echo ""
-    
-    # Search for cloud-init*.yml files in current directory
-    local ci_files=()
-    local ci_idx=0
-    while IFS= read -r -d '' ci_file; do
-        ((ci_idx++))
-        ci_files[$ci_idx]="$ci_file"
-    done < <(find . -maxdepth 1 \( -name 'cloud-init*.yml' -o -name 'cloud-init*.yaml' \) -print0 2>/dev/null | sort -z)
-    
-    local local_file=""
-    if [[ $ci_idx -gt 0 ]]; then
-        echo -e "${BOLD}${WHITE}Cloud-init files in current directory:${NC}"
-        for fi in $(seq 1 $ci_idx); do
-            printf "  ${YELLOW}%-3s${NC} %s\n" "$fi" "${ci_files[$fi]}"
-        done
-        echo ""
-        echo -n -e "${CYAN}Select file # or enter path manually: ${NC}"
-        local file_choice
-        read -r file_choice
-        
-        if [[ "$file_choice" =~ ^[0-9]+$ ]] && [[ -n "${ci_files[$file_choice]:-}" ]]; then
-            local_file="${ci_files[$file_choice]}"
-        else
-            local_file="$file_choice"
-        fi
-    else
-        echo -n -e "${CYAN}Enter path to local cloud-init file: ${NC}"
-        read -r local_file
-    fi
-    
-    # Expand ~ to home directory
-    local_file="${local_file/#\~/$HOME}"
-    
-    if [[ ! -f "$local_file" ]]; then
-        echo -e "${RED}File not found: ${local_file}${NC}"
-        echo -e "Press Enter to return..."
-        read -r
-        return
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}Fetching cloud-init from instance configuration...${NC}"
-    
-    # Fetch full JSON first (same method as instance config detail view)
-    local ic_json
-    ic_json=$(oci compute-management instance-configuration get \
-        --instance-configuration-id "$ic_ocid" \
-        --output json 2>/dev/null)
-    
-    local ud_b64=""
-    if [[ -n "$ic_json" ]] && echo "$ic_json" | jq -e '.data' > /dev/null 2>&1; then
-        ud_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
-    fi
-    
-    # Create temp file for decoded config cloud-init
-    local tmp_config
-    tmp_config=$(mktemp "${TEMP_DIR}/tmp.XXXXXXXXXX")
-    
-    if [[ -n "$ud_b64" && "$ud_b64" != "null" ]]; then
-        decode_user_data_to_file "$ud_b64" "$tmp_config" || echo "# Failed to decode" > "$tmp_config"
-    else
-        echo "# No user_data" > "$tmp_config"
-    fi
-    
-    local local_basename
-    local_basename=$(basename "$local_file")
-    
-    # Display the diff
-    _display_cloudinit_diff "$tmp_config" "$ic_name" "$local_file" "$local_basename (local)"
-    
-    # Only cleanup the temp file, not the local file
-    rm -f "$tmp_config"
 }
 
 #--------------------------------------------------------------------------------
@@ -25885,6 +27474,7 @@ rename_instance_configuration_interactive() {
     echo ""
     
     # Fetch full details to generate recommended name
+    echo -e "${GRAY}oci compute-management instance-configuration get --instance-configuration-id ${ic_ocid}${NC}"
     echo -e "${YELLOW}Fetching configuration details...${NC}"
     local ic_json
     ic_json=$(oci compute-management instance-configuration get \
@@ -26246,37 +27836,46 @@ interactive_gpu_management() {
         echo -e "  ${MAGENTA}r${NC}           - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[GPU Fabrics] Enter # or command [f#/g#/i#/c#/create/update/r/back]: ${NC}"
         
-        local input
-        read -r input
-        
-        # Empty input goes back
-        if [[ -z "$input" ]]; then
-            return
-        fi
-        
-        case "$input" in
-            create|CREATE)
-                create_gpu_memory_cluster_interactive
-                ;;
-            update|UPDATE)
-                update_gpu_memory_cluster_interactive
-                ;;
-            r|R|refresh|REFRESH)
-                echo -e "${YELLOW}Refreshing cache...${NC}"
-                rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
-                ;;
-            quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
+        # Inner loop: stay at prompt without redrawing after view actions
+        while true; do
+            echo -n -e "${BOLD}${CYAN}[GPU Fabrics] Enter # or command [f#/g#/i#/c#/create/update/r/back]: ${NC}"
+            
+            local input
+            read -r input
+            
+            # Empty input goes back
+            if [[ -z "$input" ]]; then
                 return
-                ;;
-            f[0-9]*|g[0-9]*|i[0-9]*|c[0-9]*)
-                view_gpu_resource "$input"
-                ;;
-            *)
-                echo -e "${RED}Unknown command: $input${NC}"
-                ;;
-        esac
+            fi
+            
+            case "$input" in
+                create|CREATE)
+                    create_gpu_memory_cluster_interactive
+                    break  # Refresh display after create
+                    ;;
+                update|UPDATE)
+                    update_gpu_memory_cluster_interactive
+                    break  # Refresh display after update
+                    ;;
+                r|R|refresh|REFRESH)
+                    echo -e "${YELLOW}Refreshing cache...${NC}"
+                    rm -f "$FABRIC_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$INSTANCE_CONFIG_CACHE" "$COMPUTE_CLUSTER_CACHE"
+                    break  # Refresh display
+                    ;;
+                quit|QUIT|q|Q|exit|EXIT|back|BACK|b|B)
+                    return
+                    ;;
+                f[0-9]*|g[0-9]*|i[0-9]*|c[0-9]*)
+                    view_gpu_resource "$input"
+                    # Stay in inner loop - no refresh needed for view actions
+                    echo ""
+                    ;;
+                *)
+                    echo -e "${RED}Unknown command: $input${NC}"
+                    ;;
+            esac
+        done
     done
 }
 
@@ -26373,6 +27972,32 @@ view_gpu_resource() {
                     fabric_name=$(oci compute compute-gpu-memory-fabric get --compute-gpu-memory-fabric-id "$fabric_id" --query 'data."display-name"' --raw-output 2>/dev/null) || fabric_name="N/A"
                 fi
                 echo -e "GPU Memory Fabric:      ${GREEN}$fabric_name${NC} ${YELLOW}($fabric_id)${NC}"
+                
+                # ── Launch manage_compute_instances filtered to this cluster's instances ──
+                # Get instances from cache
+                local inst_lines=""
+                if [[ -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+                    inst_lines=$(grep "|${cluster_ocid}|" "$INSTANCE_CLUSTER_MAP_CACHE" 2>/dev/null)
+                fi
+                
+                if [[ -z "$inst_lines" ]]; then
+                    echo ""
+                    echo -e "  ${GRAY}(no instances found in cache for this cluster)${NC}"
+                    echo ""
+                    echo -e "Press Enter to continue..."
+                    read -r
+                else
+                    # Build pipe-separated OCID list for filter
+                    local filter_ocids=""
+                    while IFS='|' read -r _gocid _gcl _gcn; do
+                        [[ -z "$_gocid" || "$_gocid" == "#"* ]] && continue
+                        [[ -n "$filter_ocids" ]] && filter_ocids="${filter_ocids}|"
+                        filter_ocids="${filter_ocids}${_gocid}"
+                    done <<< "$inst_lines"
+                    
+                    # Call manage_compute_instances with cluster filter
+                    manage_compute_instances "GPU Cluster: ${cluster_name}" "$filter_ocids"
+                fi
             else
                 echo -e "${WHITE}OCID:${NC} ${YELLOW}$cluster_ocid${NC}"
                 echo ""
@@ -26387,162 +28012,8 @@ view_gpu_resource() {
                 return 1
             fi
             
-            echo ""
-            echo -e "${BOLD}${GREEN}=== Instance Configuration Details ===${NC}"
-            
-            local ic_json
-            ic_json=$(oci compute-management instance-configuration get \
-                --instance-configuration-id "$ic_ocid" \
-                --output json 2>/dev/null)
-            
-            if [[ -n "$ic_json" ]]; then
-                local ic_name ic_time_created ic_compartment
-                ic_name=$(echo "$ic_json" | jq -r '.data["display-name"] // "N/A"')
-                ic_time_created=$(echo "$ic_json" | jq -r '.data["time-created"] // "N/A"')
-                ic_compartment=$(echo "$ic_json" | jq -r '.data["compartment-id"] // "N/A"')
-                
-                echo -e "${WHITE}Name:${NC}         ${GREEN}$ic_name${NC}"
-                echo -e "${WHITE}OCID:${NC}         ${YELLOW}$ic_ocid${NC}"
-                echo -e "${WHITE}Time Created:${NC} $ic_time_created"
-                echo -e "${WHITE}Compartment:${NC}  ${WHITE}$(resolve_compartment_name "$ic_compartment")${NC} ${GRAY}($ic_compartment)${NC}"
-                
-                # Show instance details from the configuration
-                echo ""
-                echo -e "${BOLD}${CYAN}Instance Details:${NC}"
-                echo "$ic_json" | jq -r '
-                    .data["instance-details"]["launch-details"] // {} |
-                    "  Shape:              \(.shape // "N/A")",
-                    "  Availability Domain: \(.["availability-domain"] // "N/A")",
-                    "  Compartment:        \(.["compartment-id"][-20:] // "N/A")"
-                ' 2>/dev/null
-                
-                # Show source details
-                local source_type
-                source_type=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["source-type"] // "N/A"' 2>/dev/null)
-                echo -e "  Source Type:        $source_type"
-                
-                if [[ "$source_type" == "image" ]]; then
-                    local image_id
-                    image_id=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["source-details"]["image-id"] // "N/A"' 2>/dev/null)
-                    
-                    # Fetch image details to get the display name
-                    if [[ -n "$image_id" && "$image_id" != "N/A" ]]; then
-                        echo -e "  ${BOLD}${CYAN}Image:${NC}"
-                        local img_json img_name img_os img_os_version
-                        img_json=$(oci compute image get --image-id "$image_id" --output json 2>/dev/null)
-                        if [[ -n "$img_json" ]] && echo "$img_json" | jq -e '.data' > /dev/null 2>&1; then
-                            img_name=$(echo "$img_json" | jq -r '.data["display-name"] // "Unknown"')
-                            img_os=$(echo "$img_json" | jq -r '.data["operating-system"] // "N/A"')
-                            img_os_version=$(echo "$img_json" | jq -r '.data["operating-system-version"] // ""')
-                            echo -e "    Name:    ${WHITE}$img_name${NC}"
-                            echo -e "    OS:      ${WHITE}$img_os $img_os_version${NC}"
-                            echo -e "    OCID:    ${YELLOW}$image_id${NC}"
-                        else
-                            echo -e "    Name:    ${GRAY}(unable to fetch)${NC}"
-                            echo -e "    OCID:    ${YELLOW}$image_id${NC}"
-                        fi
-                    else
-                        echo -e "  Image ID:           ${GRAY}N/A${NC}"
-                    fi
-                fi
-                
-                # Check if user_data exists
-                local has_user_data="false"
-                local user_data_b64
-                user_data_b64=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["user_data"] // empty' 2>/dev/null)
-                [[ -n "$user_data_b64" ]] && has_user_data="true"
-                
-                # Check for other metadata
-                local ssh_keys
-                ssh_keys=$(echo "$ic_json" | jq -r '.data["instance-details"]["launch-details"]["metadata"]["ssh_authorized_keys"] // empty' 2>/dev/null)
-                if [[ -n "$ssh_keys" ]]; then
-                    echo ""
-                    echo -e "${BOLD}${CYAN}SSH Keys:${NC}"
-                    echo -e "  ${GRAY}(SSH authorized keys are configured)${NC}"
-                fi
-                
-                if [[ "$has_user_data" == "true" ]]; then
-                    echo ""
-                    echo -e "${BOLD}${CYAN}User Data:${NC}"
-                    echo -e "  ${GREEN}✓ Cloud-init user-data is configured${NC}"
-                fi
-                
-                # Show action option
-                echo ""
-                echo -e "${BOLD}${WHITE}Actions:${NC}"
-                if [[ "$has_user_data" == "true" ]]; then
-                    echo -e "  ${MAGENTA}user-data${NC}  - View decoded cloud-init user-data"
-                    echo -e "  ${MAGENTA}save${NC}       - Save user-data to file (cloud-init.yml)"
-                fi
-                echo -e "  ${RED}delete${NC}     - Delete this instance configuration"
-                echo -e "  ${CYAN}Enter${NC}      - Return to menu"
-                echo ""
-                echo -n -e "${CYAN}Action [user-data/save/delete/Enter]: ${NC}"
-                
-                local action
-                read -r action
-                
-                if [[ "$action" == "user-data" || "$action" == "userdata" || "$action" == "ud" ]]; then
-                    if [[ "$has_user_data" == "true" ]]; then
-                        echo ""
-                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
-                        echo -e "${BOLD}${MAGENTA}                         DECODED CLOUD-INIT USER-DATA                          ${NC}"
-                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
-                        echo ""
-                        # Decode and display the user-data (handles gzip)
-                        if is_user_data_gzip "$user_data_b64"; then
-                            echo -e "${GRAY}(gzip compressed - decompressing)${NC}"
-                            echo ""
-                        fi
-                        decode_user_data "$user_data_b64"
-                        echo ""
-                        echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════${NC}"
-                        echo ""
-                        echo -n -e "${CYAN}Press Enter to continue...${NC}"
-                        read -r
-                    else
-                        echo -e "${YELLOW}No user-data found in this instance configuration${NC}"
-                    fi
-                elif [[ "$action" == "save" || "$action" == "SAVE" ]]; then
-                    if [[ "$has_user_data" == "true" ]]; then
-                        # Generate safe filename from instance config name
-                        local safe_name
-                        safe_name=$(echo "$ic_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
-                        local filename="${safe_name}_cloud-init.yml"
-                        
-                        echo ""
-                        echo -n -e "${CYAN}Save as [${filename}]: ${NC}"
-                        local custom_filename
-                        read -r custom_filename
-                        [[ -n "$custom_filename" ]] && filename="$custom_filename"
-                        
-                        # Decode and save (handles gzip)
-                        local gzip_msg=""
-                        if is_user_data_gzip "$user_data_b64"; then
-                            gzip_msg=" ${GRAY}(decompressed from gzip)${NC}"
-                        fi
-                        
-                        if decode_user_data_to_file "$user_data_b64" "$filename"; then
-                            echo -e "${GREEN}✓ User-data saved to: ${WHITE}$(pwd)/${filename}${NC}${gzip_msg}"
-                        else
-                            echo -e "${RED}Failed to save user-data${NC}"
-                        fi
-                        echo ""
-                        echo -n -e "${CYAN}Press Enter to continue...${NC}"
-                        read -r
-                    else
-                        echo -e "${YELLOW}No user-data found in this instance configuration${NC}"
-                    fi
-                elif [[ "$action" == "delete" || "$action" == "DELETE" ]]; then
-                    # Store the ic_ocid for deletion
-                    IC_INDEX_MAP["delete_target"]="$ic_ocid"
-                    delete_single_instance_configuration "$ic_ocid" "$ic_name"
-                fi
-            else
-                echo -e "${WHITE}OCID:${NC} ${YELLOW}$ic_ocid${NC}"
-                echo ""
-                echo -e "${RED}Failed to fetch instance configuration details${NC}"
-            fi
+            # Delegate to the same detail view used by --manage 7
+            view_instance_configuration_detail "$resource_id"
             ;;
             
         c[0-9]*)
@@ -27329,8 +28800,8 @@ update_gpu_memory_cluster_interactive() {
     
     local success_count=0
     local fail_count=0
-    local log_file="${LOG_DIR}/gpu_cluster_actions.log"
-    mkdir -p "$LOG_DIR"
+    local log_file="${LOGS_DIR}/gpu_cluster_actions.log"
+    mkdir -p "$LOGS_DIR"
     
     for gid in "${valid_gids[@]}"; do
         local cluster_ocid="${CLUSTER_INDEX_MAP[$gid]}"
@@ -27717,6 +29188,7 @@ manage_compute_clusters() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         _display_cache_info \
             "${COMPUTE_CLUSTER_CACHE}|Compute Clusters"
+        echo -e "${GRAY}oci compute compute-cluster list --compartment-id \$COMPARTMENT_ID --all${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -28364,10 +29836,7 @@ rm_list_stacks_with_jobs() {
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${WHITE}                                  ALL STACKS WITH JOB HISTORY                                                    ${NC}"
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    local list_cmd="oci resource-manager stack list --compartment-id \"$compartment_id\" --all --output json"
-    echo -e "${GRAY}$list_cmd${NC}"
+    echo -e "${GRAY}oci resource-manager stack list --compartment-id \$COMPARTMENT_ID --all${NC}"
     echo ""
     
     local stacks_json
@@ -29769,13 +31238,13 @@ wr_list_work_requests_interactive() {
     echo -e "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    local list_cmd="oci work-requests work-request list --compartment-id \"$compartment_id\" --all --output json"
     local query_filter=""
     if [[ -n "$status_filter" ]]; then
         query_filter="--query \"data[?status=='${status_filter}']\""
-        list_cmd="oci work-requests work-request list --compartment-id \"$compartment_id\" --all $query_filter --output json"
+        echo -e "${GRAY}oci work-requests work-request list --compartment-id \$COMPARTMENT_ID --all --query \"data[?status=='${status_filter}']\"${NC}"
+    else
+        echo -e "${GRAY}oci work-requests work-request list --compartment-id \$COMPARTMENT_ID --all${NC}"
     fi
-    echo -e "${GRAY}$list_cmd${NC}"
     echo ""
     
     local wr_json
@@ -29832,8 +31301,8 @@ wr_list_work_requests_interactive() {
     echo ""
     
     # Print header
-    printf "${BOLD}%-6s %-40s %-15s %-6s %-20s %s${NC}\n" "ID" "Operation Type" "Status" "%" "Time Started" "Work Request OCID"
-    print_separator 180
+    printf "${BOLD}%-6s %-40s %-15s %-6s %-20s %-20s %s${NC}\n" "ID" "Operation Type" "Status" "%" "Time Accepted" "Time Finished" "Work Request OCID"
+    print_separator 200
     
     local idx=0
     # Clear and populate global work request map
@@ -29846,7 +31315,7 @@ wr_list_work_requests_interactive() {
         jq_path="."
     fi
     
-    while IFS='|' read -r operation_type status percent_complete time_started wr_id; do
+    while IFS='|' read -r operation_type status percent_complete time_accepted time_finished wr_id; do
         [[ -z "$operation_type" ]] && continue
         ((idx++))
         
@@ -29865,16 +31334,22 @@ wr_list_work_requests_interactive() {
         local op_trunc="${operation_type:0:38}"
         [[ ${#operation_type} -gt 38 ]] && op_trunc="${op_trunc}.."
         
-        # Format time
-        local time_short="${time_started:0:19}"
+        # Format times
+        local accepted_short="${time_accepted:0:19}"
+        [[ "$time_accepted" == "null" || -z "$time_accepted" ]] && accepted_short="N/A"
+        accepted_short="${accepted_short/T/ }"
+        
+        local finished_short="${time_finished:0:19}"
+        [[ "$time_finished" == "null" || -z "$time_finished" ]] && finished_short="--"
+        finished_short="${finished_short/T/ }"
         
         # Format percentage
         local pct_display="${percent_complete:-0}"
         
-        printf "${YELLOW}[w%-3s]${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s ${GRAY}%s${NC}\n" \
-            "$idx" "$op_trunc" "$status" "${pct_display}%" "$time_short" "$wr_id"
+        printf "${YELLOW}[w%-3s]${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_trunc" "$status" "${pct_display}%" "$accepted_short" "$finished_short" "$wr_id"
             
-    done < <(echo "$wr_json" | jq -r "${jq_path} | sort_by(.[\"time-started\"]) | reverse | .[] | \"\(.[\"operation-type\"])|\(.status)|\(.[\"percent-complete\"])|\(.[\"time-started\"])|\(.id)\"" 2>/dev/null)
+    done < <(echo "$wr_json" | jq -r "${jq_path} | sort_by(.[\"time-accepted\"]) | reverse | .[] | \"\(.[\"operation-type\"])|\(.status)|\(.[\"percent-complete\"])|\(.[\"time-accepted\"])|\(.[\"time-finished\"])|\(.id)\"" 2>/dev/null)
     
     echo ""
     
@@ -30076,15 +31551,15 @@ wr_list_work_requests() {
     echo ""
     
     # Print header
-    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Started" "Work Request OCID"
-    print_separator 180
+    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Accepted" "Time Finished" "Work Request OCID"
+    print_separator 200
     
     local idx=0
     # Clear and populate global work request map
     declare -gA WR_MAP
     WR_MAP=()
     
-    while IFS='|' read -r operation_type status percent_complete time_started wr_id; do
+    while IFS='|' read -r operation_type status percent_complete time_accepted time_finished wr_id; do
         [[ -z "$operation_type" ]] && continue
         ((idx++))
         
@@ -30103,16 +31578,22 @@ wr_list_work_requests() {
         local op_trunc="${operation_type:0:38}"
         [[ ${#operation_type} -gt 38 ]] && op_trunc="${op_trunc}.."
         
-        # Format time
-        local time_short="${time_started:0:19}"
+        # Format times
+        local accepted_short="${time_accepted:0:19}"
+        [[ "$time_accepted" == "null" || -z "$time_accepted" ]] && accepted_short="N/A"
+        accepted_short="${accepted_short/T/ }"
+        
+        local finished_short="${time_finished:0:19}"
+        [[ "$time_finished" == "null" || -z "$time_finished" ]] && finished_short="--"
+        finished_short="${finished_short/T/ }"
         
         # Format percentage
         local pct_display="${percent_complete:-0}"
         
-        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s ${GRAY}%s${NC}\n" \
-            "$idx" "$op_trunc" "$status" "${pct_display}%" "$time_short" "$wr_id"
+        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_trunc" "$status" "${pct_display}%" "$accepted_short" "$finished_short" "$wr_id"
             
-    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-started"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.id)"' 2>/dev/null)
+    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-accepted"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-accepted"])|\(.["time-finished"])|\(.id)"' 2>/dev/null)
     
     echo ""
     
@@ -30182,12 +31663,11 @@ wr_show_work_request_detail() {
     fi
     
     # Extract fields
-    local operation_type status percent_complete time_accepted time_started time_finished
+    local operation_type status percent_complete time_accepted time_finished
     operation_type=$(echo "$wr_json" | jq -r '.data["operation-type"] // "N/A"')
     status=$(echo "$wr_json" | jq -r '.data.status // "N/A"')
     percent_complete=$(echo "$wr_json" | jq -r '.data["percent-complete"] // "0"')
     time_accepted=$(echo "$wr_json" | jq -r '.data["time-accepted"] // "N/A"')
-    time_started=$(echo "$wr_json" | jq -r '.data["time-started"] // "N/A"')
     time_finished=$(echo "$wr_json" | jq -r '.data["time-finished"] // "N/A"')
     
     # Status color
@@ -30202,7 +31682,6 @@ wr_show_work_request_detail() {
     echo -e "  ${CYAN}Status:${NC}            ${status_color}$status${NC}"
     echo -e "  ${CYAN}Progress:${NC}          ${WHITE}${percent_complete}%${NC}"
     echo -e "  ${CYAN}Time Accepted:${NC}     ${WHITE}$time_accepted${NC}"
-    echo -e "  ${CYAN}Time Started:${NC}      ${WHITE}$time_started${NC}"
     echo -e "  ${CYAN}Time Finished:${NC}     ${WHITE}$time_finished${NC}"
     echo -e "  ${CYAN}Work Request OCID:${NC} ${YELLOW}$wr_id${NC}"
     echo ""
@@ -30447,14 +31926,14 @@ wr_search_by_resource() {
     echo ""
     
     # Print header
-    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Started" "Work Request OCID"
-    print_separator 180
+    printf "${BOLD}%-3s %-40s %-15s %-6s %-20s %-20s %s${NC}\n" "#" "Operation Type" "Status" "%" "Time Accepted" "Time Finished" "Work Request OCID"
+    print_separator 200
     
     local idx=0
     declare -gA WR_MAP
     WR_MAP=()
     
-    while IFS='|' read -r operation_type status percent_complete time_started wr_id; do
+    while IFS='|' read -r operation_type status percent_complete time_accepted time_finished wr_id; do
         [[ -z "$operation_type" ]] && continue
         ((idx++))
         
@@ -30471,13 +31950,20 @@ wr_search_by_resource() {
         local op_trunc="${operation_type:0:38}"
         [[ ${#operation_type} -gt 38 ]] && op_trunc="${op_trunc}.."
         
-        local time_short="${time_started:0:19}"
+        local accepted_short="${time_accepted:0:19}"
+        [[ "$time_accepted" == "null" || -z "$time_accepted" ]] && accepted_short="N/A"
+        accepted_short="${accepted_short/T/ }"
+        
+        local finished_short="${time_finished:0:19}"
+        [[ "$time_finished" == "null" || -z "$time_finished" ]] && finished_short="--"
+        finished_short="${finished_short/T/ }"
+        
         local pct_display="${percent_complete:-0}"
         
-        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s ${GRAY}%s${NC}\n" \
-            "$idx" "$op_trunc" "$status" "${pct_display}%" "$time_short" "$wr_id"
+        printf "${YELLOW}%-3s${NC} %-40s ${status_color}%-15s${NC} %-6s %-20s %-20s ${GRAY}%s${NC}\n" \
+            "$idx" "$op_trunc" "$status" "${pct_display}%" "$accepted_short" "$finished_short" "$wr_id"
             
-    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-started"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.id)"' 2>/dev/null)
+    done < <(echo "$wr_json" | jq -r '.data | sort_by(.["time-accepted"]) | reverse | .[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-accepted"])|\(.["time-finished"])|\(.id)"' 2>/dev/null)
     
     WR_COUNT=$idx
     
@@ -31272,6 +32758,7 @@ manage_file_storage() {
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${MAGENTA}                                      FILE STORAGE SERVICE (FSS)                                                 ${NC}"
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci fs file-system list | oci fs mount-target list | oci fs export list --compartment-id \$COMPARTMENT_ID${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -31418,8 +32905,6 @@ manage_file_storage() {
         echo -e "${RED}Invalid selection${NC}"
     done
 }
-
-
 #--------------------------------------------------------------------------------
 # FSS - Show Overview (Hierarchical: Mount Targets → Exports → File Systems)
 #--------------------------------------------------------------------------------
@@ -33243,6 +34728,7 @@ manage_lustre_file_systems() {
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${MAGENTA}                                        LUSTRE FILE SYSTEMS                                                      ${NC}"
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci lfs lustre-file-system-collection list-lustre-file-systems --compartment-id \$COMPARTMENT_ID --all${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -34711,14 +36197,14 @@ lfs_list_work_requests() {
     
     # Header
     printf "${BOLD}%-3s %-22s %-12s %-6s %-20s %-20s %s${NC}\n" \
-        "#" "Operation Type" "Status" "%" "Time Started" "Time Finished" "Work Request ID"
+        "#" "Operation Type" "Status" "%" "Time Accepted" "Time Finished" "Work Request ID"
     print_separator 160
     
     local idx=0
     declare -A WR_MAP
     WR_MAP=()
     
-    while IFS='|' read -r op_type status percent_complete time_started time_finished wr_id; do
+    while IFS='|' read -r op_type status percent_complete time_accepted time_finished wr_id; do
         [[ -z "$op_type" ]] && continue
         ((idx++))
         
@@ -34733,9 +36219,9 @@ lfs_list_work_requests() {
         esac
         
         # Format times - extract just date and time
-        local start_display="${time_started:0:19}"
-        [[ "$time_started" == "null" || -z "$time_started" ]] && start_display="N/A"
-        start_display="${start_display/T/ }"
+        local accepted_display="${time_accepted:0:19}"
+        [[ "$time_accepted" == "null" || -z "$time_accepted" ]] && accepted_display="N/A"
+        accepted_display="${accepted_display/T/ }"
         
         local finish_display="${time_finished:0:19}"
         [[ "$time_finished" == "null" || -z "$time_finished" ]] && finish_display="--"
@@ -34759,9 +36245,9 @@ lfs_list_work_requests() {
         fi
         
         printf "${YELLOW}%-3s${NC} %-22s ${status_color}%-12s${NC} %-6s %-20s %-20s ${GRAY}%s${NC}\n" \
-            "$idx" "$op_short" "$status" "$pct_display" "$start_display" "$finish_display" "$wr_id"
+            "$idx" "$op_short" "$status" "$pct_display" "$accepted_display" "$finish_display" "$wr_id"
             
-    done < <(echo "$wr_json" | jq -r '.data.items[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-started"])|\(.["time-finished"])|\(.id)"' 2>/dev/null)
+    done < <(echo "$wr_json" | jq -r '.data.items[] | "\(.["operation-type"])|\(.status)|\(.["percent-complete"])|\(.["time-accepted"])|\(.["time-finished"])|\(.id)"' 2>/dev/null)
     
     echo ""
     echo -e "${CYAN}Options:${NC}"
@@ -34798,12 +36284,11 @@ lfs_view_work_request_details() {
     fi
     
     # Extract fields
-    local op_type status percent_complete time_accepted time_started time_finished
+    local op_type status percent_complete time_accepted time_finished
     op_type=$(echo "$wr_json" | jq -r '.data["operation-type"] // "N/A"')
     status=$(echo "$wr_json" | jq -r '.data.status // "N/A"')
     percent_complete=$(echo "$wr_json" | jq -r '.data["percent-complete"] // "N/A"')
     time_accepted=$(echo "$wr_json" | jq -r '.data["time-accepted"] // "N/A"')
-    time_started=$(echo "$wr_json" | jq -r '.data["time-started"] // "N/A"')
     time_finished=$(echo "$wr_json" | jq -r '.data["time-finished"] // "N/A"')
     
     local status_color="$GREEN"
@@ -34823,13 +36308,12 @@ lfs_view_work_request_details() {
     
     echo -e "${BOLD}${CYAN}─── Timing ───${NC}"
     echo -e "  ${CYAN}Time Accepted:${NC}    ${WHITE}${time_accepted/T/ }${NC}"
-    echo -e "  ${CYAN}Time Started:${NC}     ${WHITE}${time_started/T/ }${NC}"
     echo -e "  ${CYAN}Time Finished:${NC}    ${WHITE}${time_finished/T/ }${NC}"
     
-    # Calculate duration if both start and finish are available
-    if [[ "$time_started" != "N/A" && "$time_started" != "null" && "$time_finished" != "N/A" && "$time_finished" != "null" ]]; then
+    # Calculate duration if both accepted and finish are available
+    if [[ "$time_accepted" != "N/A" && "$time_accepted" != "null" && "$time_finished" != "N/A" && "$time_finished" != "null" ]]; then
         local start_epoch finish_epoch duration_sec
-        start_epoch=$(date -d "${time_started}" +%s 2>/dev/null || echo "0")
+        start_epoch=$(date -d "${time_accepted}" +%s 2>/dev/null || echo "0")
         finish_epoch=$(date -d "${time_finished}" +%s 2>/dev/null || echo "0")
         if [[ "$start_epoch" -gt 0 && "$finish_epoch" -gt 0 ]]; then
             duration_sec=$((finish_epoch - start_epoch))
@@ -35284,16 +36768,163 @@ lfs_delete_object_storage_link() {
 #--------------------------------------------------------------------------------
 # Manage Capacity Topology - View host lifecycle states summary
 #--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+# Capacity Topology - Reusable search highlight helper
+# Usage: _ct_highlight_text "some text" "search_term"
+# Returns the text with case-insensitive matches wrapped in BG_YELLOW
+#--------------------------------------------------------------------------------
+_ct_highlight_text() {
+    local text="$1"
+    local term="$2"
+    
+    if [[ -z "$term" ]]; then
+        echo "$text"
+        return
+    fi
+    
+    # Use sed for case-insensitive replacement, wrapping matches in BG_YELLOW
+    # BG_YELLOW=\e[43m, NC=\e[0m
+    echo "$text" | sed -E "s/(${term})/\x1b[43m\1\x1b[0m/gI"
+}
+
+#--------------------------------------------------------------------------------
+# Capacity Topology - Search hosts across all fields
+# Searches: instance OCID, state, details, shape, topology, HPC, net, local block
+# Displays matching rows with search term highlighted
+#--------------------------------------------------------------------------------
+_ct_view_instance() {
+    local prefill="$1"
+    local instance_ocid=""
+    
+    if [[ -n "$prefill" && "$prefill" == ocid1.instance.* ]]; then
+        instance_ocid="$prefill"
+    else
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Instance Details] Paste instance OCID (Enter=back): ${NC}"
+        local input
+        read -r input
+        [[ -z "$input" ]] && return
+        if [[ "$input" == ocid1.instance.* ]]; then
+            instance_ocid="$input"
+        else
+            echo -e "${RED}Invalid OCID. Must start with ocid1.instance.${NC}"
+            sleep 1
+            return
+        fi
+    fi
+    
+    # Loop to handle refresh requests (return code 2 = refresh)
+    while true; do
+        display_instance_details "$instance_ocid"
+        local ret=$?
+        [[ $ret -ne 2 ]] && break
+    done
+}
+
+_ct_search_hosts() {
+    local search_context="${1:-all}"  # "all", "state:VALUE", "details:VALUE"
+    
+    while true; do
+        echo ""
+        echo -n -e "${BOLD}${CYAN}[Search] Enter search term (Enter=back): ${NC}"
+        local search_term
+        read -r search_term
+        
+        [[ -z "$search_term" ]] && return
+        
+        # If user pasted an instance OCID, show instance details instead of searching
+        if [[ "$search_term" == ocid1.instance.* ]]; then
+            _ct_view_instance "$search_term"
+            continue
+        fi
+        
+        # Escape regex special characters for safe grep/sed usage
+        local search_escaped
+        search_escaped=$(printf '%s' "$search_term" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+        
+        # Build the data set based on context
+        local data_lines
+        case "$search_context" in
+            state:*)
+                local filter_val="${search_context#state:}"
+                data_lines=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | grep "|${filter_val}|")
+                ;;
+            details:*)
+                local filter_val="${search_context#details:}"
+                data_lines=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v d="$filter_val" '$3 == d')
+                ;;
+            *)
+                data_lines=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE")
+                ;;
+        esac
+        
+        # Filter to matching lines (case-insensitive across all fields)
+        local matched_lines
+        matched_lines=$(echo "$data_lines" | grep -i "$search_escaped" 2>/dev/null)
+        
+        local match_count
+        match_count=$(echo "$matched_lines" | grep -c . 2>/dev/null)
+        [[ -z "$matched_lines" ]] && match_count=0
+        
+        echo ""
+        echo -e "${BOLD}${WHITE}═══ Search Results: '${YELLOW}${search_term}${WHITE}' ($match_count matches) ═══${NC}"
+        echo ""
+        
+        if [[ "$match_count" -eq 0 ]]; then
+            echo -e "  ${GRAY}No matches found for '${search_term}'${NC}"
+            continue
+        fi
+        
+        echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all | grep -i \"${search_term}\"${NC}"
+        echo ""
+        printf "${BOLD}%-145s %-12s %-15s %-25s %-22s %-22s %-22s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE" "HPC ISLAND (last 22)" "NET BLOCK (last 22)" "LOCAL BLK (last 22)"
+        echo "═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+        
+        echo "$matched_lines" | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+            [[ -z "$inst_id" ]] && continue
+            
+            local details_display="${details:0:13}"
+            [[ ${#details} -gt 13 ]] && details_display="${details_display}.."
+            [[ "$details" == "N/A" ]] && details_display="-"
+            
+            local shape_display="${inst_shape:-N/A}"
+            [[ "$shape_display" == "N/A" ]] && shape_display="-"
+            
+            local hpc_display="-" net_display="-" local_display="-"
+            [[ "$hpc_island" != "N/A" && -n "$hpc_island" ]] && hpc_display="..${hpc_island: -20}"
+            [[ "$net_block" != "N/A" && -n "$net_block" ]] && net_display="..${net_block: -20}"
+            [[ "$local_block" != "N/A" && -n "$local_block" ]] && local_display="..${local_block: -20}"
+            
+            # Build padded plain-text row, then apply highlighting via sed
+            local row
+            row=$(printf "%-145s %-12s %-15s %-25s %-22s %-22s %-22s" "$inst_id" "$state" "$details_display" "$shape_display" "$hpc_display" "$net_display" "$local_display")
+            
+            # Apply BG_YELLOW highlight to matching text (case-insensitive)
+            local highlighted
+            highlighted=$(echo "$row" | sed -E "s/(${search_escaped})/\x1b[43m\1\x1b[0m/gI" 2>/dev/null)
+            
+            # If sed failed (e.g. regex special chars), fall back to plain row
+            [[ -z "$highlighted" ]] && highlighted="$row"
+            
+            echo -e "$highlighted"
+        done
+        
+        echo ""
+        echo -e "  ${GRAY}Search again, paste an instance OCID for details, or press Enter to go back${NC}"
+    done
+}
+
 manage_capacity_topology() {
     local tenancy_id="${TENANCY_ID:-}"
     
     while true; do
         echo ""
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}${CYAN}                                      CAPACITY TOPOLOGY                                                         ${NC}"
-        echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${CYAN}                                                                     CAPACITY TOPOLOGY                                                                      ${NC}"
+        echo -e "${BOLD}${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         _display_cache_info \
             "${CAPACITY_TOPOLOGY_CACHE}|Capacity Hosts"
+        echo -e "${GRAY}oci compute compute-capacity-topology list --compartment-id \$TENANCY_ID --all${NC}"
         echo ""
         
         if [[ -z "$tenancy_id" ]]; then
@@ -35329,93 +36960,225 @@ manage_capacity_topology() {
         fi
         
         echo ""
-        echo -e "${BOLD}${WHITE}═══ Summary ═══════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${WHITE}═══ Summary ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "  ${WHITE}Total Hosts:${NC} ${GREEN}$total_hosts${NC}"
         echo ""
+        echo -e "${GRAY}oci compute capacity-topology list --compartment-id \$TENANCY_ID --all${NC}"
+        echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all${NC}"
+        echo ""
         
         #-----------------------------------------------------------------------
-        # Lifecycle State Summary
+        # RDMA Topology Overview (compact tree with shape/status counts)
         #-----------------------------------------------------------------------
-        echo -e "${BOLD}${WHITE}─── Lifecycle State Summary ───────────────────────────────────────────────────────────────────────────────────${NC}"
-        printf "  ${BOLD}%-25s %8s %8s${NC}\n" "STATE" "COUNT" "PERCENT"
-        echo -e "  ─────────────────────────────────────────────"
+        echo -e "${BOLD}${WHITE}─── RDMA Topology Overview ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "${GRAY}oci compute capacity-topology bare-metal-host list → HPC Island / Network Block / Local Block${NC}"
+        echo ""
         
-        # Get unique lifecycle states and counts
-        grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | cut -d'|' -f2 | sort | uniq -c | sort -rn | while read -r count state; do
-            local pct
-            pct=$(echo "scale=1; $count * 100 / $total_hosts" | bc)
+        # Aligned tree line helper
+        # Args: prefix, label_color, label_text, label_pad_width, count, value_color, value
+        # Visible column widths: CT=2, HPC=6, NB=10, LB=14, Shape=18
+        # Target alignment column = 45; label_pad = 45 - prefix_visible
+        _ro_line() {
+            local prefix="$1" lcolor="$2" label="$3" lwidth="$4" count="$5" vcolor="$6" value="$7"
+            echo -n -e "${prefix}${lcolor}"
+            printf "%-${lwidth}s" "$label"
+            echo -n -e "${NC} ${BOLD}[${WHITE}"
+            printf "%3s hosts" "$count"
+            echo -e "${NC}${BOLD}]${NC} ${vcolor}${value}${NC}"
+        }
+        
+        # Capacity Topology OCID(s) at top (prefix visible=2, pad=43)
+        local ro_topo_ocids
+        ro_topo_ocids=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | cut -d'|' -f4 | sort -u)
+        
+        echo "$ro_topo_ocids" | while IFS= read -r ro_tid; do
+            [[ -z "$ro_tid" ]] && continue
+            local ro_tid_cnt
+            ro_tid_cnt=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v t="$ro_tid" '$4 == t' | wc -l)
+            _ro_line "  " "${BOLD}${WHITE}" "Capacity Topology:" 43 "$ro_tid_cnt" "${YELLOW}" "$ro_tid"
+        done
+        echo ""
+        
+        # Get unique HPC Islands, N/A sorted last
+        local rdma_hpc_islands
+        rdma_hpc_islands=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | cut -d'|' -f6 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+        
+        local rdma_hpc_idx=0
+        local rdma_hpc_total
+        rdma_hpc_total=$(echo "$rdma_hpc_islands" | grep -c . 2>/dev/null)
+        
+        while IFS= read -r r_hpc_id; do
+            [[ -z "$r_hpc_id" ]] && continue
+            ((rdma_hpc_idx++))
             
-            local state_color="$WHITE"
-            case "$state" in
-                ACTIVE|HEALTHY) state_color="$GREEN" ;;
-                DEGRADED|IMPAIRED) state_color="$YELLOW" ;;
-                INACTIVE|FAILED|UNAVAILABLE) state_color="$RED" ;;
-                *) state_color="$GRAY" ;;
+            local r_hpc_conn="├"
+            local r_hpc_pipe="│"
+            [[ "$rdma_hpc_idx" -eq "$rdma_hpc_total" ]] && { r_hpc_conn="└"; r_hpc_pipe=" "; }
+            
+            local r_hpc_display="$r_hpc_id"
+            [[ "$r_hpc_id" == "N/A" ]] && r_hpc_display="(non-RDMA)"
+            
+            local r_hpc_hosts
+            r_hpc_hosts=$(grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v h="$r_hpc_id" '$6 == h')
+            local r_hpc_cnt
+            r_hpc_cnt=$(echo "$r_hpc_hosts" | grep -c . 2>/dev/null)
+            
+            # HPC Island (prefix visible=6, pad=39)
+            _ro_line "  ${r_hpc_conn}── " "${BOLD}${CYAN}" "HPC Island:" 39 "$r_hpc_cnt" "${YELLOW}" "$r_hpc_display"
+            
+            # Network Blocks within this HPC Island
+            local r_net_blocks
+            r_net_blocks=$(echo "$r_hpc_hosts" | cut -d'|' -f7 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+            local r_nb_idx=0
+            local r_nb_total
+            r_nb_total=$(echo "$r_net_blocks" | grep -c . 2>/dev/null)
+            
+            while IFS= read -r r_nb_id; do
+                [[ -z "$r_nb_id" ]] && continue
+                ((r_nb_idx++))
+                
+                local r_nb_conn="├"
+                local r_nb_pipe="│"
+                [[ "$r_nb_idx" -eq "$r_nb_total" ]] && { r_nb_conn="└"; r_nb_pipe=" "; }
+                
+                local r_nb_display="$r_nb_id"
+                [[ "$r_nb_id" == "N/A" ]] && r_nb_display="(none)"
+                
+                local r_nb_hosts
+                r_nb_hosts=$(echo "$r_hpc_hosts" | awk -F'|' -v n="$r_nb_id" '$7 == n')
+                local r_nb_cnt
+                r_nb_cnt=$(echo "$r_nb_hosts" | grep -c . 2>/dev/null)
+                
+                # Network Block (prefix visible=10, pad=35)
+                _ro_line "  ${r_hpc_pipe}   ${r_nb_conn}── " "${BOLD}${MAGENTA}" "Network Block:" 35 "$r_nb_cnt" "${YELLOW}" "$r_nb_display"
+                
+                # Local Blocks within this Network Block
+                local r_local_blocks
+                r_local_blocks=$(echo "$r_nb_hosts" | cut -d'|' -f8 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+                local r_lb_idx=0
+                local r_lb_total
+                r_lb_total=$(echo "$r_local_blocks" | grep -c . 2>/dev/null)
+                
+                while IFS= read -r r_lb_id; do
+                    [[ -z "$r_lb_id" ]] && continue
+                    ((r_lb_idx++))
+                    
+                    local r_lb_conn="├"
+                    local r_lb_pipe="│"
+                    [[ "$r_lb_idx" -eq "$r_lb_total" ]] && { r_lb_conn="└"; r_lb_pipe=" "; }
+                    
+                    local r_lb_display="$r_lb_id"
+                    [[ "$r_lb_id" == "N/A" ]] && r_lb_display="(none)"
+                    
+                    local r_lb_hosts
+                    r_lb_hosts=$(echo "$r_nb_hosts" | awk -F'|' -v l="$r_lb_id" '$8 == l')
+                    local r_lb_cnt
+                    r_lb_cnt=$(echo "$r_lb_hosts" | grep -c . 2>/dev/null)
+                    
+                    # Local Block (prefix visible=14, pad=31)
+                    _ro_line "  ${r_hpc_pipe}   ${r_nb_pipe}   ${r_lb_conn}── " "${BOLD}${BLUE}" "Local Block:" 31 "$r_lb_cnt" "${YELLOW}" "$r_lb_display"
+                    
+                    # Build shape × status breakdown for this local block
+                    local r_lb_breakdown
+                    r_lb_breakdown=$(echo "$r_lb_hosts" | awk -F'|' '{
+                        shape = ($5 == "" || $5 == "N/A") ? "-" : $5
+                        details = ($3 == "" || $3 == "N/A") ? "-" : $3
+                        key = shape "|" details
+                        count[key]++
+                    } END {
+                        for (k in count) printf "%s|%s\n", k, count[k]
+                    }' | sort -t'|' -k1,1 -k2,2)
+                    
+                    local r_brk_idx=0
+                    local r_brk_total
+                    r_brk_total=$(echo "$r_lb_breakdown" | grep -c . 2>/dev/null)
+                    
+                    echo "$r_lb_breakdown" | while IFS='|' read -r brk_shape brk_status brk_count; do
+                        [[ -z "$brk_shape" ]] && continue
+                        ((r_brk_idx++))
+                        
+                        local brk_conn="├"
+                        [[ "$r_brk_idx" -eq "$r_brk_total" ]] && brk_conn="└"
+                        
+                        # Color by status
+                        local brk_color="$WHITE"
+                        case "$brk_status" in
+                            AVAILABLE|ACTIVE|HEALTHY) brk_color="$GREEN" ;;
+                            DEGRADED|IMPAIRED) brk_color="$YELLOW" ;;
+                            UNAVAILABLE|FAILED|INACTIVE|MAINTENANCE*) brk_color="$RED" ;;
+                            *) brk_color="$WHITE" ;;
+                        esac
+                        
+                        # Shape (prefix visible=18, pad=27)
+                        _ro_line "  ${r_hpc_pipe}   ${r_nb_pipe}   ${r_lb_pipe}   ${brk_conn}── " "${CYAN}" "$brk_shape" 27 "$brk_count" "${brk_color}" "$brk_status"
+                    done
+                    
+                done <<< "$r_local_blocks"
+                
+            done <<< "$r_net_blocks"
+            
+        done <<< "$rdma_hpc_islands"
+        
+        echo ""
+        
+        #-----------------------------------------------------------------------
+        #-----------------------------------------------------------------------
+        # Lifecycle Summary (consolidated State + Details)
+        #-----------------------------------------------------------------------
+        echo -e "${BOLD}${WHITE}─── Lifecycle Summary ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        printf "  ${BOLD}%-15s %-30s %8s %8s${NC}\n" "STATE" "DETAILS" "COUNT" "PERCENT"
+        echo -e "  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+        
+        # Get unique state+details combinations with counts, sorted by count descending
+        grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' '{
+            state = $2
+            details = ($3 == "" || $3 == "N/A") ? "(none)" : $3
+            key = state "|" details
+            count[key]++
+        } END {
+            for (k in count) printf "%s|%s\n", k, count[k]
+        }' | sort -t'|' -k3 -rn | while IFS='|' read -r lc_state lc_details lc_count; do
+            [[ -z "$lc_state" ]] && continue
+            local lc_pct
+            lc_pct=$(echo "scale=1; $lc_count * 100 / $total_hosts" | bc)
+            
+            local lc_state_color="$WHITE"
+            case "$lc_state" in
+                ACTIVE|HEALTHY) lc_state_color="$GREEN" ;;
+                DEGRADED|IMPAIRED) lc_state_color="$YELLOW" ;;
+                INACTIVE|FAILED|UNAVAILABLE) lc_state_color="$RED" ;;
+                *) lc_state_color="$GRAY" ;;
             esac
             
-            printf "  ${state_color}%-25s${NC} %8s %7s%%\n" "$state" "$count" "$pct"
-        done
-        
-        echo ""
-        
-        #-----------------------------------------------------------------------
-        # Lifecycle Details Summary
-        #-----------------------------------------------------------------------
-        echo -e "${BOLD}${WHITE}─── Lifecycle Details Summary ─────────────────────────────────────────────────────────────────────────────────${NC}"
-        printf "  ${BOLD}%-40s %8s %8s${NC}\n" "DETAILS" "COUNT" "PERCENT"
-        echo -e "  ─────────────────────────────────────────────────────────────"
-        
-        # Get unique lifecycle details and counts
-        grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | cut -d'|' -f3 | sort | uniq -c | sort -rn | while read -r count details; do
-            local pct
-            pct=$(echo "scale=1; $count * 100 / $total_hosts" | bc)
-            
-            local details_color="$WHITE"
-            local details_display="${details:0:38}"
-            [[ ${#details} -gt 38 ]] && details_display="${details_display}.."
-            
-            case "$details" in
-                N/A|"") 
-                    details_color="$GRAY"
-                    details_display="(none)"
-                    ;;
-                *HEALTHY*|*ACTIVE*) details_color="$GREEN" ;;
-                *DEGRADED*|*WARNING*|*IMPAIRED*) details_color="$YELLOW" ;;
-                *FAILED*|*ERROR*|*UNAVAILABLE*) details_color="$RED" ;;
-                *) details_color="$WHITE" ;;
+            local lc_det_color="$WHITE"
+            case "$lc_details" in
+                "(none)") lc_det_color="$GRAY" ;;
+                *FAILED*|*ERROR*|*UNAVAILABLE*) lc_det_color="$RED" ;;
+                *DEGRADED*|*WARNING*|*IMPAIRED*) lc_det_color="$YELLOW" ;;
+                *HEALTHY*|*AVAILABLE*|*ACTIVE*) lc_det_color="$GREEN" ;;
             esac
             
-            printf "  ${details_color}%-40s${NC} %8s %7s%%\n" "$details_display" "$count" "$pct"
+            local lc_det_display="${lc_details:0:28}"
+            [[ ${#lc_details} -gt 28 ]] && lc_det_display="${lc_det_display}.."
+            
+            printf "  ${lc_state_color}%-15s${NC} ${lc_det_color}%-30s${NC} %8s %7s%%\n" "$lc_state" "$lc_det_display" "$lc_count" "$lc_pct"
         done
         
         echo ""
         
-        #-----------------------------------------------------------------------
-        # Topology Summary (by Topology OCID)
-        #-----------------------------------------------------------------------
-        echo -e "${BOLD}${WHITE}─── Topology Summary ──────────────────────────────────────────────────────────────────────────────────────────${NC}"
-        printf "  ${BOLD}%-50s %8s${NC}\n" "TOPOLOGY OCID" "HOSTS"
-        echo -e "  ─────────────────────────────────────────────────────────────"
-        
-        grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | cut -d'|' -f4 | sort | uniq -c | sort -rn | while read -r count topo_id; do
-            local topo_short="${topo_id:0:48}"
-            [[ ${#topo_id} -gt 48 ]] && topo_short="${topo_short}.."
-            printf "  ${YELLOW}%-50s${NC} %8s\n" "$topo_short" "$count"
-        done
-        
-        echo ""
-        
-        #-----------------------------------------------------------------------
         # Actions Menu
         #-----------------------------------------------------------------------
-        echo -e "${BOLD}${WHITE}─── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "${BOLD}${WHITE}─── Actions ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${YELLOW}1${NC}) View hosts by lifecycle state"
         echo -e "  ${YELLOW}2${NC}) View hosts by lifecycle details"
         echo -e "  ${YELLOW}3${NC}) View all hosts (detailed)"
+        echo -e "  ${YELLOW}4${NC}) View RDMA topology tree (HPC Island → Network Block → Local Block)"
+        echo -e "  ${YELLOW}s${NC}) Search hosts"
+        echo -e "  ${YELLOW}i${NC}) Instance details (paste OCID)"
         echo -e "  ${MAGENTA}r${NC}) Refresh data"
         echo -e "  ${CYAN}Enter${NC}) Return to menu"
         echo ""
-        echo -n -e "${BOLD}${CYAN}[Capacity Topology] Select [1-3/r/Enter]: ${NC}"
+        echo -n -e "${BOLD}${CYAN}[Capacity Topology] Select [1-4/s/i/r/Enter]: ${NC}"
         
         local choice
         read -r choice
@@ -35429,6 +37192,18 @@ manage_capacity_topology() {
                 ;;
             3)
                 capacity_topology_view_all_hosts
+                ;;
+            4)
+                capacity_topology_view_rdma_tree
+                ;;
+            s|S)
+                _ct_search_hosts "all"
+                ;;
+            i|I)
+                _ct_view_instance
+                ;;
+            ocid1.instance.*)
+                _ct_view_instance "$choice"
                 ;;
             r|R)
                 # Force refresh by removing cache
@@ -35475,13 +37250,12 @@ capacity_topology_view_by_state() {
     echo ""
     echo -e "${BOLD}${WHITE}═══ Hosts with Lifecycle State: ${CYAN}$selected_state${NC} ${BOLD}${WHITE}═══${NC}"
     echo ""
-    printf "${BOLD}%-50s %-15s %-30s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS"
-    echo "─────────────────────────────────────────────────────────────────────────────────────────────────────"
+    echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all${NC}"
+    echo ""
+    printf "${BOLD}%-145s %-15s %-20s %-25s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
+    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
-    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | grep "|${selected_state}|" | while IFS='|' read -r inst_id state details topo_id; do
-        local inst_short="${inst_id:0:48}"
-        [[ ${#inst_id} -gt 48 ]] && inst_short="${inst_short}.."
-        
+    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | grep "|${selected_state}|" | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35489,21 +37263,27 @@ capacity_topology_view_by_state() {
             INACTIVE|FAILED|UNAVAILABLE) state_color="$RED" ;;
         esac
         
-        local details_display="${details:0:28}"
-        [[ ${#details} -gt 28 ]] && details_display="${details_display}.."
+        local details_display="${details:0:18}"
+        [[ ${#details} -gt 18 ]] && details_display="${details_display}.."
         [[ "$details" == "N/A" ]] && details_display="-"
         
-        printf "${YELLOW}%-50s${NC} ${state_color}%-15s${NC} %-30s\n" "$inst_short" "$state" "$details_display"
-    done
+        local shape_display="${inst_shape:-N/A}"
+        [[ "$shape_display" == "N/A" ]] && shape_display="-"
+        
+        printf "${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_id" "$state" "$details_display" "$shape_display"
+    done 
     
     echo ""
-    echo -n -e "${CYAN}Press Enter to continue...${NC}"
-    read -r
+    echo -e "  ${YELLOW}s${NC}) Search within this view    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
+    echo -n -e "${BOLD}${CYAN}[State View] Select [s/i/Enter]: ${NC}"
+    local view_choice
+    read -r view_choice
+    case "$view_choice" in
+        s|S) _ct_search_hosts "state:${selected_state}" ;;
+        i|I) _ct_view_instance ;;
+        ocid1.instance.*) _ct_view_instance "$view_choice" ;;
+    esac
 }
-
-#--------------------------------------------------------------------------------
-# Capacity Topology - View hosts filtered by lifecycle details
-#--------------------------------------------------------------------------------
 capacity_topology_view_by_details() {
     echo ""
     echo -e "${CYAN}Select lifecycle details to filter:${NC}"
@@ -35538,13 +37318,12 @@ capacity_topology_view_by_details() {
     echo ""
     echo -e "${BOLD}${WHITE}═══ Hosts with Lifecycle Details: ${CYAN}$display_title${NC} ${BOLD}${WHITE}═══${NC}"
     echo ""
-    printf "${BOLD}%-50s %-15s %-30s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS"
-    echo "─────────────────────────────────────────────────────────────────────────────────────────────────────"
+    echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all${NC}"
+    echo ""
+    printf "${BOLD}%-145s %-15s %-20s %-25s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
+    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
-    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v d="$selected_details" '$3 == d' | while IFS='|' read -r inst_id state details topo_id; do
-        local inst_short="${inst_id:0:48}"
-        [[ ${#inst_id} -gt 48 ]] && inst_short="${inst_short}.."
-        
+    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v d="$selected_details" '$3 == d' | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35552,16 +37331,26 @@ capacity_topology_view_by_details() {
             INACTIVE|FAILED|UNAVAILABLE) state_color="$RED" ;;
         esac
         
-        local details_display="${details:0:28}"
-        [[ ${#details} -gt 28 ]] && details_display="${details_display}.."
+        local details_display="${details:0:18}"
+        [[ ${#details} -gt 18 ]] && details_display="${details_display}.."
         [[ "$details" == "N/A" ]] && details_display="-"
         
-        printf "${YELLOW}%-50s${NC} ${state_color}%-15s${NC} %-30s\n" "$inst_short" "$state" "$details_display"
-    done
+        local shape_display="${inst_shape:-N/A}"
+        [[ "$shape_display" == "N/A" ]] && shape_display="-"
+        
+        printf "${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_id" "$state" "$details_display" "$shape_display"
+    done 
     
     echo ""
-    echo -n -e "${CYAN}Press Enter to continue...${NC}"
-    read -r
+    echo -e "  ${YELLOW}s${NC}) Search within this view    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
+    echo -n -e "${BOLD}${CYAN}[Details View] Select [s/i/Enter]: ${NC}"
+    local view_choice
+    read -r view_choice
+    case "$view_choice" in
+        s|S) _ct_search_hosts "details:${selected_details}" ;;
+        i|I) _ct_view_instance ;;
+        ocid1.instance.*) _ct_view_instance "$view_choice" ;;
+    esac
 }
 
 #--------------------------------------------------------------------------------
@@ -35571,13 +37360,12 @@ capacity_topology_view_all_hosts() {
     echo ""
     echo -e "${BOLD}${WHITE}═══ All Capacity Topology Hosts ═══${NC}"
     echo ""
-    printf "${BOLD}%-55s %-12s %-25s %-30s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "TOPOLOGY"
-    echo "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+    echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all${NC}"
+    echo ""
+    printf "${BOLD}%-145s %-12s %-15s %-25s %-22s %-22s %-22s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE" "HPC ISLAND (last 22)" "NET BLOCK (last 22)" "LOCAL BLK (last 22)"
+    echo "═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
-    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | sort -t'|' -k2,2 -k3,3 | while IFS='|' read -r inst_id state details topo_id; do
-        local inst_short="${inst_id:0:53}"
-        [[ ${#inst_id} -gt 53 ]] && inst_short="${inst_short}.."
-        
+    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | sort -t'|' -k2,2 -k3,3 | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35585,19 +37373,203 @@ capacity_topology_view_all_hosts() {
             INACTIVE|FAILED|UNAVAILABLE) state_color="$RED" ;;
         esac
         
-        local details_display="${details:0:23}"
-        [[ ${#details} -gt 23 ]] && details_display="${details_display}.."
+        local details_display="${details:0:13}"
+        [[ ${#details} -gt 13 ]] && details_display="${details_display}.."
         [[ "$details" == "N/A" ]] && details_display="-"
         
-        local topo_short="${topo_id:0:28}"
-        [[ ${#topo_id} -gt 28 ]] && topo_short="${topo_short}.."
+        local shape_display="${inst_shape:-N/A}"
+        [[ "$shape_display" == "N/A" ]] && shape_display="-"
         
-        printf "${YELLOW}%-55s${NC} ${state_color}%-12s${NC} %-25s ${GRAY}%-30s${NC}\n" "$inst_short" "$state" "$details_display" "$topo_short"
-    done | less -R
+        # Show last 22 chars of RDMA topology OCIDs for readability
+        local hpc_display="-" net_display="-" local_display="-"
+        [[ "$hpc_island" != "N/A" && -n "$hpc_island" ]] && hpc_display="..${hpc_island: -20}"
+        [[ "$net_block" != "N/A" && -n "$net_block" ]] && net_display="..${net_block: -20}"
+        [[ "$local_block" != "N/A" && -n "$local_block" ]] && local_display="..${local_block: -20}"
+        
+        printf "${YELLOW}%-145s${NC} ${state_color}%-12s${NC} %-15s %-25s ${GRAY}%-22s %-22s %-22s${NC}\n" "$inst_id" "$state" "$details_display" "$shape_display" "$hpc_display" "$net_display" "$local_display"
+    done 
     
     echo ""
-    echo -n -e "${CYAN}Press Enter to continue...${NC}"
-    read -r
+    echo -e "  ${YELLOW}s${NC}) Search within this view    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
+    echo -n -e "${BOLD}${CYAN}[All Hosts View] Select [s/i/Enter]: ${NC}"
+    local view_choice
+    read -r view_choice
+    case "$view_choice" in
+        s|S) _ct_search_hosts "all" ;;
+        i|I) _ct_view_instance ;;
+        ocid1.instance.*) _ct_view_instance "$view_choice" ;;
+    esac
+}
+
+#--------------------------------------------------------------------------------
+# Capacity Topology - View RDMA topology tree
+# Shows hierarchy: HPC Island → Network Block → Local Block → Hosts
+#--------------------------------------------------------------------------------
+capacity_topology_view_rdma_tree() {
+    echo ""
+    echo -e "${BOLD}${WHITE}═══ RDMA Topology Tree ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GRAY}oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all${NC}"
+    echo -e "${GRAY}Hierarchy: HPC Island → Network Block → Local Block → Hosts${NC}"
+    echo ""
+    
+    local cache="$CAPACITY_TOPOLOGY_CACHE"
+    
+    # Aligned tree line helper (same as overview but no 2-space leading indent)
+    # Visible column widths: CT=2, HPC=4, NB=8, LB=12
+    # Target alignment column = 43; label_pad = 43 - prefix_visible
+    _rt_line() {
+        local prefix="$1" lcolor="$2" label="$3" lwidth="$4" count="$5" vcolor="$6" value="$7"
+        echo -n -e "${prefix}${lcolor}"
+        printf "%-${lwidth}s" "$label"
+        echo -n -e "${NC} ${BOLD}[${WHITE}"
+        printf "%3s hosts" "$count"
+        echo -e "${NC}${BOLD}]${NC} ${vcolor}${value}${NC}"
+    }
+    
+    # Capacity Topology OCID(s) at top (prefix visible=2, pad=41)
+    local rt_topo_ocids
+    rt_topo_ocids=$(grep -v "^#" "$cache" | cut -d'|' -f4 | sort -u)
+    
+    echo "$rt_topo_ocids" | while IFS= read -r rt_tid; do
+        [[ -z "$rt_tid" ]] && continue
+        local rt_tid_cnt
+        rt_tid_cnt=$(grep -v "^#" "$cache" | awk -F'|' -v t="$rt_tid" '$4 == t' | wc -l)
+        _rt_line "  " "${BOLD}${WHITE}" "Capacity Topology:" 41 "$rt_tid_cnt" "${YELLOW}" "$rt_tid"
+    done
+    echo ""
+    
+    # Get unique HPC Islands (field 6), sort N/A last
+    local hpc_islands
+    hpc_islands=$(grep -v "^#" "$cache" | cut -d'|' -f6 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+    
+    local hpc_idx=0
+    local hpc_total
+    hpc_total=$(echo "$hpc_islands" | grep -c . 2>/dev/null)
+    
+    while IFS= read -r hpc_id; do
+        [[ -z "$hpc_id" ]] && continue
+        ((hpc_idx++))
+        
+        local hpc_connector="├"
+        local hpc_pipe="│"
+        [[ "$hpc_idx" -eq "$hpc_total" ]] && { hpc_connector="└"; hpc_pipe=" "; }
+        
+        # Count hosts in this HPC Island
+        local hpc_hosts
+        hpc_hosts=$(grep -v "^#" "$cache" | awk -F'|' -v h="$hpc_id" '$6 == h')
+        local hpc_host_count
+        hpc_host_count=$(echo "$hpc_hosts" | grep -c . 2>/dev/null)
+        
+        # Display HPC Island
+        local hpc_display="$hpc_id"
+        [[ "$hpc_id" == "N/A" ]] && hpc_display="(non-RDMA)"
+        
+        # HPC Island (prefix visible=4, pad=39)
+        _rt_line "${hpc_connector}── " "${BOLD}${CYAN}" "HPC Island:" 39 "$hpc_host_count" "${YELLOW}" "$hpc_display"
+        
+        # Get unique Network Blocks within this HPC Island
+        local net_blocks
+        net_blocks=$(echo "$hpc_hosts" | cut -d'|' -f7 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+        
+        local nb_idx=0
+        local nb_total
+        nb_total=$(echo "$net_blocks" | grep -c . 2>/dev/null)
+        
+        while IFS= read -r nb_id; do
+            [[ -z "$nb_id" ]] && continue
+            ((nb_idx++))
+            
+            local nb_connector="├"
+            local nb_pipe="│"
+            [[ "$nb_idx" -eq "$nb_total" ]] && { nb_connector="└"; nb_pipe=" "; }
+            
+            # Count hosts in this Network Block
+            local nb_hosts
+            nb_hosts=$(echo "$hpc_hosts" | awk -F'|' -v n="$nb_id" '$7 == n')
+            local nb_host_count
+            nb_host_count=$(echo "$nb_hosts" | grep -c . 2>/dev/null)
+            
+            local nb_display="$nb_id"
+            [[ "$nb_id" == "N/A" ]] && nb_display="(none)"
+            
+            # Network Block (prefix visible=8, pad=35)
+            _rt_line "${hpc_pipe}   ${nb_connector}── " "${BOLD}${MAGENTA}" "Network Block:" 35 "$nb_host_count" "${YELLOW}" "$nb_display"
+            
+            # Get unique Local Blocks within this Network Block
+            local local_blocks
+            local_blocks=$(echo "$nb_hosts" | cut -d'|' -f8 | sort -u | awk '/^N\/A$/{last=$0;next}{print} END{if(last)print last}')
+            
+            local lb_idx=0
+            local lb_total
+            lb_total=$(echo "$local_blocks" | grep -c . 2>/dev/null)
+            
+            while IFS= read -r lb_id; do
+                [[ -z "$lb_id" ]] && continue
+                ((lb_idx++))
+                
+                local lb_connector="├"
+                local lb_pipe="│"
+                [[ "$lb_idx" -eq "$lb_total" ]] && { lb_connector="└"; lb_pipe=" "; }
+                
+                # Get hosts in this Local Block
+                local lb_hosts
+                lb_hosts=$(echo "$nb_hosts" | awk -F'|' -v l="$lb_id" '$8 == l')
+                local lb_host_count
+                lb_host_count=$(echo "$lb_hosts" | grep -c . 2>/dev/null)
+                
+                local lb_display="$lb_id"
+                [[ "$lb_id" == "N/A" ]] && lb_display="(none)"
+                
+                # Local Block (prefix visible=12, pad=31)
+                _rt_line "${hpc_pipe}   ${nb_pipe}   ${lb_connector}── " "${BOLD}${BLUE}" "Local Block:" 31 "$lb_host_count" "${YELLOW}" "$lb_display"
+                
+                # List individual hosts
+                local host_idx=0
+                local host_total="$lb_host_count"
+                
+                echo "$lb_hosts" | sort -t'|' -k2,2 | while IFS='|' read -r inst_id h_state h_details h_topo h_shape _hpc _nb _lb h_tcreated h_tupdated; do
+                    [[ -z "$inst_id" ]] && continue
+                    ((host_idx++))
+                    
+                    local host_connector="├"
+                    [[ "$host_idx" -eq "$host_total" ]] && host_connector="└"
+                    
+                    local state_color="$GREEN"
+                    case "$h_state" in
+                        ACTIVE|HEALTHY) state_color="$GREEN" ;;
+                        DEGRADED|IMPAIRED) state_color="$YELLOW" ;;
+                        INACTIVE|FAILED|UNAVAILABLE) state_color="$RED" ;;
+                        *) state_color="$WHITE" ;;
+                    esac
+                    
+                    local h_details_display="${h_details}"
+                    [[ "$h_details" == "N/A" ]] && h_details_display="-"
+                    
+                    local h_shape_display="${h_shape:-N/A}"
+                    [[ "$h_shape_display" == "N/A" ]] && h_shape_display="-"
+                    
+                    echo -e "${hpc_pipe}   ${nb_pipe}   ${lb_pipe}   ${host_connector}── ${CYAN}${h_shape_display}${NC} ${BOLD}[${state_color}${h_state}${NC}${BOLD}]${NC} ${state_color}${h_details_display}${NC} ${GRAY}${inst_id}${NC}"
+                done
+                
+                echo -e "${hpc_pipe}   ${nb_pipe}   ${lb_pipe}"
+            done <<< "$local_blocks"
+            
+        done <<< "$net_blocks"
+        
+        echo -e "${hpc_pipe}"
+    done <<< "$hpc_islands"
+    
+    echo ""
+    echo -e "  ${YELLOW}s${NC}) Search hosts    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
+    echo -n -e "${BOLD}${CYAN}[RDMA Tree] Select [s/i/Enter]: ${NC}"
+    local view_choice
+    read -r view_choice
+    case "$view_choice" in
+        s|S) _ct_search_hosts "all" ;;
+        i|I) _ct_view_instance ;;
+        ocid1.instance.*) _ct_view_instance "$view_choice" ;;
+    esac
 }
 
 #--------------------------------------------------------------------------------
@@ -35655,7 +37627,7 @@ manage_kubernetes() {
 k8s_deregister_node() {
     local compartment_id="$1"
     local region="$2"
-    local log_file="${LOG_DIR}/k8s_deregister_$(date +%Y%m%d_%H%M%S).log"
+    local log_file="${LOGS_DIR}/k8s_deregister_$(date +%Y%m%d_%H%M%S).log"
     
     echo ""
     echo -e "${BOLD}${YELLOW}═══ Deregister Node (Kubelet Issue) ═══${NC}"
@@ -35838,7 +37810,7 @@ k8s_deregister_node() {
         return
     fi
     
-    mkdir -p "$LOG_DIR"
+    mkdir -p "$LOGS_DIR"
     
     # Step 1: Drain the node
     echo ""
@@ -35929,6 +37901,8 @@ manage_gpu_instance_tagging() {
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${MAGENTA}                                        GPU INSTANCE TAGGING                                                     ${NC}"
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci iam tag-namespace list --compartment-id \$TENANCY_ID | oci iam tag list --tag-namespace-id \$TAG_NS_ID${NC}"
+        echo -e "${GRAY}Home region derived from: oci iam region-subscription list --tenancy-id \"\$TENANCY_ID\" --query \"data[?\\\"is-home-region\\\"==\\\`true\\\`].\\\"region-name\\\" | [0]\"${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Configuration:${NC}"
@@ -35937,8 +37911,6 @@ manage_gpu_instance_tagging() {
         echo -e "  ${CYAN}Namespace:${NC}   ${WHITE}${GPU_TAG_NAMESPACE}${NC}"
         echo -e "  ${CYAN}Tag Name:${NC}    ${WHITE}${GPU_TAG_NAME}${NC}"
         echo -e "  ${CYAN}Tag Values:${NC}  ${WHITE}${GPU_TAG_VALUES}${NC}"
-        echo ""
-        echo -e "${GRAY}Home region derived from: oci iam region-subscription list --tenancy-id \"\$TENANCY_ID\" --query \"data[?\\\"is-home-region\\\"==\\\`true\\\`].\\\"region-name\\\" | [0]\"${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}═══ Actions ═══${NC}"
@@ -35987,6 +37959,7 @@ manage_kubernetes() {
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${MAGENTA}                                        KUBERNETES MANAGEMENT                                                     ${NC}"
         echo -e "${BOLD}${MAGENTA}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}kubectl get nodes | oci compute instance list --compartment-id \$COMPARTMENT_ID${NC}"
         echo ""
         
         echo -e "${BOLD}${WHITE}Environment:${NC}"
@@ -36274,6 +38247,7 @@ manage_nvidia_gpu_stack_health() {
     echo -e "${BOLD}${GREEN}                                                    NVIDIA GPU STACK HEALTH CHECK                                                                      ${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
+    echo -e "${GRAY}kubectl get nodes -o json | kubectl get pods -n gpu-operator -o json | kubectl get pods -n nvidia-dra-driver-gpu -o json${NC}"
     
     # Check if kubectl is available
     if ! command -v kubectl &>/dev/null; then
@@ -38801,6 +40775,7 @@ manage_object_storage() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                              OBJECT STORAGE MANAGEMENT                                            ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci os ns get | oci os bucket list | oci os private-endpoint list --compartment-id \$COMPARTMENT_ID${NC}"
         echo ""
         echo -e "${BOLD}${WHITE}Environment:${NC}"
         echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
@@ -39099,12 +41074,11 @@ os_view_work_request_details() {
     fi
     
     # Extract details
-    local wr_status wr_operation wr_percent wr_accepted wr_started wr_finished
+    local wr_status wr_operation wr_percent wr_accepted wr_finished
     wr_status=$(echo "$wr_json" | jq -r '.data.status // "N/A"')
     wr_operation=$(echo "$wr_json" | jq -r '.data["operation-type"] // "N/A"')
     wr_percent=$(echo "$wr_json" | jq -r '.data["percent-complete"] // 0')
     wr_accepted=$(echo "$wr_json" | jq -r '.data["time-accepted"] // "N/A"')
-    wr_started=$(echo "$wr_json" | jq -r '.data["time-started"] // "N/A"')
     wr_finished=$(echo "$wr_json" | jq -r '.data["time-finished"] // "N/A"')
     
     # Status color
@@ -39124,7 +41098,6 @@ os_view_work_request_details() {
     echo ""
     echo -e "${BOLD}${WHITE}─── Timestamps ───${NC}"
     echo -e "  ${CYAN}Accepted:${NC}  ${WHITE}${wr_accepted:0:19}${NC}"
-    echo -e "  ${CYAN}Started:${NC}   ${WHITE}${wr_started:0:19}${NC}"
     echo -e "  ${CYAN}Finished:${NC}  ${WHITE}${wr_finished:0:19}${NC}"
     
     # Show resources
@@ -41167,6 +43140,7 @@ manage_custom_images() {
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}${CYAN}                                              CUSTOM IMAGES MANAGEMENT                                              ${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GRAY}oci compute image list --compartment-id \$COMPARTMENT_ID --sort-by TIMECREATED --all${NC}"
         echo ""
         echo -e "${BOLD}${WHITE}Environment:${NC}"
         echo -e "  ${CYAN}Region:${NC}      ${WHITE}${region}${NC}"
@@ -42551,7 +44525,7 @@ show_help() {
     echo "    Logs all actions to ./logs/k8s_maintenance_YYYYMMDD.log"
     echo ""
     echo -e "${BOLD}Resource Management:${NC}"
-    echo "  --manage            Interactive resource management mode"
+    echo "  --manage [#]        Interactive resource management mode (optional: jump to menu #)"
     echo "                      - OKE Cluster environment view"
     echo "                      - Network resources (subnets, NSGs)"
     echo "                      - GPU Memory Fabrics & Clusters (create, update, view)"
@@ -42593,6 +44567,7 @@ show_help() {
     echo "  $0 --list-cliques                                     # List all cliques with fabric details"
     echo "  $0 --cliques-summary                                  # Summary table of cliques with fabric"
     echo "  $0 --manage                                           # Interactive resource management"
+    echo "  $0 --manage 10                                        # Jump directly to Capacity Topology"
     echo "  $0 --manage --debug                                   # Resource management with debug output"
     echo "  $0 --setup                                            # Run initial setup wizard"
     echo "  $0 ocid1.instance.oc1.us-dallas-1.xxx                 # Basic node info"
@@ -43193,7 +45168,8 @@ main() {
             list_cliques_summary
             ;;
         --manage)
-            interactive_management_main_menu
+            shift
+            interactive_management_main_menu "$1"
             ;;
         --maintenance)
             list_maintenance_instances "$EFFECTIVE_COMPARTMENT_ID" "$EFFECTIVE_REGION"
