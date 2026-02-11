@@ -135,6 +135,19 @@ readonly NSG_RULES_DETAIL_DIR="${CACHE_DIR}/nsg_rules_detail"
 readonly SL_CACHE="${CACHE_DIR}/security_lists.txt"
 readonly XR_CACHE_DIR="${CACHE_DIR}/xr_map"
 readonly XR_CACHE_TTL=180  # 3 minutes for cross-region DRG map
+
+# DRG Topology display section flags (all enabled by default)
+declare -gA DRG_TOPO_FLAGS=(
+    [compartments]=1    # Section 2: Compartments
+    [vcn]=1             # Section 4: VCN
+    [attachments]=1     # Section 5: Attachments
+    [peering]=1         # Section 6: Remote Peering
+    [fastconnect]=1     # Section 6b: FastConnect Virtual Circuits
+    [ipsec]=1           # Section 6c: IPSec VPN Connections
+    [routes]=1          # Section 7+8: Route Rules + NSGs/SLs
+    [distributions]=1   # Section 9-11: Import/Export Route Distributions
+    [summary]=1         # Unified Route Summary
+)
 readonly MAINT_EVENTS_CACHE="${CACHE_DIR}/maintenance_events.json"
 readonly MAINT_EVENTS_CACHE_TTL=3600  # 1 hour TTL for maintenance events
 readonly FAULT_DETAILS_CACHE="${CACHE_DIR}/fault_details.txt"
@@ -296,7 +309,7 @@ _display_cache_info() {
         local ext="${cache_file##*.}"
         if [[ "$ext" == "json" ]]; then
             # JSON: try common envelope patterns
-            count=$(jq -r '(.data // []) | if type == "array" then length else 0 end' "$cache_file" 2>/dev/null || echo 0)
+            count=$(jq -r 'if (.data | type) == "array" then (.data | length) elif (.data.items // null | type) == "array" then (.data.items | length) else 0 end' "$cache_file" 2>/dev/null || echo 0)
         elif [[ -n "$type_filter" ]]; then
             # Text with prefix filter (e.g. SUBNET, NSG)
             count=$(grep -c "^${type_filter}|" "$cache_file" 2>/dev/null || true)
@@ -6657,23 +6670,53 @@ list_all_announcements() {
     
     _ui_banner "ALL ANNOUNCEMENTS"
     _display_cache_info \
-        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
-    _ui_oci_cmd "oci announce announcements list --compartment-id \$COMPARTMENT_ID --all"
+        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements" \
+        "${INSTANCE_LIST_CACHE}|Instances"
+    _ui_oci_cmd "oci announce announcements list --compartment-id \$COMPARTMENT_ID --all | oci compute instance list --compartment-id \$COMPARTMENT_ID --all | oci announce announcements get --announcement-id \$ID (×N)"
     echo ""
     
-    log_info "Fetching announcements from OCI..."
+    #==========================================================================
+    # Fetch announcements list + instances (step-progress checkboxes)
+    #==========================================================================
+    _step_init
     
-    # Force refresh of announcements cache
+    # Step 1: Announcements list (always force refresh)
+    _step_active "Announcements"
     rm -f "$ANNOUNCEMENTS_LIST_CACHE"
-    
-    if ! oci announce announcements list \
-            --compartment-id "$compartment_id" \
-            --all > "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null; then
+    oci announce announcements list \
+        --compartment-id "$compartment_id" \
+        --all > "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null
+    if [[ $? -ne 0 || ! -f "$ANNOUNCEMENTS_LIST_CACHE" ]]; then
+        _step_complete "Announcements"
+        _step_finish
         log_error "Failed to fetch announcements"
         return 1
     fi
+    _step_complete "Announcements"
     
-    # Get announcement count
+    # Step 2: Instances for validation (reuse INSTANCE_LIST_CACHE from --manage 6 if fresh)
+    _step_active "Instances"
+    local instances_json
+    local instance_cache_ttl=300
+    if is_cache_fresh "$INSTANCE_LIST_CACHE" "$instance_cache_ttl"; then
+        instances_json=$(cat "$INSTANCE_LIST_CACHE")
+    else
+        instances_json=$(oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null)
+        if [[ -n "$instances_json" ]] && jq -e '.data' <<< "$instances_json" > /dev/null 2>&1; then
+            echo "$instances_json" > "$INSTANCE_LIST_CACHE"
+        fi
+    fi
+    _step_complete "Instances"
+    
+    _step_finish
+    
+    #==========================================================================
+    # Validate announcement count
+    #==========================================================================
     local ann_count
     ann_count=$(jq '.data.items | length' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null) || ann_count=0
     
@@ -6686,16 +6729,9 @@ list_all_announcements() {
     echo -e "${GRAY}Found ${WHITE}${ann_count}${GRAY} announcement(s)${NC}"
     echo ""
     
-    # Fetch all instances in compartment for validation
-    log_info "Fetching instances for validation..."
-    local instances_json
-    instances_json=$(oci compute instance list \
-        --compartment-id "$compartment_id" \
-        --region "$region" \
-        --all \
-        --output json 2>/dev/null)
-    
-    # Build instance lookup (OCID -> display_name|state)
+    #==========================================================================
+    # Build instance lookup from cached data
+    #==========================================================================
     declare -A INSTANCE_LOOKUP
     if [[ -n "$instances_json" ]]; then
         while IFS='|' read -r ocid name state; do
@@ -6703,24 +6739,57 @@ list_all_announcements() {
         done < <(jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])"' <<< "$instances_json" 2>/dev/null)
     fi
     
-    # Fetch details for each announcement
-    log_info "Fetching announcement details..."
+    #==========================================================================
+    # Fetch announcement details (parallel N+1 with progress bar)
+    #==========================================================================
     local announcement_ids
     announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
     
-    # Fetch details in parallel
-    local ann_id
-    local _ann_pids=()
-    for ann_id in $announcement_ids; do
-        local detail_file="${CACHE_DIR}/ann_${ann_id##*.}.json"
-        oci announce announcements get --announcement-id "$ann_id" --output json > "$detail_file" 2>/dev/null &
-        _ann_pids+=($!)
-    done
-    if [[ ${#_ann_pids[@]} -gt 0 ]]; then
-        _show_spinner "Fetching ${#_ann_pids[@]} announcement details..." &
-        local _ann_sp=$!
-        wait "${_ann_pids[@]}"
-        _kill_spinner $_ann_sp "Fetched ${#_ann_pids[@]} announcement details"
+    # Build ID list
+    local _ann_id_list=()
+    local _ann_id
+    while IFS= read -r _ann_id; do
+        [[ -n "$_ann_id" ]] && _ann_id_list+=("$_ann_id")
+    done <<< "$announcement_ids"
+    
+    local _ann_total=${#_ann_id_list[@]}
+    
+    if [[ $_ann_total -gt 0 ]]; then
+        echo -e "  ${GRAY}Command: oci announce announcements get --announcement-id \$ID  (×${_ann_total})${NC}"
+        
+        local _ann_progress_dir
+        _ann_progress_dir=$(mktemp -d)
+        local _ann_pids=()
+        local _ann_max_parallel=10
+        local _ann_running=0
+        
+        # Start progress bar in background (tracks marker files in temp dir)
+        show_parallel_progress "$_ann_progress_dir" "done_*" "$_ann_total" "announcement details" &
+        local _ann_progress_pid=$!
+        
+        for (( _ai=0; _ai<_ann_total; _ai++ )); do
+            (
+                local _aid="${_ann_id_list[$_ai]}"
+                local _detail_file="${CACHE_DIR}/ann_${_aid##*.}.json"
+                oci announce announcements get --announcement-id "$_aid" --output json > "$_detail_file" 2>/dev/null
+                # Write completion marker for progress tracking
+                touch "${_ann_progress_dir}/done_${_ai}"
+            ) &
+            _ann_pids+=($!)
+            ((_ann_running++))
+            if [[ $_ann_running -ge $_ann_max_parallel ]]; then
+                wait -n 2>/dev/null || true
+                ((_ann_running--))
+            fi
+        done
+        
+        [[ ${#_ann_pids[@]} -gt 0 ]] && wait "${_ann_pids[@]}" 2>/dev/null
+        
+        # Stop progress bar + print final 100% line
+        kill "$_ann_progress_pid" 2>/dev/null
+        wait "$_ann_progress_pid" 2>/dev/null
+        printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) announcement details \n" "$_ann_total" "$_ann_total"
+        rm -rf "$_ann_progress_dir" 2>/dev/null
     fi
     
     # ── Display function (called for default filtered + show-all) ──
@@ -7022,9 +7091,9 @@ list_all_announcements() {
             if [[ $resource_count -gt 0 ]]; then
                 echo ""
                 echo -e "  ${WHITE}Affected Resources (${resource_count}):${NC}"
-                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-                printf "  ${BOLD}%-40s %-30s %-16s %-22s${NC}\n" "Instance OCID" "Display Name" "OCI State" "GPU Memory Cluster"
-                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+                printf "  ${BOLD}%-90s %-30s %-16s %-70s${NC}\n" "Instance OCID" "Display Name" "OCI State" "GPU Memory Cluster"
+                echo -e "  ${GRAY}─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
                 
                 local i
                 for ((i=0; i<resource_count; i++)); do
@@ -7075,19 +7144,19 @@ list_all_announcements() {
                         fi
                     fi
                     
-                    # Truncate OCID for display
+                    # Show full OCID
                     local ocid_display="N/A"
                     if [[ "$resource_id" != "N/A" && -n "$resource_id" ]]; then
-                        ocid_display="...${resource_id: -37}"
+                        ocid_display="$resource_id"
                     fi
                     
-                    # Truncate GPU memory cluster
+                    # Show full GPU memory cluster OCID
                     local gpu_display="N/A"
                     if [[ "$gpu_mem_cluster" != "N/A" && -n "$gpu_mem_cluster" ]]; then
-                        gpu_display="...${gpu_mem_cluster: -19}"
+                        gpu_display="$gpu_mem_cluster"
                     fi
                     
-                    printf "  %-40s %-30s ${state_color}%-16s${NC} %-22s\n" \
+                    printf "  ${YELLOW}%-90s${NC} %-30s ${state_color}%-16s${NC} %-70s\n" \
                         "$ocid_display" "${instance_display_name:0:30}" "$instance_state" "$gpu_display"
                 done
             else
@@ -8835,12 +8904,47 @@ display_compartment_selector() {
 #--------------------------------------------------------------------------------
 # Cache for resolved compartment names to avoid repeated API calls
 declare -gA RESOLVED_COMP_NAME_CACHE=()
+declare -g  _COMP_CACHE_WARMED=0  # Track if file cache has been bulk-loaded
+
+# Bulk-load all compartment names from COMPARTMENTS_CACHE into in-memory cache
+# Call this before loops that resolve many compartments (e.g., BFS, DRG discovery)
+_warm_comp_name_cache() {
+    [[ "$_COMP_CACHE_WARMED" -eq 1 ]] && return 0
+    
+    # Source 1: COMPARTMENTS_CACHE file (from --manage 17 / compartment selector)
+    if [[ -f "$COMPARTMENTS_CACHE" && -s "$COMPARTMENTS_CACHE" ]]; then
+        local _cage=$(($(date +%s) - $(stat -c %Y "$COMPARTMENTS_CACHE" 2>/dev/null || echo 0)))
+        if [[ $_cage -lt ${CACHE_MAX_AGE:-600} ]]; then
+            local _cnt=0
+            while IFS='|' read -r _cid _cname; do
+                [[ -z "$_cid" || -z "$_cname" ]] && continue
+                [[ -z "${RESOLVED_COMP_NAME_CACHE[$_cid]+_}" ]] && RESOLVED_COMP_NAME_CACHE[$_cid]="$_cname"
+                ((_cnt++))
+            done < <(jq -r '.data[]? | "\(.id)|\(.name)"' "$COMPARTMENTS_CACHE" 2>/dev/null)
+            [[ "$DEBUG_MODE" == "true" ]] && echo -e "  ${GRAY}[DRG-DBG] Warmed comp name cache: $_cnt compartments from COMPARTMENTS_CACHE${NC}" >&2
+            _COMP_CACHE_WARMED=1
+            return 0
+        fi
+    fi
+    
+    # Source 2: COMP_MAP (from compartment selector if loaded)
+    if [[ ${#COMP_MAP[@]} -gt 0 ]]; then
+        for _cid in "${!COMP_MAP[@]}"; do
+            [[ -z "${RESOLVED_COMP_NAME_CACHE[$_cid]+_}" ]] && RESOLVED_COMP_NAME_CACHE[$_cid]="${COMP_MAP[$_cid]%%|*}"
+        done
+        [[ "$DEBUG_MODE" == "true" ]] && echo -e "  ${GRAY}[DRG-DBG] Warmed comp name cache: ${#COMP_MAP[@]} from COMP_MAP${NC}" >&2
+        _COMP_CACHE_WARMED=1
+        return 0
+    fi
+    
+    return 1
+}
 
 resolve_compartment_name() {
     local ocid="$1"
     [[ -z "$ocid" ]] && echo "Unknown" && return
     
-    # Check cache first
+    # Check in-memory cache first (instant)
     if [[ -n "${RESOLVED_COMP_NAME_CACHE[$ocid]+_}" ]]; then
         echo "${RESOLVED_COMP_NAME_CACHE[$ocid]}"
         return
@@ -8848,7 +8952,18 @@ resolve_compartment_name() {
     
     local name=""
     
-    # Method 1: Try oci iam compartment get (--raw-output for reliability)
+    # Method 1: Try COMPARTMENTS_CACHE file (bulk-load on first miss, then lookup)
+    # This avoids individual API calls when the full list is already cached on disk
+    if [[ "$_COMP_CACHE_WARMED" -eq 0 ]]; then
+        _warm_comp_name_cache
+    fi
+    # Re-check in-memory after warm
+    if [[ -n "${RESOLVED_COMP_NAME_CACHE[$ocid]+_}" ]]; then
+        echo "${RESOLVED_COMP_NAME_CACHE[$ocid]}"
+        return
+    fi
+    
+    # Method 2: Try oci iam compartment get (single API call)
     if [[ "$ocid" == ocid1.compartment.* ]]; then
         name=$(oci iam compartment get --compartment-id "$ocid" --query 'data.name' --raw-output 2>/dev/null)
         if [[ -n "$name" && "$name" != "null" && "$name" != "None" ]]; then
@@ -8865,7 +8980,7 @@ resolve_compartment_name() {
         fi
     fi
     
-    # Method 2: Try as tenancy (root compartment)
+    # Method 3: Try as tenancy (root compartment)
     if [[ "$ocid" == ocid1.tenancy.* ]]; then
         name=$(oci iam tenancy get --tenancy-id "$ocid" --query 'data.name' --raw-output 2>/dev/null)
         if [[ -n "$name" && "$name" != "null" && "$name" != "None" ]]; then
@@ -8881,7 +8996,7 @@ resolve_compartment_name() {
         fi
     fi
     
-    # Method 3: If OCID prefix unknown or above failed, try both
+    # Method 4: If OCID prefix unknown or above failed, try both
     if [[ -z "$name" ]]; then
         name=$(oci iam compartment get --compartment-id "$ocid" --query 'data.name' --raw-output 2>/dev/null)
         if [[ -n "$name" && "$name" != "null" && "$name" != "None" ]]; then
@@ -8899,23 +9014,17 @@ resolve_compartment_name() {
         fi
     fi
     
-    # Method 4: Search via compartment list from tenancy
+    # Method 5: Fetch/refresh full compartment list (use COMPARTMENTS_CACHE → live API fallback)
     if [[ -z "$name" ]]; then
-        # Get tenancy ID - try multiple sources
-        local tenancy_id="${TENANCY_OCID:-}"
-        if [[ -z "$tenancy_id" ]]; then
-            tenancy_id="${TENANCY_ID:-}"
-        fi
+        local tenancy_id="${TENANCY_OCID:-${TENANCY_ID:-}}"
         if [[ -z "$tenancy_id" ]]; then
             local vf="${VARIABLES_FILE:-./variables.sh}"
             tenancy_id=$(grep "^TENANCY_OCID=" "$vf" 2>/dev/null | head -1 | cut -d'"' -f2)
             [[ -z "$tenancy_id" ]] && tenancy_id=$(grep "^TENANCY_ID=" "$vf" 2>/dev/null | head -1 | cut -d'"' -f2)
         fi
-        # Try OCI CLI config file for tenancy
         if [[ -z "$tenancy_id" && -f "$HOME/.oci/config" ]]; then
             tenancy_id=$(grep "^tenancy=" "$HOME/.oci/config" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d ' ')
         fi
-        # Try instance metadata as last resort for tenancy
         if [[ -z "$tenancy_id" ]]; then
             tenancy_id=$(curl -sH "Authorization: Bearer Oracle" -L http://169.254.169.254/opc/v2/instance/ 2>/dev/null | jq -r '.tenantId // empty' 2>/dev/null)
         fi
@@ -8931,18 +9040,38 @@ resolve_compartment_name() {
                 fi
             fi
             
-            # Search in full compartment list
-            name=$(oci iam compartment list --compartment-id "$tenancy_id" --compartment-id-in-subtree true --all --output json 2>/dev/null \
-                | jq -r --arg id "$ocid" '.data[] | select(.id == $id) | .name // empty' 2>/dev/null)
-            if [[ -n "$name" ]]; then
-                RESOLVED_COMP_NAME_CACHE[$ocid]="$name"
-                echo "$name"
-                return
+            # Try reading from COMPARTMENTS_CACHE file first (may be stale but available)
+            if [[ -f "$COMPARTMENTS_CACHE" && -s "$COMPARTMENTS_CACHE" ]]; then
+                name=$(jq -r --arg id "$ocid" '.data[]? | select(.id == $id) | .name // empty' "$COMPARTMENTS_CACHE" 2>/dev/null)
+                if [[ -n "$name" ]]; then
+                    RESOLVED_COMP_NAME_CACHE[$ocid]="$name"
+                    echo "$name"
+                    return
+                fi
+            fi
+            
+            # Last resort: live API call to fetch full compartment list, cache it
+            local _comp_list_json
+            _comp_list_json=$(oci iam compartment list --compartment-id "$tenancy_id" --compartment-id-in-subtree true --all --output json 2>/dev/null)
+            if [[ -n "$_comp_list_json" ]] && jq -e '.data[0]' <<< "$_comp_list_json" >/dev/null 2>&1; then
+                # Save to COMPARTMENTS_CACHE for future use
+                echo "$_comp_list_json" > "$COMPARTMENTS_CACHE" 2>/dev/null
+                # Bulk-load ALL into in-memory cache
+                while IFS='|' read -r _cid _cname; do
+                    [[ -z "$_cid" || -z "$_cname" ]] && continue
+                    RESOLVED_COMP_NAME_CACHE[$_cid]="$_cname"
+                done < <(jq -r '.data[] | "\(.id)|\(.name)"' <<< "$_comp_list_json" 2>/dev/null)
+                _COMP_CACHE_WARMED=1
+                # Now check if our target is resolved
+                if [[ -n "${RESOLVED_COMP_NAME_CACHE[$ocid]+_}" ]]; then
+                    echo "${RESOLVED_COMP_NAME_CACHE[$ocid]}"
+                    return
+                fi
             fi
         fi
     fi
     
-    # Method 5: Check if COMP_MAP (from compartment selector) has it
+    # Method 6: Check if COMP_MAP (from compartment selector) has it
     if [[ -z "$name" && -n "${COMP_MAP[$ocid]+_}" ]]; then
         name="${COMP_MAP[$ocid]%%|*}"
         if [[ -n "$name" ]]; then
@@ -12090,6 +12219,9 @@ def print_compartment(comp_id, prefix="", is_last=True, depth=0):
     comp_matches_filter = True
     if filter_type == 'compartment' and filter_patterns:
         comp_matches_filter = matches_filter(comp_name, filter_patterns)
+        # Root compartment is listed as "(root)" but named tenancy_name here
+        if not comp_matches_filter and comp_id == tenancy_ocid:
+            comp_matches_filter = matches_filter('(root)', filter_patterns)
         if not comp_matches_filter:
             def has_matching_descendant(cid):
                 c = compartments.get(cid, {})
@@ -14287,7 +14419,8 @@ manage_oke_cluster() {
                 continue
                 ;;
             show|SHOW)
-                continue
+                manage_oke_cluster
+                return
                 ;;
         esac
         
@@ -14934,6 +15067,7 @@ manage_network_resources() {
     fi
     
     # Pre-cache compartment names to avoid "Unknown" in all sub-menus
+    _warm_comp_name_cache
     if [[ -n "$compartment_id" ]]; then
         resolve_compartment_name "$compartment_id" >/dev/null 2>&1
     fi
@@ -15394,10 +15528,10 @@ manage_network_resources() {
                     | jq --arg drg "$drg_id" '[.data[] | select(.["drg-id"] == $drg and .["lifecycle-state"] != "DETACHED")] | length' 2>/dev/null)
                 [[ -n "$_ac" && "$_ac" =~ ^[0-9]+$ ]] && att_count=$((att_count + _ac))
             done
-            # Fallback: if compartment search found 0, try --drg-id directly
-            if [[ "$att_count" -eq 0 ]]; then
+            # Fallback: if compartment search found 0, try DRG's own compartment
+            if [[ "$att_count" -eq 0 && -n "$drg_comp" ]]; then
                 local _drg_ac
-                _drg_ac=$(oci network drg-attachment list --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null \
+                _drg_ac=$(oci network drg-attachment list --compartment-id "$drg_comp" --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null \
                     | jq '[.data[] | select(.["lifecycle-state"] != "DETACHED")] | length' 2>/dev/null)
                 [[ -n "$_drg_ac" && "$_drg_ac" =~ ^[0-9]+$ ]] && att_count=$_drg_ac
             fi
@@ -15681,6 +15815,7 @@ display_drg_connectivity_map() {
     # --- DRG Route Tables (cache for lookups) ---
     declare -A DRT_NAME_CACHE DRT_RULES_CACHE
     local drt_json
+    _drg_dbg_cmd "DRG RT list" "oci network drg-route-table list --drg-id ${drg_id} --region $region"
     drt_json=$(oci network drg-route-table list --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null)
     if [[ -n "$drt_json" ]] && jq -e '.data[0]' <<< "$drt_json" >/dev/null 2>&1; then
         while IFS='|' read -r drt_id drt_name drt_import_dist; do
@@ -15701,6 +15836,7 @@ display_drg_connectivity_map() {
     local all_attachments="[]"
     for comp in "${all_comps[@]}"; do
         local att_json
+        _drg_dbg_cmd "DRG att list (per comp)" "oci network drg-attachment list --compartment-id ${comp} --region $region"
         att_json=$(oci network drg-attachment list --compartment-id "$comp" --region "$region" --all --output json 2>/dev/null)
         if [[ -n "$att_json" ]] && jq -e '.data[0]' <<< "$att_json" >/dev/null 2>&1; then
             local filtered
@@ -15715,9 +15851,10 @@ display_drg_connectivity_map() {
     local all_rpcs="[]"
     for comp in "${all_comps[@]}"; do
         local rpc_json
+        _drg_dbg_cmd "RPC list" "oci network remote-peering-connection list --compartment-id ${comp} --drg-id ${drg_id} --region $region"
         rpc_json=$(oci network remote-peering-connection list --compartment-id "$comp" --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$rpc_json" ]] && jq -e '.data[0]' <<< "$rpc_json" >/dev/null 2>&1; then
-            all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$rpc_json" 2>/dev/null)
+            all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data' <<< "$rpc_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
         fi
     done
     
@@ -15725,9 +15862,10 @@ display_drg_connectivity_map() {
     local all_ipsec="[]"
     for comp in "${all_comps[@]}"; do
         local ipsec_json
+        _drg_dbg_cmd "IPSec list" "oci network ip-sec-connection list --compartment-id ${comp} --drg-id ${drg_id} --region $region"
         ipsec_json=$(oci network ip-sec-connection list --compartment-id "$comp" --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$ipsec_json" ]] && jq -e '.data[0]' <<< "$ipsec_json" >/dev/null 2>&1; then
-            all_ipsec=$(jq -n --argjson a "$all_ipsec" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$ipsec_json" 2>/dev/null)
+            all_ipsec=$(jq -n --argjson a "$all_ipsec" --argjson b "$(jq '.data' <<< "$ipsec_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
         fi
     done
     
@@ -15735,6 +15873,7 @@ display_drg_connectivity_map() {
     local all_fc="[]"
     for comp in "${all_comps[@]}"; do
         local vc_json
+        _drg_dbg_cmd "FC VC list" "oci network virtual-circuit list --compartment-id ${comp} --region $region"
         vc_json=$(oci network virtual-circuit list --compartment-id "$comp" --region "$region" --output json 2>/dev/null)
         if [[ -n "$vc_json" ]] && jq -e '.data[0]' <<< "$vc_json" >/dev/null 2>&1; then
             local filtered
@@ -15924,6 +16063,7 @@ display_drg_connectivity_map() {
                 if [[ -n "$remote_drg_id" ]]; then
                     local remote_drg_name="DRG (...${remote_drg_id: -8})" remote_drg_state="N/A" remote_drg_redundancy="N/A"
                     local remote_drg_json
+                    _drg_dbg_cmd "Remote DRG get" "oci network drg get --drg-id ${remote_drg_id} --region $peer_region"
                     remote_drg_json=$(oci network drg get --drg-id "$remote_drg_id" --region "$peer_region" --output json 2>/dev/null)
                     if [[ -n "$remote_drg_json" ]] && jq -e '.data' <<< "$remote_drg_json" >/dev/null 2>&1; then
                         remote_drg_name=$(jq -r '.data["display-name"] // "Unknown"' <<< "$remote_drg_json" 2>/dev/null)
@@ -15939,9 +16079,9 @@ display_drg_connectivity_map() {
                     printf "  ${CYAN}%s${NC}       ${WHITE}╰─ Remote DRG:${NC} ${BOLD}${ORANGE}%-22s${NC} ${WHITE}[${remote_state_color}%s${WHITE}]${NC} ${CYAN}Redundancy:${NC} ${remote_red_color}%s${NC}%*s${CYAN}%s${NC}\n" \
                         "$V" "${remote_drg_name:0:22}" "$remote_drg_state" "${remote_drg_redundancy:0:20}" 2 "" "$V"
                     
-                    # Remote VCN attachments - use --drg-id directly
+                    # Remote VCN attachments - search via compartment
                     local remote_att_json
-                    remote_att_json=$(oci network drg-attachment list --drg-id "$remote_drg_id" \
+                    remote_att_json=$(oci network drg-attachment list --compartment-id "$remote_comp" --drg-id "$remote_drg_id" \
                         --region "$peer_region" --all --output json 2>/dev/null)
                     
                     local remote_atts="[]"
@@ -16020,7 +16160,7 @@ display_drg_connectivity_map() {
                         remote_vpn_json=$(oci network ip-sec-connection list --compartment-id "$r_comp" \
                             --drg-id "$remote_drg_id" --region "$peer_region" --output json 2>/dev/null)
                         if [[ -n "$remote_vpn_json" ]] && jq -e '.data[0]' <<< "$remote_vpn_json" >/dev/null 2>&1; then
-                            remote_all_vpn=$(jq -n --argjson a "$remote_all_vpn" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$remote_vpn_json" 2>/dev/null)
+                            remote_all_vpn=$(jq -n --argjson a "$remote_all_vpn" --argjson b "$(jq '.data' <<< "$remote_vpn_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
                         fi
                     done
                     if [[ $(jq 'length' <<< "$remote_all_vpn" 2>/dev/null || echo "0") -gt 0 ]]; then
@@ -16320,7 +16460,323 @@ xr_cache_age_display() {
 }
 
 #--------------------------------------------------------------------------------
-# Cross-Region DRG Map - Comprehensive view across all peered regions
+# DRG Debug Helpers - Conditional debug output for --debug mode
+#--------------------------------------------------------------------------------
+_drg_dbg() {
+    # General debug message: _drg_dbg "message"
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    echo -e "  ${GRAY}[DRG-DBG] $*${NC}" >&2
+}
+
+_drg_dbg_cmd() {
+    # Log an OCI command about to execute: _drg_dbg_cmd "description" "oci network drg get ..."
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    echo -e "  ${GRAY}[DRG-CMD] $1${NC}" >&2
+    echo -e "  ${GRAY}  → $2${NC}" >&2
+}
+
+_drg_dbg_batch() {
+    # Log a batch of parallel OCI calls: _drg_dbg_batch "Phase name" count "cmd1" "cmd2" ...
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    local label="$1"; shift
+    local count="$1"; shift
+    echo -e "  ${GRAY}[DRG-PAR] $label — launching $count parallel calls:${NC}" >&2
+    local i=1
+    for cmd in "$@"; do
+        echo -e "  ${GRAY}  [$i/$count] $cmd${NC}" >&2
+        ((i++))
+    done
+}
+
+_drg_dbg_result() {
+    # Log result: _drg_dbg_result "what" "count|OK|FAIL" [detail]
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    local label="$1" status="$2" detail="${3:-}"
+    if [[ "$status" == "FAIL" || "$status" == "0" ]]; then
+        echo -e "  ${YELLOW}[DRG-RES] $label: ${RED}$status${NC}${detail:+ ${GRAY}$detail${NC}}" >&2
+    else
+        echo -e "  ${GRAY}[DRG-RES] $label: ${GREEN}$status${NC}${detail:+ ${GRAY}$detail${NC}}" >&2
+    fi
+}
+
+_drg_dbg_section() {
+    # Section divider: _drg_dbg_section "BFS Phase A: VCN Enrichment"
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    echo -e "  ${CYAN}[DRG-DBG] ═══ $* ═══${NC}" >&2
+}
+
+_drg_dbg_comps() {
+    # Log compartment search list: _drg_dbg_comps "label" comp1 comp2 ...
+    [[ "$DEBUG_MODE" != "true" ]] && return
+    local label="$1"; shift
+    echo -e "  ${GRAY}[DRG-CMP] $label — ${#@} compartments:${NC}" >&2
+    local i=1
+    for c in "$@"; do
+        echo -e "  ${GRAY}  [$i] ${c}${NC}" >&2
+        ((i++))
+    done
+}
+
+# Extract region from an OCI OCID (e.g., ocid1.networksecuritygroup.oc1.ap-sydney-1.aaaa... → ap-sydney-1)
+# Falls back to $1 (provided default) if parsing fails
+_ocid_region() {
+    local ocid="$1" default_region="${2:-}"
+    # OCID format: ocid1.<resource>.oc1.<region>.<unique_id>
+    # Region is field 4 when split by '.', but may contain dots itself (e.g., ap-sydney-1)
+    # Strategy: strip "ocid1.<type>.oc1." prefix, then take everything before the last dot-separated 60-char block
+    if [[ "$ocid" =~ ^ocid1\.[^.]+\.oc[0-9]+\.([^.]+(-[^.]+)*)\.([a-z0-9]{40,}) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+    # Simpler fallback: split by dots, rejoin fields 3..N-1 (skip ocid1, type, oc1, and unique_id)
+    local region
+    region=$(echo "$ocid" | awk -F'.' '{
+        # Skip first 3 fields (ocid1, resource-type, oc1) and last field (unique)
+        n = NF
+        region = ""
+        for (i=4; i<n; i++) {
+            if (region != "") region = region "."
+            region = region $i
+        }
+        print region
+    }')
+    if [[ -n "$region" && ${#region} -lt 30 ]]; then
+        echo "$region"
+    else
+        echo "$default_region"
+    fi
+}
+
+#--------------------------------------------------------------------------------
+# FastConnect detail display helper
+# Usage: _fc_display_details VC_OCID REGION PREFIX_STR
+# PREFIX_STR is the box-drawing prefix (e.g. "  │         ")
+#--------------------------------------------------------------------------------
+_fc_display_details() {
+    local _fd_vc_id="$1" _fd_region="$2" _fd_prefix="$3"
+    
+    local _fd_vc
+    _drg_dbg_cmd "FC VC get (live)" "oci network virtual-circuit get --virtual-circuit-id ${_fd_vc_id} --region $_fd_region"
+    _fd_vc=$(oci network virtual-circuit get --virtual-circuit-id "$_fd_vc_id" --region "$_fd_region" --output json 2>/dev/null)
+    [[ -z "$_fd_vc" ]] && return
+    jq -e '.data' <<< "$_fd_vc" >/dev/null 2>&1 || return
+    
+    # ── Extract virtual-circuit fields ──
+    local _fd_type _fd_svc_type _fd_mtu _fd_transport _fd_bfd _fd_redundancy
+    local _fd_ora_asn _fd_cust_asn
+    _fd_type=$(jq -r '.data["type"] // "N/A"' <<< "$_fd_vc" 2>/dev/null)
+    _fd_svc_type=$(jq -r '.data["service-type"] // ""' <<< "$_fd_vc" 2>/dev/null)
+    _fd_mtu=$(jq -r '.data["ip-mtu"] // "N/A"' <<< "$_fd_vc" 2>/dev/null)
+    [[ "$_fd_mtu" == "null" ]] && _fd_mtu="N/A"
+    _fd_transport=$(jq -r '.data["is-transport-mode"] // "null"' <<< "$_fd_vc" 2>/dev/null)
+    _fd_bfd=$(jq -r '.data["is-bfd-enabled"] // "null"' <<< "$_fd_vc" 2>/dev/null)
+    _fd_redundancy=$(jq -r '.data["ipv4-bgp-status"] // "N/A"' <<< "$_fd_vc" 2>/dev/null)
+    [[ "$_fd_redundancy" == "null" ]] && _fd_redundancy="N/A"
+    _fd_ora_asn=$(jq -r '.data["oracle-bgp-asn"] // "N/A"' <<< "$_fd_vc" 2>/dev/null)
+    _fd_cust_asn=$(jq -r '.data["customer-bgp-asn"] // "N/A"' <<< "$_fd_vc" 2>/dev/null)
+    [[ "$_fd_ora_asn" == "null" ]] && _fd_ora_asn="N/A"
+    [[ "$_fd_cust_asn" == "null" ]] && _fd_cust_asn="N/A"
+    
+    # Encryption display
+    local _fd_encrypt_d
+    if [[ "$_fd_transport" == "true" ]]; then
+        _fd_encrypt_d="${GREEN}IPSec Transport${NC}"
+    elif [[ "$_fd_transport" == "false" ]]; then
+        _fd_encrypt_d="${GRAY}None${NC}"
+    else
+        _fd_encrypt_d="${GRAY}N/A${NC}"
+    fi
+    
+    # BFD display
+    local _fd_bfd_d
+    if [[ "$_fd_bfd" == "true" ]]; then
+        _fd_bfd_d="${GREEN}Enabled${NC}"
+    elif [[ "$_fd_bfd" == "false" ]]; then
+        _fd_bfd_d="${GRAY}Disabled${NC}"
+    else
+        _fd_bfd_d="${GRAY}N/A${NC}"
+    fi
+    
+    # Connection type display
+    local _fd_conn_type="$_fd_type"
+    [[ -n "$_fd_svc_type" && "$_fd_svc_type" != "null" && "$_fd_svc_type" != "" ]] && \
+        _fd_conn_type="${_fd_type}/${_fd_svc_type}"
+    
+    # IPv4 redundancy color
+    local _fd_redund_c="$GRAY"
+    case "$_fd_redundancy" in
+        UP|REDUNDANT) _fd_redund_c="$GREEN" ;;
+        DOWN|NOT_REDUNDANT) _fd_redund_c="$RED" ;;
+        N/A) _fd_redund_c="$GRAY" ;;
+        *) _fd_redund_c="$YELLOW" ;;
+    esac
+    
+    # ── Cross-connect mappings ──
+    local _fd_cc_maps
+    _fd_cc_maps=$(jq '.data["cross-connect-mappings"] // []' <<< "$_fd_vc" 2>/dev/null)
+    local _fd_cc_count
+    _fd_cc_count=$(jq 'length' <<< "$_fd_cc_maps" 2>/dev/null || echo "0")
+    
+    # Extract BGP peering IPs from first mapping
+    local _fd_ora_ip _fd_cust_ip _fd_vlan
+    _fd_ora_ip=$(jq -r '.[0]["oracle-bgp-peering-ip"] // "N/A"' <<< "$_fd_cc_maps" 2>/dev/null)
+    _fd_cust_ip=$(jq -r '.[0]["customer-bgp-peering-ip"] // "N/A"' <<< "$_fd_cc_maps" 2>/dev/null)
+    _fd_vlan=$(jq -r '.[0]["vlan"] // "N/A"' <<< "$_fd_cc_maps" 2>/dev/null)
+    [[ "$_fd_ora_ip" == "null" ]] && _fd_ora_ip="N/A"
+    [[ "$_fd_cust_ip" == "null" ]] && _fd_cust_ip="N/A"
+    [[ "$_fd_vlan" == "null" ]] && _fd_vlan="N/A"
+    
+    # Resolve cross-connect / cross-connect group for physical details
+    local _fd_ccg_name="" _fd_ms_d="" _fd_loc="" _fd_phys="" _fd_logi="" _fd_port="" _fd_speed=""
+    local _fd_if_state="" _fd_ll_ind="" _fd_ll_val=""
+    
+    if [[ "$_fd_cc_count" -gt 0 ]]; then
+        local _fd_ccid
+        _fd_ccid=$(jq -r '.[0]["cross-connect-or-cross-connect-group-id"] // "null"' <<< "$_fd_cc_maps" 2>/dev/null)
+        
+        if [[ -n "$_fd_ccid" && "$_fd_ccid" != "null" ]]; then
+            if [[ "$_fd_ccid" == ocid1.crossconnectgroup.* ]]; then
+                # CC Group — get group info, then first member CC for physical details
+                local _fd_ccg_json
+                _fd_ccg_json=$(oci network cross-connect-group get --cross-connect-group-id "$_fd_ccid" --region "$_fd_region" --output json 2>/dev/null)
+                if [[ -n "$_fd_ccg_json" ]] && jq -e '.data' <<< "$_fd_ccg_json" >/dev/null 2>&1; then
+                    _fd_ccg_name=$(jq -r '.data["display-name"] // "N/A"' <<< "$_fd_ccg_json" 2>/dev/null)
+                    local _fd_ccg_ms
+                    _fd_ccg_ms=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_fd_ccg_json" 2>/dev/null)
+                    local _fd_ms_c="$GRAY"
+                    [[ "$_fd_ccg_ms" == "ENABLED" ]] && _fd_ms_c="$GREEN"
+                    [[ "$_fd_ccg_ms" == "DISABLED" ]] && _fd_ms_c="$YELLOW"
+                    _fd_ms_d="${_fd_ms_c}${_fd_ccg_ms}${NC}"
+                fi
+                
+                # Try to find a member cross-connect for physical details
+                local _fd_mem_json=""
+                # Search known compartments for member CCs
+                local _fd_search_comps=("${SEARCH_COMPARTMENTS[@]:-$COMPARTMENT_ID}")
+                for _fd_sc in "${_fd_search_comps[@]}"; do
+                    [[ -z "$_fd_sc" ]] && continue
+                    _fd_mem_json=$(oci network cross-connect list --compartment-id "$_fd_sc" \
+                        --cross-connect-group-id "$_fd_ccid" --region "$_fd_region" --output json 2>/dev/null)
+                    if [[ -n "$_fd_mem_json" ]] && jq -e '.data[0]' <<< "$_fd_mem_json" >/dev/null 2>&1; then
+                        _fd_loc=$(jq -r '.data[0]["location-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_phys=$(jq -r '.data[0]["oci-physical-device-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_logi=$(jq -r '.data[0]["oci-logical-device-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_port=$(jq -r '.data[0]["port-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_speed=$(jq -r '.data[0]["port-speed-shape-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_if_state=$(jq -r '.data[0]["lifecycle-state"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        _fd_ll_ind=$(jq -r '.data[0]["customer-reference-name"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        # Light level value from near-end-rx-light-level if available
+                        _fd_ll_val=$(jq -r '.data[0]["near-end-rx-light-level-in-dbm"] // "N/A"' <<< "$_fd_mem_json" 2>/dev/null)
+                        [[ "$_fd_ll_val" == "null" ]] && _fd_ll_val="N/A"
+                        break
+                    fi
+                done
+            elif [[ "$_fd_ccid" == ocid1.crossconnect.* ]]; then
+                # Direct cross-connect
+                local _fd_cc_json
+                _drg_dbg_cmd "FC CC get" "oci network cross-connect get --cross-connect-id ${_fd_ccid} --region $_fd_region"
+                _fd_cc_json=$(oci network cross-connect get --cross-connect-id "$_fd_ccid" --region "$_fd_region" --output json 2>/dev/null)
+                if [[ -n "$_fd_cc_json" ]] && jq -e '.data' <<< "$_fd_cc_json" >/dev/null 2>&1; then
+                    _fd_ccg_name=$(jq -r '.data["display-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    local _fd_cc_ms
+                    _fd_cc_ms=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    local _fd_ms_c="$GRAY"
+                    [[ "$_fd_cc_ms" == "ENABLED" ]] && _fd_ms_c="$GREEN"
+                    [[ "$_fd_cc_ms" == "DISABLED" ]] && _fd_ms_c="$YELLOW"
+                    _fd_ms_d="${_fd_ms_c}${_fd_cc_ms}${NC}"
+                    _fd_loc=$(jq -r '.data["location-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_phys=$(jq -r '.data["oci-physical-device-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_logi=$(jq -r '.data["oci-logical-device-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_port=$(jq -r '.data["port-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_speed=$(jq -r '.data["port-speed-shape-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_if_state=$(jq -r '.data["lifecycle-state"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_ll_ind=$(jq -r '.data["customer-reference-name"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    _fd_ll_val=$(jq -r '.data["near-end-rx-light-level-in-dbm"] // "N/A"' <<< "$_fd_cc_json" 2>/dev/null)
+                    [[ "$_fd_ll_val" == "null" ]] && _fd_ll_val="N/A"
+                fi
+            fi
+        fi
+    fi
+    
+    # Null cleanup
+    for _v in _fd_loc _fd_phys _fd_logi _fd_port _fd_speed _fd_if_state _fd_ll_ind _fd_ll_val; do
+        eval "[[ \"\$$_v\" == 'null' ]] && $_v='N/A'"
+    done
+    
+    # ── Interface state color ──
+    local _fd_if_c="$GRAY"
+    case "$_fd_if_state" in
+        PROVISIONED) _fd_if_c="$GREEN" ;;
+        PENDING_*|PROVISIONING) _fd_if_c="$YELLOW" ;;
+        INACTIVE|FAILED|TERMINATED) _fd_if_c="$RED" ;;
+    esac
+    
+    # ── Line 1: CC Group | Connection Type | MTU | Encrypt | MACsec ──
+    printf "%b" "$_fd_prefix"
+    [[ -n "$_fd_ccg_name" && "$_fd_ccg_name" != "N/A" ]] && \
+        printf "${CYAN}CC Group:${NC} ${WHITE}%s${NC}  " "$_fd_ccg_name"
+    printf "${CYAN}Type:${NC} ${WHITE}%s${NC}  " "$_fd_conn_type"
+    [[ "$_fd_mtu" != "N/A" ]] && \
+        printf "${CYAN}MTU:${NC} ${WHITE}%s${NC}  " "$_fd_mtu"
+    printf "${CYAN}Encrypt:${NC} %b  " "$_fd_encrypt_d"
+    [[ -n "$_fd_ms_d" ]] && \
+        printf "${CYAN}MACsec:${NC} %b" "$_fd_ms_d"
+    printf "\n"
+    
+    # ── Line 2: Physical Location | Physical Device | Logical Device | Interface State | Port ──
+    if [[ "$_fd_loc" != "N/A" || "$_fd_phys" != "N/A" || "$_fd_if_state" != "N/A" ]]; then
+        printf "%b" "$_fd_prefix"
+        [[ "$_fd_loc" != "N/A" ]] && printf "${CYAN}Phys Loc:${NC} ${WHITE}%s${NC}  " "$_fd_loc"
+        [[ "$_fd_phys" != "N/A" ]] && printf "${CYAN}Phys Dev:${NC} ${WHITE}%s${NC}  " "$_fd_phys"
+        [[ "$_fd_logi" != "N/A" ]] && printf "${CYAN}Logical Dev:${NC} ${WHITE}%s${NC}  " "$_fd_logi"
+        [[ "$_fd_if_state" != "N/A" ]] && printf "${CYAN}Interface:${NC} ${_fd_if_c}%s${NC}  " "$_fd_if_state"
+        [[ "$_fd_port" != "N/A" ]] && printf "${CYAN}Port:${NC} ${WHITE}%s${NC}" "$_fd_port"
+        [[ "$_fd_speed" != "N/A" ]] && printf " ${GRAY}(%s)${NC}" "$_fd_speed"
+        printf "\n"
+    fi
+    
+    # ── Line 3: BGP Oracle/Customer IPs + ASNs | BFD | IPv4 Redundancy ──
+    printf "%b" "$_fd_prefix"
+    printf "${CYAN}BGP Oracle:${NC} ${WHITE}%s${NC} ${GRAY}(ASN %s)${NC}  " "$_fd_ora_ip" "$_fd_ora_asn"
+    printf "${CYAN}Customer:${NC} ${WHITE}%s${NC} ${GRAY}(ASN %s)${NC}  " "$_fd_cust_ip" "$_fd_cust_asn"
+    [[ "$_fd_vlan" != "N/A" ]] && printf "${CYAN}VLAN:${NC} ${WHITE}%s${NC}  " "$_fd_vlan"
+    printf "\n"
+    
+    printf "%b" "$_fd_prefix"
+    printf "${CYAN}BFD:${NC} %b  " "$_fd_bfd_d"
+    printf "${CYAN}IPv4 Redundancy:${NC} ${_fd_redund_c}%s${NC}" "$_fd_redundancy"
+    # Light levels
+    if [[ "$_fd_ll_ind" != "N/A" && -n "$_fd_ll_ind" ]]; then
+        printf "  ${CYAN}Light Indicator:${NC} ${WHITE}%s${NC}" "$_fd_ll_ind"
+    fi
+    if [[ "$_fd_ll_val" != "N/A" && -n "$_fd_ll_val" ]]; then
+        printf "  ${CYAN}Light Level:${NC} ${WHITE}%s dBm${NC}" "$_fd_ll_val"
+    fi
+    printf "\n"
+    
+    # ── Additional cross-connect mappings (if LAG with >1 mapping) ──
+    if [[ "$_fd_cc_count" -gt 1 ]]; then
+        local _fd_mi=1
+        while [[ $_fd_mi -lt $_fd_cc_count ]]; do
+            local _fd_m_ora_ip _fd_m_cust_ip _fd_m_vlan
+            _fd_m_ora_ip=$(jq -r ".[$_fd_mi][\"oracle-bgp-peering-ip\"] // \"N/A\"" <<< "$_fd_cc_maps" 2>/dev/null)
+            _fd_m_cust_ip=$(jq -r ".[$_fd_mi][\"customer-bgp-peering-ip\"] // \"N/A\"" <<< "$_fd_cc_maps" 2>/dev/null)
+            _fd_m_vlan=$(jq -r ".[$_fd_mi][\"vlan\"] // \"N/A\"" <<< "$_fd_cc_maps" 2>/dev/null)
+            [[ "$_fd_m_ora_ip" == "null" ]] && _fd_m_ora_ip="N/A"
+            [[ "$_fd_m_cust_ip" == "null" ]] && _fd_m_cust_ip="N/A"
+            [[ "$_fd_m_vlan" == "null" ]] && _fd_m_vlan="N/A"
+            if [[ "$_fd_m_ora_ip" != "N/A" || "$_fd_m_cust_ip" != "N/A" ]]; then
+                printf "%b${GRAY}Mapping %s:${NC} " "$_fd_prefix" "$((_fd_mi + 1))"
+                printf "${CYAN}Oracle:${NC} ${WHITE}%s${NC}  ${CYAN}Customer:${NC} ${WHITE}%s${NC}" "$_fd_m_ora_ip" "$_fd_m_cust_ip"
+                [[ "$_fd_m_vlan" != "N/A" ]] && printf "  ${CYAN}VLAN:${NC} ${WHITE}%s${NC}" "$_fd_m_vlan"
+                printf "\n"
+            fi
+            ((_fd_mi++))
+        done
+    fi
+}
+
+#--------------------------------------------------------------------------------
 # Follows RPC chains to build a unified topology from current DRG outward
 # Features: Parallel API calls, 3-minute cache, subnet drill-down, route rules
 #--------------------------------------------------------------------------------
@@ -16331,8 +16787,15 @@ display_cross_region_drg_map() {
     shift 3 2>/dev/null || true
     local search_comps=("$@")
     
+    # Ensure NETWORK_COMPARTMENT_ID is always searched (NSGs/SLs may live there)
+    if [[ -n "$NETWORK_COMPARTMENT_ID" ]]; then
+        local _nc_found=0
+        for _sc in "${search_comps[@]}"; do [[ "$_sc" == "$NETWORK_COMPARTMENT_ID" ]] && _nc_found=1; done
+        [[ $_nc_found -eq 0 ]] && search_comps+=("$NETWORK_COMPARTMENT_ID")
+    fi
+    
     local TL="┌" TR="┐" BL="└" BR="┘" H="─" V="│" LT="├" RT="┤"
-    local box_width=140
+    local box_width=225
     
     _ui_banner "🌐  CROSS-REGION DRG TOPOLOGY MAP  🌐"
     echo ""
@@ -16359,6 +16822,13 @@ display_cross_region_drg_map() {
     declare -A XR_VCN_LPGS             # vcn_id -> JSON array of LPGs
     declare -A XR_VCN_NAMES            # vcn_id -> display name
     declare -A XR_VCN_CIDRS            # vcn_id -> cidr block
+    declare -A XR_RT_INFO              # rt_id -> "name|rule_count"
+    declare -A XR_SL_INFO              # sl_id -> "name|in_count|eg_count"
+    declare -A XR_SL_RULES             # sl_id -> JSON {"ingress":[...],"egress":[...]}
+    declare -A XR_NSG_INFO             # nsg_id -> "name|in_count|eg_count|compartment_id"
+    declare -A XR_NSG_RULES            # nsg_id -> JSON array of rules (compact)
+    declare -A XR_VCN_NSGS             # vcn_id -> newline-separated nsg_ids
+    declare -A XR_VCN_SLS              # vcn_id -> newline-separated sl_ids
     local xr_total_regions=0
     
     # Try loading from cache
@@ -16373,10 +16843,17 @@ display_cross_region_drg_map() {
             fi
         fi
         if [[ $cache_loaded -eq 1 ]]; then
-            local cache_age
-            cache_age=$(( $(date +%s) - $(stat -c %Y "${XR_CACHE_DIR}/.meta" 2>/dev/null || echo "0") ))
-            local ttl_remain=$((XR_CACHE_TTL - cache_age))
-            echo -e "\r  ${GREEN}✓ Loaded from cache${NC} ${GRAY}(${cache_age}s old, expires in ${ttl_remain}s | use ${WHITE}rc${GRAY} to refresh)${NC}"
+            # Detect stale cache: old cache missing NSG/SL/RT maps
+            if [[ ${#XR_VCN_SUBNETS[@]} -gt 0 && ${#XR_RT_INFO[@]} -eq 0 && ${#XR_SL_INFO[@]} -eq 0 ]]; then
+                echo -e "\r  ${YELLOW}Cache missing NSG/SL/RT data, rebuilding...${NC}                    "
+                cache_loaded=0
+                xr_cache_clear
+            else
+                local cache_age
+                cache_age=$(( $(date +%s) - $(stat -c %Y "${XR_CACHE_DIR}/.meta" 2>/dev/null || echo "0") ))
+                local ttl_remain=$((XR_CACHE_TTL - cache_age))
+                echo -e "\r  ${GREEN}✓ Loaded from cache${NC} ${GRAY}(${cache_age}s old, expires in ${ttl_remain}s | use ${WHITE}rc${GRAY} to refresh)${NC}"
+            fi
         else
             echo -e "\r  ${YELLOW}Cache corrupt, rebuilding...${NC}                    "
         fi
@@ -16388,10 +16865,34 @@ display_cross_region_drg_map() {
     if [[ $cache_loaded -eq 0 ]]; then
         echo -ne "  ${GRAY}Discovering cross-region topology (parallel API queries)...${NC}"
         
+        _drg_dbg_section "PHASE 1: BFS Traversal"
+        _drg_dbg "Starting DRG: ${start_drg_id} in $start_region"
+        _drg_dbg_comps "Initial search compartments" "${search_comps[@]}"
+        
+        # Pre-warm compartment name cache from disk (avoids per-OCID API calls during BFS)
+        _warm_comp_name_cache
+        
+        # Ensure COMPARTMENTS_CACHE is fresh (needed for supplemental compartment discovery)
+        if [[ ! -f "$COMPARTMENTS_CACHE" || ! -s "$COMPARTMENTS_CACHE" ]] || \
+           [[ $(( $(date +%s) - $(stat -c %Y "$COMPARTMENTS_CACHE" 2>/dev/null || echo 0) )) -gt $CACHE_MAX_AGE ]]; then
+            _drg_dbg "Refreshing COMPARTMENTS_CACHE (stale or missing)"
+            echo -ne "\r  ${GRAY}Refreshing compartment cache...${NC}                          "
+            local _bfs_comp_json
+            _bfs_comp_json=$(oci iam compartment list --compartment-id "${TENANCY_ID:-$tenancy_id}" --compartment-id-in-subtree true --all --output json 2>/dev/null)
+            if [[ -n "$_bfs_comp_json" ]] && jq -e '.data[0]' <<< "$_bfs_comp_json" >/dev/null 2>&1; then
+                echo "$_bfs_comp_json" > "$COMPARTMENTS_CACHE"
+                _warm_comp_name_cache  # Re-warm after refresh
+                local _bfs_cc=$(jq '.data | length' <<< "$_bfs_comp_json" 2>/dev/null)
+                _drg_dbg "COMPARTMENTS_CACHE refreshed: $_bfs_cc compartments"
+            fi
+            echo -ne "\r  ${GRAY}Discovering cross-region topology (parallel API queries)...${NC}"
+        fi
+        
         mkdir -p "$TEMP_DIR" "$XR_CACHE_DIR"
         
         # Get starting DRG info
         local start_drg_json
+        _drg_dbg_cmd "Start DRG get" "oci network drg get --drg-id ${start_drg_id} --region $start_region --output json"
         start_drg_json=$(oci network drg get --drg-id "$start_drg_id" --region "$start_region" --output json 2>/dev/null)
         
         # BFS queue: "drg_id|region|comp1,comp2,..."
@@ -16413,26 +16914,57 @@ display_cross_region_drg_map() {
             local -a q_comps=()
             IFS=',' read -ra q_comps <<< "$q_comps_str"
             
+            # Deduplicate q_comps (duplicates can leak in from RPC enqueue)
+            if [[ ${#q_comps[@]} -gt 1 ]]; then
+                declare -A _dedup_set=()
+                local -a _dedup_comps=()
+                for _dc in "${q_comps[@]}"; do
+                    [[ -z "$_dc" ]] && continue
+                    if [[ -z "${_dedup_set[$_dc]+x}" ]]; then
+                        _dedup_set[$_dc]=1
+                        _dedup_comps+=("$_dc")
+                    fi
+                done
+                q_comps=("${_dedup_comps[@]}")
+                unset _dedup_set
+            fi
+            
+            _drg_dbg_section "BFS iteration: $q_region / ${q_drg_id}"
+            _drg_dbg "Queue remaining: ${#drg_queue[@]} | Visited: ${#XR_VISITED_DRGS[@]}"
+            _drg_dbg_comps "BFS compartments for this DRG" "${q_comps[@]}"
+            
             # ── Parallel API calls for this DRG ──
             local _par_dir
             _par_dir=$(mktemp -d "${TEMP_DIR}/xr_par.XXXXXX")
             
-            # Core queries (always needed)
+            local _dbg_par_count=$((3 + ${#q_comps[@]} * 4))
+            _drg_dbg "Launching $_dbg_par_count parallel API calls (3 core + ${#q_comps[@]} comps × 4)"
+            
+            # Core queries (these don't require --compartment-id)
+            _drg_dbg_cmd "DRG get" "oci network drg get --drg-id ${q_drg_id} --region $q_region"
+            _drg_dbg_cmd "DRG route-table list" "oci network drg-route-table list --drg-id ${q_drg_id} --region $q_region --all"
+            _drg_dbg_cmd "Redundancy get" "oci network drg-redundancy-status get --drg-id ${q_drg_id} --region $q_region"
             oci network drg get --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/drg.json" 2>/dev/null &
-            oci network drg-attachment list --drg-id "$q_drg_id" --region "$q_region" --all --output json > "$_par_dir/att.json" 2>/dev/null &
             oci network drg-route-table list --drg-id "$q_drg_id" --region "$q_region" --all --output json > "$_par_dir/drt.json" 2>/dev/null &
             oci network drg-redundancy-status get --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/redund.json" 2>/dev/null &
             
-            # Per-compartment queries (RPCs, FC, VPN)
+            # Per-compartment queries (attachments + RPCs + FC + VPN — all require --compartment-id)
             local _ci=0
+            local _batch_comp_count=${#q_comps[@]}  # Track original batch size
             for comp in "${q_comps[@]}"; do
+                _drg_dbg_cmd "Att list [comp $_ci]" "oci network drg-attachment list --compartment-id ${comp} --drg-id ${q_drg_id} --region $q_region --all"
+                _drg_dbg_cmd "RPC list [comp $_ci]" "oci network remote-peering-connection list --compartment-id ${comp} --drg-id ${q_drg_id} --region $q_region"
+                _drg_dbg_cmd "FC list [comp $_ci]" "oci network virtual-circuit list --compartment-id ${comp} --region $q_region"
+                _drg_dbg_cmd "VPN list [comp $_ci]" "oci network ip-sec-connection list --compartment-id ${comp} --drg-id ${q_drg_id} --region $q_region"
+                oci network drg-attachment list --compartment-id "$comp" --drg-id "$q_drg_id" --region "$q_region" --all --output json > "$_par_dir/att_${_ci}.json" 2>/dev/null &
                 oci network remote-peering-connection list --compartment-id "$comp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/rpc_${_ci}.json" 2>/dev/null &
-                oci network virtual-circuit list --compartment-id "$comp" --region "$q_region" --output json > "$_par_dir/fc_${_ci}.json" 2>/dev/null &
+                oci network virtual-circuit list --compartment-id "$comp" --region "$q_region" --all --output json > "$_par_dir/fc_${_ci}.json" 2>/dev/null &
                 oci network ip-sec-connection list --compartment-id "$comp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/vpn_${_ci}.json" 2>/dev/null &
                 ((_ci++))
             done
             
             wait  # Wait for all parallel calls to complete
+            _drg_dbg "Parallel batch complete — processing results (batch had $_batch_comp_count compartments)"
             
             # ── Process DRG details ──
             local drg_json
@@ -16444,6 +16976,7 @@ display_cross_region_drg_map() {
                 local drg_comp
                 drg_comp=$(jq -r '.data["compartment-id"] // ""' <<< "$drg_json" 2>/dev/null)
                 XR_DRG_COMPS[$q_drg_id]="$drg_comp"
+                _drg_dbg_result "DRG get" "OK" "name=${XR_DRG_NAMES[$q_drg_id]} state=${XR_DRG_STATES[$q_drg_id]} comp=${drg_comp}"
                 # Resolve compartment name using centralized resolver (leverages cache)
                 if [[ -n "$drg_comp" ]]; then
                     local comp_name
@@ -16456,6 +16989,7 @@ display_cross_region_drg_map() {
                 XR_DRG_NAMES[$q_drg_id]="DRG ...${q_drg_id: -8}"
                 XR_DRG_STATES[$q_drg_id]="UNKNOWN"
                 XR_DRG_REGIONS[$q_drg_id]="$q_region"
+                _drg_dbg_result "DRG get" "FAIL" "drg.json empty or invalid — using fallback name"
             fi
             
             # ── Process redundancy ──
@@ -16463,8 +16997,10 @@ display_cross_region_drg_map() {
             redund_json=$(cat "$_par_dir/redund.json" 2>/dev/null)
             if [[ -n "$redund_json" ]] && jq -e '.data' <<< "$redund_json" >/dev/null 2>&1; then
                 XR_DRG_REDUNDANCY[$q_drg_id]=$(jq -r '.data.status // "N/A"' <<< "$redund_json" 2>/dev/null)
+                _drg_dbg_result "Redundancy" "${XR_DRG_REDUNDANCY[$q_drg_id]}"
             else
                 XR_DRG_REDUNDANCY[$q_drg_id]="N/A"
+                _drg_dbg_result "Redundancy" "FAIL" "redund.json empty"
             fi
             
             # ── Process default export route distribution ──
@@ -16473,6 +17009,8 @@ display_cross_region_drg_map() {
                 export_dist_id=$(jq -r '.data["default-export-drg-route-distribution-id"] // ""' <<< "$drg_json" 2>/dev/null)
                 if [[ -n "$export_dist_id" && "$export_dist_id" != "null" ]]; then
                     # Fetch distribution details + statements in parallel
+                    _drg_dbg_cmd "Export dist get" "oci network drg-route-distribution get --drg-route-distribution-id ${export_dist_id} --region $q_region"
+                    _drg_dbg_cmd "Export dist statements" "oci network drg-route-distribution-statement list --route-distribution-id ${export_dist_id} --region $q_region --all"
                     oci network drg-route-distribution get --drg-route-distribution-id "$export_dist_id" \
                         --region "$q_region" --output json > "$_par_dir/export_dist.json" 2>/dev/null &
                     oci network drg-route-distribution-statement list --route-distribution-id "$export_dist_id" --all \
@@ -16500,11 +17038,14 @@ display_cross_region_drg_map() {
             
             # ── Collect ALL route distributions (import + export) for Phase 2 display ──
             local _xr_dlist_json
+            _drg_dbg_cmd "Dist list" "oci network drg-route-distribution list --drg-id ${q_drg_id} --region $q_region --all"
             _xr_dlist_json=$(oci network drg-route-distribution list --drg-id "$q_drg_id" --region "$q_region" --all --output json 2>/dev/null)
             if [[ -n "$_xr_dlist_json" ]] && jq -e '.data[0]' <<< "$_xr_dlist_json" >/dev/null 2>&1; then
                 XR_DRG_DIST_LIST[$q_drg_id]=$(jq '.data' <<< "$_xr_dlist_json" 2>/dev/null)
+                _drg_dbg_result "Dist list" "$(echo "${XR_DRG_DIST_LIST[$q_drg_id]}" | jq 'length' 2>/dev/null) distributions"
             else
                 XR_DRG_DIST_LIST[$q_drg_id]="[]"
+                _drg_dbg_result "Dist list" "0" "empty"
             fi
             
             # ── Track region ──
@@ -16514,13 +17055,188 @@ display_cross_region_drg_map() {
             fi
             XR_REGION_DRGS[$q_region]=$(echo "${XR_REGION_DRGS[$q_region]}" | jq --arg id "$q_drg_id" '. + [$id]' 2>/dev/null)
             
-            # ── Process attachments ──
+            # ── Supplemental compartment discovery from COMPARTMENTS_CACHE ──
+            # The DRG's own compartment was added to q_comps after the initial parallel batch.
+            # Also check COMPARTMENTS_CACHE for child compartments of the DRG compartment 
+            # and any sibling compartments that may hold attachments.
+            if [[ -f "$COMPARTMENTS_CACHE" && -s "$COMPARTMENTS_CACHE" ]]; then
+                local _pre_supp_ct=${#q_comps[@]}
+                # Build a set of already-known compartments for fast lookup
+                declare -A _known_comp_set=()
+                for _kc in "${q_comps[@]}"; do _known_comp_set[$_kc]=1; done
+                
+                # For each compartment in q_comps, find its children from the cache
+                # (only check compartments added after the original batch - these are the newly discovered ones)
+                for ((_sc_i=_batch_comp_count; _sc_i<${#q_comps[@]}; _sc_i++)); do
+                    local _parent_comp="${q_comps[$_sc_i]}"
+                    while IFS='|' read -r _child_cid _child_state; do
+                        [[ -z "$_child_cid" || "$_child_state" != "ACTIVE" ]] && continue
+                        if [[ -z "${_known_comp_set[$_child_cid]+x}" ]]; then
+                            _known_comp_set[$_child_cid]=1
+                            q_comps+=("$_child_cid")
+                            _drg_dbg "★ Child compartment from cache: ${_child_cid} (parent: ${_parent_comp})"
+                        fi
+                    done < <(jq -r --arg pid "$_parent_comp" '.data[]? | select(.["compartment-id"] == $pid) | "\(.id)|\(.["lifecycle-state"])"' "$COMPARTMENTS_CACHE" 2>/dev/null)
+                done
+                
+                # Also check: parent compartment of the DRG compartment — its siblings may hold attachments
+                if [[ -n "${drg_comp:-}" ]]; then
+                    local _drg_parent_comp
+                    _drg_parent_comp=$(jq -r --arg cid "$drg_comp" '.data[]? | select(.id == $cid) | .["compartment-id"] // empty' "$COMPARTMENTS_CACHE" 2>/dev/null)
+                    if [[ -n "$_drg_parent_comp" && -z "${_known_comp_set[$_drg_parent_comp]+x}" ]]; then
+                        _known_comp_set[$_drg_parent_comp]=1
+                        q_comps+=("$_drg_parent_comp")
+                        _drg_dbg "★ DRG parent compartment from cache: ${_drg_parent_comp}"
+                    fi
+                    # Siblings of DRG compartment (same parent)
+                    if [[ -n "$_drg_parent_comp" ]]; then
+                        while IFS='|' read -r _sib_cid _sib_state; do
+                            [[ -z "$_sib_cid" || "$_sib_state" != "ACTIVE" ]] && continue
+                            if [[ -z "${_known_comp_set[$_sib_cid]+x}" ]]; then
+                                _known_comp_set[$_sib_cid]=1
+                                q_comps+=("$_sib_cid")
+                                _drg_dbg "★ Sibling compartment from cache: ${_sib_cid} (under ${_drg_parent_comp})"
+                            fi
+                        done < <(jq -r --arg pid "$_drg_parent_comp" '.data[]? | select(.["compartment-id"] == $pid and .["lifecycle-state"] == "ACTIVE") | "\(.id)|\(.["lifecycle-state"])"' "$COMPARTMENTS_CACHE" 2>/dev/null)
+                    fi
+                fi
+                
+                unset _known_comp_set
+                local _supp_new=$(( ${#q_comps[@]} - _pre_supp_ct ))
+                [[ $_supp_new -gt 0 ]] && _drg_dbg "Compartment cache added $_supp_new compartment(s) → total ${#q_comps[@]}"
+            fi
+            
+            # ── Supplemental parallel batch for newly discovered compartments ──
+            # Any compartments added after the original batch (_batch_comp_count) need their own API calls
+            if [[ ${#q_comps[@]} -gt $_batch_comp_count ]]; then
+                local _supp_ct=$(( ${#q_comps[@]} - _batch_comp_count ))
+                _drg_dbg_section "Supplemental batch: $_supp_ct new compartment(s) [indices ${_batch_comp_count}..$(( ${#q_comps[@]} - 1 ))]"
+                
+                local _si=$_batch_comp_count
+                for ((_si=_batch_comp_count; _si<${#q_comps[@]}; _si++)); do
+                    local _scomp="${q_comps[$_si]}"
+                    _drg_dbg_cmd "Supp att [comp $_si]" "oci network drg-attachment list --compartment-id ${_scomp} --drg-id ${q_drg_id} --region $q_region --all"
+                    _drg_dbg_cmd "Supp RPC [comp $_si]" "oci network remote-peering-connection list --compartment-id ${_scomp} --drg-id ${q_drg_id} --region $q_region"
+                    _drg_dbg_cmd "Supp FC [comp $_si]" "oci network virtual-circuit list --compartment-id ${_scomp} --region $q_region"
+                    _drg_dbg_cmd "Supp VPN [comp $_si]" "oci network ip-sec-connection list --compartment-id ${_scomp} --drg-id ${q_drg_id} --region $q_region"
+                    oci network drg-attachment list --compartment-id "$_scomp" --drg-id "$q_drg_id" --region "$q_region" --all --output json > "$_par_dir/att_${_si}.json" 2>/dev/null &
+                    oci network remote-peering-connection list --compartment-id "$_scomp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/rpc_${_si}.json" 2>/dev/null &
+                    oci network virtual-circuit list --compartment-id "$_scomp" --region "$q_region" --all --output json > "$_par_dir/fc_${_si}.json" 2>/dev/null &
+                    oci network ip-sec-connection list --compartment-id "$_scomp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/vpn_${_si}.json" 2>/dev/null &
+                done
+                wait
+                _drg_dbg "Supplemental batch complete — $_supp_ct compartment(s) fetched"
+            fi
+            
+            # ── Process attachments (merge from all compartments) ──
             local att_json
-            att_json=$(cat "$_par_dir/att.json" 2>/dev/null)
-            if [[ -n "$att_json" ]] && jq -e '.data[0]' <<< "$att_json" >/dev/null 2>&1; then
+            local all_atts="[]"
+            for ((_ci=0; _ci<${#q_comps[@]}; _ci++)); do
+                local att_file="$_par_dir/att_${_ci}.json"
+                if [[ -f "$att_file" ]]; then
+                    local _att_j
+                    _att_j=$(cat "$att_file" 2>/dev/null)
+                    if [[ -n "$_att_j" ]] && jq -e '.data[0]' <<< "$_att_j" >/dev/null 2>&1; then
+                        all_atts=$(jq -n --argjson a "$all_atts" --argjson b "$(jq '.data' <<< "$_att_j")" '$a + $b | unique_by(.id)' 2>/dev/null)
+                    fi
+                fi
+            done
+            # Build a synthetic att_json with merged data for downstream processing
+            att_json="{\"data\": $all_atts}"
+            if [[ $(jq '.data | length' <<< "$att_json" 2>/dev/null || echo "0") -gt 0 ]]; then
                 XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]=$(jq '.data' <<< "$att_json" 2>/dev/null)
+                local _dbg_att_ct=$(jq '.data | length' <<< "$att_json" 2>/dev/null)
+                local _dbg_att_types=$(jq -r '[.data[] | .["network-details"]["type"] // "VCN"] | group_by(.) | map("\(.[0])=\(length)") | join(", ")' <<< "$att_json" 2>/dev/null)
+                _drg_dbg_result "Attachments" "$_dbg_att_ct" "types: $_dbg_att_types (merged from ${#q_comps[@]} compartments)"
+                
+                # Extract all unique compartment-ids from attachments and add to q_comps
+                # This is critical for remote peered regions where attachments may be in different compartments
+                local _dbg_pre_comp_ct=${#q_comps[@]}
+                while IFS= read -r _att_cid; do
+                    [[ -z "$_att_cid" || "$_att_cid" == "null" ]] && continue
+                    local _att_dup=0
+                    for c in "${q_comps[@]}"; do [[ "$c" == "$_att_cid" ]] && _att_dup=1 && break; done
+                    if [[ $_att_dup -eq 0 ]]; then
+                        q_comps+=("$_att_cid")
+                        _drg_dbg "★ NEW compartment from attachment: ${_att_cid}"
+                    fi
+                done < <(jq -r '.data[]["compartment-id"] // empty' <<< "$att_json" 2>/dev/null | sort -u)
+                local _dbg_new_comps=$(( ${#q_comps[@]} - _dbg_pre_comp_ct ))
+                [[ $_dbg_new_comps -gt 0 ]] && _drg_dbg "Compartments expanded: $_dbg_pre_comp_ct → ${#q_comps[@]} (+$_dbg_new_comps new from attachments)"
             else
-                XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]="[]"
+                # Fallback: no attachments found in known compartments — try additional compartments from cache
+                _drg_dbg "Attachments empty — attempting fallback with COMPARTMENTS_CACHE"
+                local _fb_found=0
+                if [[ -f "$COMPARTMENTS_CACHE" && -s "$COMPARTMENTS_CACHE" ]]; then
+                    # Get active compartments not already searched
+                    local -A _searched_set=()
+                    for c in "${q_comps[@]}"; do _searched_set[$c]=1; done
+                    
+                    local _fb_comps=()
+                    while IFS='|' read -r _fb_cid _fb_cname _fb_cstate; do
+                        [[ -z "$_fb_cid" || "$_fb_cstate" != "ACTIVE" ]] && continue
+                        [[ -n "${_searched_set[$_fb_cid]+x}" ]] && continue
+                        _fb_comps+=("$_fb_cid")
+                    done < <(jq -r '.data[]? | "\(.id)|\(.name)|\(.["lifecycle-state"])"' "$COMPARTMENTS_CACHE" 2>/dev/null)
+                    
+                    if [[ ${#_fb_comps[@]} -gt 0 ]]; then
+                        _drg_dbg "Fallback: trying ${#_fb_comps[@]} additional compartments from cache"
+                        local _fb_att_dir
+                        _fb_att_dir=$(mktemp -d "${TEMP_DIR}/fb_att.XXXXXX")
+                        local _fb_i=0
+                        local _fb_pids=()
+                        for _fb_c in "${_fb_comps[@]}"; do
+                            _drg_dbg_cmd "Fallback att list" "oci network drg-attachment list --compartment-id ${_fb_c} --drg-id ${q_drg_id} --region $q_region"
+                            oci network drg-attachment list --compartment-id "$_fb_c" --drg-id "$q_drg_id" \
+                                --region "$q_region" --all --output json > "$_fb_att_dir/att_${_fb_i}.json" 2>/dev/null &
+                            _fb_pids+=($!)
+                            ((_fb_i++))
+                            # Limit parallelism
+                            if (( _fb_i % 10 == 0 )); then
+                                wait "${_fb_pids[@]}" 2>/dev/null
+                                _fb_pids=()
+                            fi
+                        done
+                        [[ ${#_fb_pids[@]} -gt 0 ]] && wait "${_fb_pids[@]}" 2>/dev/null
+                        
+                        # Merge any found
+                        all_atts="[]"
+                        for ((_fb_i=0; _fb_i<${#_fb_comps[@]}; _fb_i++)); do
+                            local _fb_af="$_fb_att_dir/att_${_fb_i}.json"
+                            if [[ -f "$_fb_af" && -s "$_fb_af" ]]; then
+                                local _fb_aj
+                                _fb_aj=$(cat "$_fb_af" 2>/dev/null)
+                                if [[ -n "$_fb_aj" ]] && jq -e '.data[0]' <<< "$_fb_aj" >/dev/null 2>&1; then
+                                    all_atts=$(jq -n --argjson a "$all_atts" --argjson b "$(jq '.data' <<< "$_fb_aj")" '$a + $b | unique_by(.id)' 2>/dev/null)
+                                    # Add this compartment to q_comps for downstream use
+                                    q_comps+=("${_fb_comps[$_fb_i]}")
+                                    _drg_dbg "★ Fallback found attachments in comp: ${_fb_comps[$_fb_i]}"
+                                fi
+                            fi
+                        done
+                        rm -rf "$_fb_att_dir" 2>/dev/null
+                        
+                        local _fb_att_ct
+                        _fb_att_ct=$(jq 'length' <<< "$all_atts" 2>/dev/null || echo "0")
+                        if [[ "$_fb_att_ct" -gt 0 ]]; then
+                            att_json="{\"data\": $all_atts}"
+                            XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]=$(jq '.data' <<< "$att_json" 2>/dev/null)
+                            _drg_dbg_result "Fallback Attachments" "$_fb_att_ct" "found via compartment cache fallback"
+                            _fb_found=1
+                            # Extract new compartment-ids from fallback attachments
+                            while IFS= read -r _att_cid; do
+                                [[ -z "$_att_cid" || "$_att_cid" == "null" ]] && continue
+                                local _att_dup=0
+                                for c in "${q_comps[@]}"; do [[ "$c" == "$_att_cid" ]] && _att_dup=1 && break; done
+                                [[ $_att_dup -eq 0 ]] && q_comps+=("$_att_cid")
+                            done < <(jq -r '.data[]["compartment-id"] // empty' <<< "$att_json" 2>/dev/null | sort -u)
+                        fi
+                    fi
+                fi
+                if [[ $_fb_found -eq 0 ]]; then
+                    XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]="[]"
+                    _drg_dbg_result "Attachments" "0" "no attachments found in ${#q_comps[@]} compartments (incl. fallback)"
+                fi
             fi
             
             # ── Process route tables + rules ──
@@ -16529,11 +17245,14 @@ display_cross_region_drg_map() {
             if [[ -n "$drt_json" ]] && jq -e '.data[0]' <<< "$drt_json" >/dev/null 2>&1; then
                 # Fetch route rules for each table (parallel batch)
                 local -a _rt_ids=() _rt_names=()
+                local _dbg_rt_count=$(jq '.data | length' <<< "$drt_json" 2>/dev/null)
+                _drg_dbg "Route tables: $_dbg_rt_count found — fetching rules in parallel"
                 while IFS='|' read -r drt_id drt_name; do
                     [[ -z "$drt_id" ]] && continue
                     _rt_ids+=("$drt_id")
                     _rt_names+=("$drt_name")
                     XR_REGION_DRT_NAMES["${q_region}:${q_drg_id}:${drt_id}"]="$drt_name"
+                    _drg_dbg_cmd "Route rules" "oci network drg-route-rule list --drg-route-table-id ${drt_id} ($drt_name)"
                     oci network drg-route-rule list --drg-route-table-id "$drt_id" --region "$q_region" --output json > "$_par_dir/rules_${drt_id: -8}.json" 2>/dev/null &
                 done < <(jq -r '.data[] | "\(.id)|\(.["display-name"])"' <<< "$drt_json" 2>/dev/null)
                 wait
@@ -16551,6 +17270,34 @@ display_cross_region_drg_map() {
             fi
             
             # ── Process RPCs (merge from all compartments) ──
+            # First, check if any new compartments were added during attachment processing
+            # that need FC/VPN/RPC fetches
+            if [[ ${#q_comps[@]} -gt $_batch_comp_count ]]; then
+                # Find any comps that don't have fc/vpn files yet
+                local _post_att_need_fetch=0
+                for ((_pf=0; _pf<${#q_comps[@]}; _pf++)); do
+                    if [[ ! -f "$_par_dir/fc_${_pf}.json" && ! -f "$_par_dir/rpc_${_pf}.json" ]]; then
+                        _post_att_need_fetch=1
+                        break
+                    fi
+                done
+                if [[ $_post_att_need_fetch -eq 1 ]]; then
+                    _drg_dbg "Post-attachment: fetching FC/VPN/RPC for compartments missing data files"
+                    for ((_pf=0; _pf<${#q_comps[@]}; _pf++)); do
+                        [[ -f "$_par_dir/rpc_${_pf}.json" ]] && continue
+                        local _pf_comp="${q_comps[$_pf]}"
+                        _drg_dbg_cmd "Post-att RPC [comp $_pf]" "oci network remote-peering-connection list --compartment-id ${_pf_comp} --drg-id ${q_drg_id} --region $q_region"
+                        _drg_dbg_cmd "Post-att FC [comp $_pf]" "oci network virtual-circuit list --compartment-id ${_pf_comp} --region $q_region"
+                        _drg_dbg_cmd "Post-att VPN [comp $_pf]" "oci network ip-sec-connection list --compartment-id ${_pf_comp} --drg-id ${q_drg_id} --region $q_region"
+                        oci network remote-peering-connection list --compartment-id "$_pf_comp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/rpc_${_pf}.json" 2>/dev/null &
+                        oci network virtual-circuit list --compartment-id "$_pf_comp" --region "$q_region" --all --output json > "$_par_dir/fc_${_pf}.json" 2>/dev/null &
+                        oci network ip-sec-connection list --compartment-id "$_pf_comp" --drg-id "$q_drg_id" --region "$q_region" --output json > "$_par_dir/vpn_${_pf}.json" 2>/dev/null &
+                    done
+                    wait
+                    _drg_dbg "Post-attachment FC/VPN/RPC fetch complete"
+                fi
+            fi
+            
             local all_rpcs="[]"
             for ((_ci=0; _ci<${#q_comps[@]}; _ci++)); do
                 local rpc_file="$_par_dir/rpc_${_ci}.json"
@@ -16558,11 +17305,12 @@ display_cross_region_drg_map() {
                     local rpc_json
                     rpc_json=$(cat "$rpc_file" 2>/dev/null)
                     if [[ -n "$rpc_json" ]] && jq -e '.data[0]' <<< "$rpc_json" >/dev/null 2>&1; then
-                        all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$rpc_json" )
+                        all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data' <<< "$rpc_json")" '$a + $b | unique_by(.id)' )
                     fi
                 fi
             done
             XR_REGION_RPCS["${q_region}:${q_drg_id}"]="$all_rpcs"
+            _drg_dbg_result "RPCs merged" "$(echo "$all_rpcs" | jq 'length' 2>/dev/null) RPCs"
             
             # ── Process FastConnect (merge, filter by DRG) ──
             local all_fc="[]"
@@ -16581,6 +17329,7 @@ display_cross_region_drg_map() {
                 fi
             done
             XR_REGION_FC["${q_region}:${q_drg_id}"]="$all_fc"
+            _drg_dbg_result "FC merged" "$(echo "$all_fc" | jq 'length' 2>/dev/null) circuits (filtered to DRG)"
             
             # ── Process VPN (merge from all compartments) ──
             local all_vpn="[]"
@@ -16590,85 +17339,308 @@ display_cross_region_drg_map() {
                     local vpn_json
                     vpn_json=$(cat "$vpn_file" 2>/dev/null)
                     if [[ -n "$vpn_json" ]] && jq -e '.data[0]' <<< "$vpn_json" >/dev/null 2>&1; then
-                        all_vpn=$(jq -n --argjson a "$all_vpn" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$vpn_json" )
+                        all_vpn=$(jq -n --argjson a "$all_vpn" --argjson b "$(jq '.data' <<< "$vpn_json")" '$a + $b | unique_by(.id)' )
                     fi
                 fi
             done
             XR_REGION_VPN["${q_region}:${q_drg_id}"]="$all_vpn"
+            _drg_dbg_result "VPN merged" "$(echo "$all_vpn" | jq 'length' 2>/dev/null) IPSec connections"
             
-            # ── Fetch VCN details + subnets + LPGs (parallel per VCN) ──
+            # ── Fetch VCN details + subnets + LPGs + NSGs + SLs + RTs (parallel per VCN) ──
             local vcn_ids_raw
             vcn_ids_raw=$(echo "${XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]}" | jq -r \
                 '.[] | select((.["network-details"]["type"] // "VCN") == "VCN") | .["network-details"]["id"] // .["vcn-id"] // empty' 2>/dev/null | sort -u)
             if [[ -n "$vcn_ids_raw" ]]; then
+                local _dbg_vcn_ct=$(echo "$vcn_ids_raw" | wc -l)
+                _drg_dbg_section "VCN Enrichment: $_dbg_vcn_ct VCNs"
+                # Extract attachment compartment-id per VCN (the attachment knows which compartment the VCN is in)
+                declare -A _att_vcn_comps=()  # vcn_id -> attachment compartment-id
+                while IFS='|' read -r _avcn _acomp; do
+                    [[ -z "$_avcn" || "$_avcn" == "null" || -z "$_acomp" || "$_acomp" == "null" ]] && continue
+                    _att_vcn_comps[$_avcn]="$_acomp"
+                    _drg_dbg "VCN att comp map: ${_avcn} → ${_acomp}"
+                done < <(echo "${XR_REGION_VCN_ATTACH["${q_region}:${q_drg_id}"]}" | jq -r \
+                    '.[] | select((.["network-details"]["type"] // "VCN") == "VCN") | "\(.["network-details"]["id"] // .["vcn-id"] // "null")|\(.["compartment-id"] // "null")"' 2>/dev/null)
+                
+                # Phase A: Fetch VCN details + subnets + LPGs (use attachment comp + known comps)
+                _drg_dbg_section "Phase A: VCN get + subnets + LPGs"
                 while IFS= read -r vcn_id; do
                     [[ -z "$vcn_id" || "$vcn_id" == "null" ]] && continue
-                    [[ -n "${XR_VCN_NAMES[$vcn_id]+x}" ]] && continue  # Already fetched
+                    [[ -n "${XR_VCN_NAMES[$vcn_id]+x}" ]] && { _drg_dbg "Skip VCN ${vcn_id} — already processed from prior BFS"; continue; }
+                    _drg_dbg_cmd "VCN get" "oci network vcn get --vcn-id ${vcn_id} --region $q_region"
                     oci network vcn get --vcn-id "$vcn_id" --region "$q_region" --output json > "$_par_dir/vcn_${vcn_id: -8}.json" 2>/dev/null &
-                    # Subnets: search all compartments
+                    # Build initial comp list for subnet/LPG: attachment comp + q_comps
+                    local -A _pa_seen=()
+                    local _att_comp="${_att_vcn_comps[$vcn_id]:-}"
+                    if [[ -n "$_att_comp" ]]; then
+                        _pa_seen[$_att_comp]=1
+                        _drg_dbg_cmd "Subnet list (att comp)" "oci network subnet list --vcn-id ${vcn_id} --compartment-id ${_att_comp} --region $q_region"
+                        _drg_dbg_cmd "LPG list (att comp)" "oci network local-peering-gateway list --vcn-id ${vcn_id} --compartment-id ${_att_comp} --region $q_region"
+                        oci network subnet list --vcn-id "$vcn_id" --compartment-id "$_att_comp" --region "$q_region" --output json > "$_par_dir/sub_${vcn_id: -8}_${_att_comp: -8}.json" 2>/dev/null &
+                        oci network local-peering-gateway list --vcn-id "$vcn_id" --compartment-id "$_att_comp" --region "$q_region" --output json > "$_par_dir/lpg_${vcn_id: -8}_${_att_comp: -8}.json" 2>/dev/null &
+                    fi
                     for comp in "${q_comps[@]}"; do
+                        [[ -z "$comp" || -n "${_pa_seen[$comp]+x}" ]] && continue
+                        _pa_seen[$comp]=1
+                        _drg_dbg_cmd "Subnet list [q_comp]" "oci network subnet list --vcn-id ${vcn_id} --compartment-id ${comp} --region $q_region"
                         oci network subnet list --vcn-id "$vcn_id" --compartment-id "$comp" --region "$q_region" --output json > "$_par_dir/sub_${vcn_id: -8}_${comp: -8}.json" 2>/dev/null &
                         oci network local-peering-gateway list --vcn-id "$vcn_id" --compartment-id "$comp" --region "$q_region" --output json > "$_par_dir/lpg_${vcn_id: -8}_${comp: -8}.json" 2>/dev/null &
                     done
                 done <<< "$vcn_ids_raw"
                 wait
+                _drg_dbg "Phase A complete — VCN + subnet + LPG fetches done"
                 
-                # Process VCN/subnet/LPG results
+                # Phase B: Process VCN details, build expanded comp list per VCN
+                _drg_dbg_section "Phase B: Process VCN details + build compartment priority"
+                declare -A _vcn_all_comps=()  # vcn_id -> "comp1|comp2|..."
                 while IFS= read -r vcn_id; do
                     [[ -z "$vcn_id" || "$vcn_id" == "null" ]] && continue
                     [[ -n "${XR_VCN_NAMES[$vcn_id]+x}" ]] && continue
                     
                     local vcn_file="$_par_dir/vcn_${vcn_id: -8}.json"
+                    local vcn_actual_comp=""
                     if [[ -f "$vcn_file" ]]; then
                         local vcn_det
                         vcn_det=$(cat "$vcn_file" 2>/dev/null)
                         if [[ -n "$vcn_det" ]] && jq -e '.data' <<< "$vcn_det" >/dev/null 2>&1; then
                             XR_VCN_NAMES[$vcn_id]=$(jq -r '.data["display-name"] // "Unknown"' <<< "$vcn_det")
                             XR_VCN_CIDRS[$vcn_id]=$(jq -r '.data["cidr-block"] // .data["cidr-blocks"][0] // ""' <<< "$vcn_det")
+                            vcn_actual_comp=$(jq -r '.data["compartment-id"] // ""' <<< "$vcn_det")
+                            _drg_dbg_result "VCN get" "OK" "${XR_VCN_NAMES[$vcn_id]} [${XR_VCN_CIDRS[$vcn_id]}] vcn_comp=${vcn_actual_comp}"
+                        else
+                            _drg_dbg_result "VCN get" "FAIL" "${vcn_id} — vcn_${vcn_id: -8}.json parse error"
                         fi
+                    else
+                        _drg_dbg_result "VCN get" "FAIL" "${vcn_id} — vcn_${vcn_id: -8}.json missing"
                     fi
                     [[ -z "${XR_VCN_NAMES[$vcn_id]+x}" ]] && XR_VCN_NAMES[$vcn_id]="Unknown"
                     [[ -z "${XR_VCN_CIDRS[$vcn_id]+x}" ]] && XR_VCN_CIDRS[$vcn_id]=""
                     
+                    # Build deduplicated compartment list: att comp > VCN's own > DRG's > network > default > q_comps
+                    local -A _vc_seen=()
+                    local _vc_list=""
+                    # 1. Attachment compartment (from drg-attachment list — most reliable for remote regions)
+                    local _att_comp="${_att_vcn_comps[$vcn_id]:-}"
+                    if [[ -n "$_att_comp" && -z "${_vc_seen[$_att_comp]+x}" ]]; then
+                        _vc_seen[$_att_comp]=1
+                        _vc_list="${_vc_list}${_att_comp}|"
+                    fi
+                    # 2. VCN's own compartment (from vcn get)
+                    if [[ -n "$vcn_actual_comp" && -z "${_vc_seen[$vcn_actual_comp]+x}" ]]; then
+                        _vc_seen[$vcn_actual_comp]=1
+                        _vc_list="${_vc_list}${vcn_actual_comp}|"
+                    fi
+                    # 3. DRG's compartment
+                    local _drg_comp="${XR_DRG_COMPS[$q_drg_id]:-}"
+                    if [[ -n "$_drg_comp" && -z "${_vc_seen[$_drg_comp]+x}" ]]; then
+                        _vc_seen[$_drg_comp]=1
+                        _vc_list="${_vc_list}${_drg_comp}|"
+                    fi
+                    # 4. Network compartment
+                    if [[ -n "$NETWORK_COMPARTMENT_ID" && -z "${_vc_seen[$NETWORK_COMPARTMENT_ID]+x}" ]]; then
+                        _vc_seen[$NETWORK_COMPARTMENT_ID]=1
+                        _vc_list="${_vc_list}${NETWORK_COMPARTMENT_ID}|"
+                    fi
+                    # 5. Default compartment
+                    if [[ -n "$COMPARTMENT_ID" && -z "${_vc_seen[$COMPARTMENT_ID]+x}" ]]; then
+                        _vc_seen[$COMPARTMENT_ID]=1
+                        _vc_list="${_vc_list}${COMPARTMENT_ID}|"
+                    fi
+                    # 6. Any remaining from BFS queue
+                    for comp in "${q_comps[@]}"; do
+                        [[ -z "$comp" || -n "${_vc_seen[$comp]+x}" ]] && continue
+                        _vc_seen[$comp]=1
+                        _vc_list="${_vc_list}${comp}|"
+                    done
+                    _vcn_all_comps[$vcn_id]="$_vc_list"
+                    _drg_dbg "VCN ${vcn_id} comp priority (${_vc_list//|/ → })"
+                done <<< "$vcn_ids_raw"
+                
+                # Phase C: Fetch NSGs, SLs, RTs with expanded compartment list (includes VCN's own compartment)
+                _drg_dbg_section "Phase C: NSG/SL/RT fetch (parallel per VCN × compartment)"
+                while IFS= read -r vcn_id; do
+                    [[ -z "$vcn_id" || "$vcn_id" == "null" ]] && continue
+                    local _comp_list="${_vcn_all_comps[$vcn_id]:-}"
+                    [[ -z "$_comp_list" ]] && continue
+                    local _dbg_c_ct=0
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
+                        ((_dbg_c_ct++))
+                        _drg_dbg_cmd "NSG/SL/RT [VCN ${vcn_id} comp ${comp}]" "oci network nsg|security-list|route-table list --compartment-id ${comp} --vcn-id ${vcn_id} --region $q_region"
+                        oci network nsg list --compartment-id "$comp" --vcn-id "$vcn_id" --region "$q_region" --all --output json > "$_par_dir/nsg_${vcn_id: -8}_${comp: -8}.json" 2>/dev/null &
+                        oci network security-list list --compartment-id "$comp" --vcn-id "$vcn_id" --region "$q_region" --all --output json > "$_par_dir/sl_${vcn_id: -8}_${comp: -8}.json" 2>/dev/null &
+                        oci network route-table list --compartment-id "$comp" --vcn-id "$vcn_id" --region "$q_region" --all --output json > "$_par_dir/rt_${vcn_id: -8}_${comp: -8}.json" 2>/dev/null &
+                    done <<< "${_comp_list//|/$'\n'}"
+                    _drg_dbg "VCN ${vcn_id}: launched ${_dbg_c_ct} comp × 3 = $((_dbg_c_ct * 3)) parallel calls"
+                done <<< "$vcn_ids_raw"
+                wait
+                _drg_dbg "Phase C complete — NSG/SL/RT fetches done"
+                
+                # Phase D: Process subnet/LPG/NSG/SL/RT results
+                _drg_dbg_section "Phase D: Process results (first-comp-wins)"
+                while IFS= read -r vcn_id; do
+                    [[ -z "$vcn_id" || "$vcn_id" == "null" ]] && continue
+                    # Skip if already fully processed from a previous BFS iteration
+                    [[ -n "${XR_VCN_SUBNETS[$vcn_id]+x}" ]] && continue
+                    
+                    local _comp_list="${_vcn_all_comps[$vcn_id]:-}"
+                    
                     # Merge subnets from all compartments
                     local all_subs="[]"
-                    for comp in "${q_comps[@]}"; do
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
                         local sub_file="$_par_dir/sub_${vcn_id: -8}_${comp: -8}.json"
                         if [[ -f "$sub_file" ]]; then
                             local sub_json
                             sub_json=$(cat "$sub_file" 2>/dev/null)
                             if [[ -n "$sub_json" ]] && jq -e '.data[0]' <<< "$sub_json" >/dev/null 2>&1; then
-                                all_subs=$(jq -n --argjson a "$all_subs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$sub_json" )
+                                all_subs=$(jq -n --argjson a "$all_subs" --argjson b "$(jq '.data' <<< "$sub_json")" '$a + $b | unique_by(.id)' )
                             fi
                         fi
-                    done
+                    done <<< "${_comp_list//|/$'\n'}"
                     XR_VCN_SUBNETS[$vcn_id]="$all_subs"
                     
                     # Merge LPGs
                     local all_lpgs="[]"
-                    for comp in "${q_comps[@]}"; do
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
                         local lpg_file="$_par_dir/lpg_${vcn_id: -8}_${comp: -8}.json"
                         if [[ -f "$lpg_file" ]]; then
                             local lpg_json
                             lpg_json=$(cat "$lpg_file" 2>/dev/null)
                             if [[ -n "$lpg_json" ]] && jq -e '.data[0]' <<< "$lpg_json" >/dev/null 2>&1; then
-                                all_lpgs=$(jq -n --argjson a "$all_lpgs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$lpg_json" )
+                                all_lpgs=$(jq -n --argjson a "$all_lpgs" --argjson b "$(jq '.data' <<< "$lpg_json")" '$a + $b | unique_by(.id)' )
                             fi
                         fi
-                    done
+                    done <<< "${_comp_list//|/$'\n'}"
                     XR_VCN_LPGS[$vcn_id]="$all_lpgs"
+                    
+                    # Merge NSGs — if found in one compartment, they're all there
+                    local all_nsg_ids=""
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
+                        local nsg_file="$_par_dir/nsg_${vcn_id: -8}_${comp: -8}.json"
+                        if [[ -f "$nsg_file" ]]; then
+                            local nsg_json
+                            nsg_json=$(cat "$nsg_file" 2>/dev/null)
+                            if [[ -n "$nsg_json" ]] && jq -e '.data[0]' <<< "$nsg_json" >/dev/null 2>&1; then
+                                while IFS='|' read -r _nid _nname _nstate; do
+                                    [[ -z "$_nid" ]] && continue
+                                    [[ -n "${XR_NSG_INFO[$_nid]+x}" ]] && continue
+                                    XR_NSG_INFO[$_nid]="${_nname}|?|?|${comp}"
+                                    all_nsg_ids="${all_nsg_ids}${_nid}"$'\n'
+                                done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["lifecycle-state"])"' <<< "$nsg_json" 2>/dev/null)
+                                break  # Found in this compartment — skip rest
+                            fi
+                        fi
+                    done <<< "${_comp_list//|/$'\n'}"
+                    XR_VCN_NSGS[$vcn_id]="$all_nsg_ids"
+                    
+                    # Merge SLs — if found in one compartment, they're all there
+                    local all_sl_ids=""
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
+                        local sl_file="$_par_dir/sl_${vcn_id: -8}_${comp: -8}.json"
+                        if [[ -f "$sl_file" ]]; then
+                            local sl_json
+                            sl_json=$(cat "$sl_file" 2>/dev/null)
+                            if [[ -n "$sl_json" ]] && jq -e '.data[0]' <<< "$sl_json" >/dev/null 2>&1; then
+                                while IFS='|' read -r _sid _sname _sin _seg; do
+                                    [[ -z "$_sid" || -n "${XR_SL_INFO[$_sid]+x}" ]] && continue
+                                    XR_SL_INFO[$_sid]="${_sname}|${_sin}|${_seg}"
+                                    all_sl_ids="${all_sl_ids}${_sid}"$'\n'
+                                    # Store full rules JSON for display
+                                    local _sl_rules_j
+                                    _sl_rules_j=$(jq -c --arg sid "$_sid" '.data[] | select(.id == $sid) | {"ingress": (.["ingress-security-rules"] // []), "egress": (.["egress-security-rules"] // [])}' <<< "$sl_json" 2>/dev/null)
+                                    [[ -n "$_sl_rules_j" ]] && XR_SL_RULES[$_sid]="$_sl_rules_j"
+                                done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["ingress-security-rules"] | length)|\(.["egress-security-rules"] | length)"' <<< "$sl_json" 2>/dev/null)
+                                break  # Found in this compartment — skip rest
+                            fi
+                        fi
+                    done <<< "${_comp_list//|/$'\n'}"
+                    XR_VCN_SLS[$vcn_id]="$all_sl_ids"
+                    
+                    # Merge RTs — if found in one compartment, they're all there
+                    while IFS='|' read -r comp; do
+                        [[ -z "$comp" ]] && continue
+                        local rt_file="$_par_dir/rt_${vcn_id: -8}_${comp: -8}.json"
+                        if [[ -f "$rt_file" ]]; then
+                            local rt_json
+                            rt_json=$(cat "$rt_file" 2>/dev/null)
+                            if [[ -n "$rt_json" ]] && jq -e '.data[0]' <<< "$rt_json" >/dev/null 2>&1; then
+                                while IFS='|' read -r _rid _rname _rcount; do
+                                    [[ -z "$_rid" || -n "${XR_RT_INFO[$_rid]+x}" ]] && continue
+                                    XR_RT_INFO[$_rid]="${_rname}|${_rcount}"
+                                done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["route-rules"] | length)"' <<< "$rt_json" 2>/dev/null)
+                                break  # Found in this compartment — skip rest
+                            fi
+                        fi
+                    done <<< "${_comp_list//|/$'\n'}"
                 done <<< "$vcn_ids_raw"
+                
+                # ── Fetch NSG rules for all discovered NSGs (parallel batch) ──
+                local _all_nsg_ids_uniq=""
+                for _vid in "${!XR_VCN_NSGS[@]}"; do
+                    _all_nsg_ids_uniq="${_all_nsg_ids_uniq}${XR_VCN_NSGS[$_vid]}"
+                done
+                _all_nsg_ids_uniq=$(echo "$_all_nsg_ids_uniq" | sort -u)
+                if [[ -n "$_all_nsg_ids_uniq" ]]; then
+                    local _dbg_nsg_rule_ct=$(echo "$_all_nsg_ids_uniq" | grep -c . || echo "0")
+                    _drg_dbg_section "NSG Rules: fetching for $_dbg_nsg_rule_ct NSGs"
+                    local _nsg_par_dir
+                    _nsg_par_dir=$(mktemp -d "${TEMP_DIR}/xr_nsg.XXXXXX")
+                    while IFS= read -r _nid; do
+                        [[ -z "$_nid" ]] && continue
+                        [[ -n "${XR_NSG_RULES[$_nid]+x}" ]] && continue
+                        # Use region from the NSG's own OCID (prevents cross-region mismatch)
+                        local _nsg_region
+                        _nsg_region=$(_ocid_region "$_nid" "$q_region")
+                        _drg_dbg_cmd "NSG rules" "oci network nsg rules list --nsg-id ${_nid} --region $_nsg_region --all"
+                        oci network nsg rules list --nsg-id "$_nid" --region "$_nsg_region" --all --output json > "$_nsg_par_dir/${_nid: -8}.json" 2>/dev/null &
+                    done <<< "$_all_nsg_ids_uniq"
+                    wait
+                    
+                    while IFS= read -r _nid; do
+                        [[ -z "$_nid" ]] && continue
+                        [[ -n "${XR_NSG_RULES[$_nid]+x}" ]] && continue
+                        local _nrf="$_nsg_par_dir/${_nid: -8}.json"
+                        if [[ -f "$_nrf" && -s "$_nrf" ]]; then
+                            local _nrj
+                            _nrj=$(cat "$_nrf" 2>/dev/null)
+                            if [[ -n "$_nrj" ]] && jq -e '.data' <<< "$_nrj" >/dev/null 2>&1; then
+                                local _in_ct _eg_ct
+                                _in_ct=$(jq '[(.data // [])[] | select(.direction=="INGRESS")] | length' <<< "$_nrj" 2>/dev/null || echo "0")
+                                _eg_ct=$(jq '[(.data // [])[] | select(.direction=="EGRESS")] | length' <<< "$_nrj" 2>/dev/null || echo "0")
+                                # Update info with real counts (preserve compartment field)
+                                local _cur_name _cur_comp
+                                _cur_name=$(echo "${XR_NSG_INFO[$_nid]}" | cut -d'|' -f1)
+                                _cur_comp=$(echo "${XR_NSG_INFO[$_nid]}" | cut -d'|' -f4)
+                                XR_NSG_INFO[$_nid]="${_cur_name}|${_in_ct}|${_eg_ct}|${_cur_comp}"
+                                # Store compact rules — only if valid .data response
+                                XR_NSG_RULES[$_nid]=$(jq -c '.data // []' <<< "$_nrj" 2>/dev/null)
+                                _drg_dbg_result "NSG rules" "OK" "$(echo "${XR_NSG_INFO[$_nid]}" | cut -d'|' -f1): ${_in_ct}↓ ${_eg_ct}↑"
+                            else
+                                _drg_dbg_result "NSG rules" "FAIL" "${_nid} — no .data in response (API error or wrong region)"
+                            fi
+                        else
+                            _drg_dbg_result "NSG rules" "FAIL" "${_nid} — file missing or empty"
+                        fi
+                    done <<< "$_all_nsg_ids_uniq"
+                    rm -rf "$_nsg_par_dir" 2>/dev/null
+                fi
             fi
             
             # ── Follow RPC peering connections to discover remote DRGs ──
             local rpc_count
             rpc_count=$(jq 'length' <<< "$all_rpcs" 2>/dev/null || echo "0")
             if [[ "$rpc_count" -gt 0 ]]; then
+                _drg_dbg_section "RPC Peer Resolution: $rpc_count RPCs"
                 # Parallel resolve of peer RPCs
                 while IFS='|' read -r peer_rpc_id peer_region peer_status; do
                     [[ "$peer_status" != "PEERED" ]] && continue
                     [[ -z "$peer_rpc_id" || "$peer_rpc_id" == "null" ]] && continue
                     [[ -z "$peer_region" || "$peer_region" == "null" ]] && continue
+                    _drg_dbg_cmd "Peer RPC get" "oci network remote-peering-connection get --remote-peering-connection-id ${peer_rpc_id} --region $peer_region"
                     oci network remote-peering-connection get --remote-peering-connection-id "$peer_rpc_id" \
                         --region "$peer_region" --output json > "$_par_dir/peer_${peer_rpc_id: -8}.json" 2>/dev/null &
                 done < <(jq -r '.[] | "\(.["peer-id"] // "")|\(.["peer-region-name"] // "")|\(.["peering-status"])"' <<< "$all_rpcs" 2>/dev/null)
@@ -16689,9 +17661,22 @@ display_cross_region_drg_map() {
                             remote_comp=$(jq -r '.data["compartment-id"] // ""' <<< "$peer_rpc_detail")
                             if [[ -n "$remote_drg_id" && -z "${XR_VISITED_DRGS[$remote_drg_id]+x}" ]]; then
                                 local remote_comps_str
-                                remote_comps_str=$(IFS=,; echo "${q_comps[*]}")
-                                [[ -n "$remote_comp" ]] && remote_comps_str="$remote_comps_str,$remote_comp"
+                                # Build deduplicated comma-separated compartment list
+                                declare -A _rcs_set=()
+                                local -a _rcs_arr=()
+                                for _rc in "${q_comps[@]}"; do
+                                    if [[ -n "$_rc" && -z "${_rcs_set[$_rc]+x}" ]]; then
+                                        _rcs_set[$_rc]=1
+                                        _rcs_arr+=("$_rc")
+                                    fi
+                                done
+                                if [[ -n "$remote_comp" && -z "${_rcs_set[$remote_comp]+x}" ]]; then
+                                    _rcs_arr+=("$remote_comp")
+                                fi
+                                remote_comps_str=$(IFS=,; echo "${_rcs_arr[*]}")
+                                unset _rcs_set
                                 drg_queue+=("${remote_drg_id}|${peer_region}|${remote_comps_str}")
+                                _drg_dbg "★ ENQUEUED remote DRG: $peer_region / ${remote_drg_id} with comps=${remote_comps_str}"
                             fi
                         fi
                     fi
@@ -16703,6 +17688,45 @@ display_cross_region_drg_map() {
         done
         
         echo -ne "\r                                                                                          \r"
+        
+        _drg_dbg_section "BFS COMPLETE — Summary"
+        _drg_dbg "Regions: $xr_total_regions | DRGs: ${#XR_DRG_NAMES[@]} | VCNs: ${#XR_VCN_NAMES[@]}"
+        _drg_dbg "NSGs: ${#XR_NSG_INFO[@]} (${#XR_NSG_RULES[@]} with rules) | SLs: ${#XR_SL_INFO[@]} (${#XR_SL_RULES[@]} with rules) | RTs: ${#XR_RT_INFO[@]}"
+        # Count total FC and VPN across all regions/DRGs
+        local _total_fc=0 _total_vpn=0
+        for _fc_key in "${!XR_REGION_FC[@]}"; do
+            local _fc_ct; _fc_ct=$(jq 'length' <<< "${XR_REGION_FC[$_fc_key]}" 2>/dev/null || echo "0")
+            ((_total_fc += _fc_ct))
+        done
+        for _vpn_key in "${!XR_REGION_VPN[@]}"; do
+            local _vpn_ct; _vpn_ct=$(jq 'length' <<< "${XR_REGION_VPN[$_vpn_key]}" 2>/dev/null || echo "0")
+            ((_total_vpn += _vpn_ct))
+        done
+        _drg_dbg "FC circuits: $_total_fc | IPSec VPNs: $_total_vpn"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            for _dbg_did in "${!XR_DRG_NAMES[@]}"; do
+                local _dbg_reg="${XR_DRG_REGIONS[$_dbg_did]}"
+                local _dbg_att_ct=0
+                local _dbg_att_data="${XR_REGION_VCN_ATTACH["${_dbg_reg}:${_dbg_did}"]:-[]}"
+                [[ "$_dbg_att_data" != "[]" ]] && _dbg_att_ct=$(jq 'length' <<< "$_dbg_att_data" 2>/dev/null || echo "0")
+                _drg_dbg "  DRG: ${XR_DRG_NAMES[$_dbg_did]} region=${_dbg_reg} comp=${XR_DRG_COMP_NAMES[$_dbg_did]:-?} attachments=${_dbg_att_ct}"
+                local _dbg_fc_ct=0 _dbg_vpn_ct=0
+                local _dbg_fc_data="${XR_REGION_FC["${_dbg_reg}:${_dbg_did}"]:-[]}"
+                local _dbg_vpn_data="${XR_REGION_VPN["${_dbg_reg}:${_dbg_did}"]:-[]}"
+                [[ "$_dbg_fc_data" != "[]" ]] && _dbg_fc_ct=$(jq 'length' <<< "$_dbg_fc_data" 2>/dev/null || echo "0")
+                [[ "$_dbg_vpn_data" != "[]" ]] && _dbg_vpn_ct=$(jq 'length' <<< "$_dbg_vpn_data" 2>/dev/null || echo "0")
+                [[ "$_dbg_fc_ct" -gt 0 || "$_dbg_vpn_ct" -gt 0 ]] && _drg_dbg "    FC=${_dbg_fc_ct} VPN=${_dbg_vpn_ct}"
+                [[ "$_dbg_att_ct" == "0" ]] && _drg_dbg "    ⚠ NO attachments — check compartment search scope for this region"
+            done
+            for _dbg_vid in "${!XR_VCN_NSGS[@]}"; do
+                local _dbg_nlist="${XR_VCN_NSGS[$_dbg_vid]}"
+                local _dbg_nct=0; [[ -n "$_dbg_nlist" ]] && _dbg_nct=$(echo "$_dbg_nlist" | grep -c . || echo 0)
+                _drg_dbg "  VCN: ${XR_VCN_NAMES[$_dbg_vid]:-?} [${XR_VCN_CIDRS[$_dbg_vid]:-?}] NSGs=$_dbg_nct"
+                if [[ $_dbg_nct -eq 0 ]]; then
+                    _drg_dbg "    ⚠ NO NSGs found for this VCN — check compartment search list"
+                fi
+            done
+        fi
         
         # ── Save to cache ──
         mkdir -p "$XR_CACHE_DIR"
@@ -16728,6 +17752,13 @@ display_cross_region_drg_map() {
             declare -p XR_VCN_LPGS 2>/dev/null
             declare -p XR_VCN_NAMES 2>/dev/null
             declare -p XR_VCN_CIDRS 2>/dev/null
+            declare -p XR_RT_INFO 2>/dev/null
+            declare -p XR_SL_INFO 2>/dev/null
+            declare -p XR_SL_RULES 2>/dev/null
+            declare -p XR_NSG_INFO 2>/dev/null
+            declare -p XR_NSG_RULES 2>/dev/null
+            declare -p XR_VCN_NSGS 2>/dev/null
+            declare -p XR_VCN_SLS 2>/dev/null
         } > "${XR_CACHE_DIR}/xr_data.sh"
         echo "$xr_total_regions" > "${XR_CACHE_DIR}/xr_total_regions.txt"
         touch "${XR_CACHE_DIR}/.meta"
@@ -16739,16 +17770,20 @@ display_cross_region_drg_map() {
     # PHASE 2: Display the Comprehensive Map (compacted)
     # ═══════════════════════════════════════════════════════════════════════════════
     echo -e "  ${BOLD}${WHITE}Discovered: ${GREEN}${xr_total_regions} region(s)${NC}, ${WHITE}${#XR_VISITED_DRGS[@]} DRG(s)${NC}"
+    if [[ ${#XR_RT_INFO[@]} -gt 0 || ${#XR_SL_INFO[@]} -gt 0 || ${#XR_NSG_INFO[@]} -gt 0 ]]; then
+        echo -e "  ${GRAY}Enrichment: ${#XR_RT_INFO[@]} RTs, ${#XR_SL_INFO[@]} SLs (${#XR_SL_RULES[@]} with rules), ${#XR_NSG_INFO[@]} NSGs (${#XR_NSG_RULES[@]} with rules)${NC}"
+    fi
     
-    # Build global attachment lookup (name, type) for route rule resolution
-    declare -A XR_ATT_NAMES XR_ATT_TYPES
+    # Build global attachment lookup (name, type, vcn_id) for route rule resolution
+    declare -A XR_ATT_NAMES XR_ATT_TYPES XR_ATT_VCN_IDS
     for key in "${!XR_REGION_VCN_ATTACH[@]}"; do
         local att_data="${XR_REGION_VCN_ATTACH[$key]}"
-        while IFS='|' read -r _aid _aname _atype; do
+        while IFS='|' read -r _aid _aname _atype _avcnid; do
             [[ -z "$_aid" ]] && continue
             XR_ATT_NAMES[$_aid]="$_aname"
             XR_ATT_TYPES[$_aid]="$_atype"
-        done < <(jq -r '.[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["network-details"]["type"] // "VCN")"' <<< "$att_data" 2>/dev/null)
+            [[ "$_atype" == "VCN" && -n "$_avcnid" && "$_avcnid" != "null" ]] && XR_ATT_VCN_IDS[$_aid]="$_avcnid"
+        done < <(jq -r '.[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["network-details"]["type"] // "VCN")|\(.["network-details"]["id"] // .["vcn-id"] // "null")"' <<< "$att_data" 2>/dev/null)
     done
     
     for region_key in $(echo "${!XR_REGION_DRGS[@]}" | tr ' ' '\n' | sort); do
@@ -16779,41 +17814,75 @@ display_cross_region_drg_map() {
                 *) redund_color="$YELLOW" ;;
             esac
             
-            # DRG header — compact (no inner box)
-            printf "  ${CYAN}%s${NC}  ${BOLD}${MAGENTA}🔷 DRG:${NC} ${WHITE}%s${NC} ${GRAY}|${NC} State: ${state_color}%s${NC} ${GRAY}|${NC} Redundancy: ${redund_color}%s${NC}%*s${CYAN}%s${NC}\n" \
-                "$V" "$drg_name" "$drg_state" "$drg_redundancy" 2 "" "$V"
-            printf "  ${CYAN}%s${NC}  ${CYAN}OCID:${NC} ${GRAY}%s${NC}%*s${CYAN}%s${NC}\n" \
-                "$V" "$drg_id" $((box_width - 10 - ${#drg_id})) "" "$V"
-            printf "  ${CYAN}%s${NC}  ${CYAN}Compartment:${NC} ${WHITE}%s${NC} ${GRAY}(%s)${NC}%*s${CYAN}%s${NC}\n" \
-                "$V" "$drg_comp_name" "$drg_comp" 2 "" "$V"
+            # ── 1. DRG + OCID ──
+            printf "  ${CYAN}%s${NC}  ${BOLD}${MAGENTA}🔷 DRG:${NC} ${WHITE}%s${NC} ${GRAY}|${NC} State: ${state_color}%s${NC} ${GRAY}|${NC} Redundancy: ${redund_color}%s${NC} ${YELLOW}(%s)${NC}\n" \
+                "$V" "$drg_name" "$drg_state" "$drg_redundancy" "$drg_id"
             
-            # Default Export Route Distribution
-            local export_dist_info="${XR_DRG_EXPORT_DIST[$drg_id]:-}"
-            if [[ -n "$export_dist_info" ]]; then
-                local ed_name ed_type ed_ocid
-                IFS='|' read -r ed_name ed_type ed_ocid <<< "$export_dist_info"
-                printf "  ${CYAN}%s${NC}  ${CYAN}Default Export Distribution:${NC} ${GREEN}%s${NC} ${GRAY}[%s]${NC} ${GRAY}(%s)${NC}\n" \
-                    "$V" "$ed_name" "$ed_type" "$ed_ocid"
-                # Statements
-                local export_stmts="${XR_DRG_EXPORT_DIST_STMTS[$drg_id]:-[]}"
-                local export_stmt_count
-                export_stmt_count=$(jq 'length' <<< "$export_stmts" 2>/dev/null || echo "0")
-                if [[ "$export_stmt_count" -gt 0 ]]; then
-                    while IFS='|' read -r es_action es_priority es_match_type es_att_type; do
-                        [[ -z "$es_action" ]] && continue
-                        local match_d=""
-                        if [[ -n "$es_att_type" && "$es_att_type" != "null" ]]; then
-                            match_d="attachment-type=${es_att_type}"
-                        else
-                            match_d="match=${es_match_type}"
-                        fi
-                        printf "  ${CYAN}%s${NC}    Priority ${GREEN}%s${NC}: ${WHITE}%s${NC}  %s\n" \
-                            "$V" "$es_priority" "$es_action" "$match_d"
-                    done < <(jq -r '.[] | "\(.action)|\(.priority)|\(.["match-criteria"][0]["match-type"] // "ALL")|\(.["match-criteria"][0]["attachment-type"] // "null")"' <<< "$export_stmts" 2>/dev/null)
+            # ── 2. Compartments (all unique for this DRG + VCNs + attachments) ──
+            if [[ "${DRG_TOPO_FLAGS[compartments]}" == "1" ]]; then
+            {
+                declare -A _shown_comps=()
+                local _comp_lines=()
+                # DRG's own compartment
+                if [[ -n "$drg_comp" && -z "${_shown_comps[$drg_comp]+x}" ]]; then
+                    _shown_comps[$drg_comp]=1
+                    local _cn; _cn=$(resolve_compartment_name "$drg_comp")
+                    _comp_lines+=("${_cn}|${drg_comp}|DRG")
                 fi
-            fi
+                # Compartments from attachments
+                local _hdr_att_data="${XR_REGION_VCN_ATTACH["${region_key}:${drg_id}"]:-[]}"
+                while IFS= read -r _ac; do
+                    [[ -z "$_ac" || "$_ac" == "null" ]] && continue
+                    if [[ -z "${_shown_comps[$_ac]+x}" ]]; then
+                        _shown_comps[$_ac]=1
+                        local _cn; _cn=$(resolve_compartment_name "$_ac")
+                        _comp_lines+=("${_cn}|${_ac}|Attachment")
+                    fi
+                done < <(echo "$_hdr_att_data" | jq -r '.[]["compartment-id"] // empty' 2>/dev/null | sort -u)
+                # Compartments from VCNs (VCN's own compartment may differ from attachment)
+                while IFS= read -r _vc; do
+                    [[ -z "$_vc" || "$_vc" == "null" ]] && continue
+                    local _vcn_id
+                    _vcn_id=$(echo "$_hdr_att_data" | jq -r --arg id "$_vc" '.[] | select(.id == $id) | .["network-details"]["id"] // .["vcn-id"] // empty' 2>/dev/null | head -1)
+                    # nothing to do here - VCN comp already gathered above
+                done < <(echo "$_hdr_att_data" | jq -r '.[].id' 2>/dev/null)
+                
+                if [[ ${#_comp_lines[@]} -gt 0 ]]; then
+                    printf "  ${CYAN}%s${NC}  ${CYAN}Compartments:${NC}\n" "$V"
+                    for _cl in "${_comp_lines[@]}"; do
+                        local _cname _cocid _crole
+                        IFS='|' read -r _cname _cocid _crole <<< "$_cl"
+                        printf "  ${CYAN}%s${NC}    ${WHITE}%-30s${NC} ${YELLOW}(%s)${NC} ${GRAY}[%s]${NC}\n" \
+                            "$V" "$_cname" "$_cocid" "$_crole"
+                    done
+                fi
+            }
+            fi  # compartments flag
             
-            # ── ALL DRG Attachments (unified: VCN, VIRTUAL_CIRCUIT, IPSEC_TUNNEL, REMOTE_PEERING_CONNECTION) ──
+            # ── 4. VCN ──
+            if [[ "${DRG_TOPO_FLAGS[vcn]}" == "1" ]]; then
+            local _hdr_vcn_shown=0
+            while IFS='|' read -r _hv_id _hv_vcn_id _hv_state _hv_comp; do
+                [[ -z "$_hv_id" || "$_hv_id" == "null" ]] && continue
+                [[ "$_hv_state" == "DETACHED" || "$_hv_state" == "TERMINATED" ]] && continue
+                local _hv_vcn_name="${XR_VCN_NAMES[$_hv_vcn_id]:-}"
+                local _hv_vcn_cidr="${XR_VCN_CIDRS[$_hv_vcn_id]:-}"
+                [[ -z "$_hv_vcn_name" && -n "$_hv_vcn_id" && "$_hv_vcn_id" != "null" ]] && _hv_vcn_name="$_hv_vcn_id"
+                if [[ -n "$_hv_vcn_name" ]]; then
+                    if [[ $_hdr_vcn_shown -eq 0 ]]; then
+                        printf "  ${CYAN}%s${NC}  ${CYAN}VCN:${NC}\n" "$V"
+                        _hdr_vcn_shown=1
+                    fi
+                    local _hv_cidr_str=""
+                    [[ -n "$_hv_vcn_cidr" ]] && _hv_cidr_str=" [${_hv_vcn_cidr}]"
+                    printf "  ${CYAN}%s${NC}    ${WHITE}%s${NC}${GRAY}%s${NC} ${YELLOW}(%s)${NC}\n" \
+                        "$V" "$_hv_vcn_name" "$_hv_cidr_str" "${_hv_vcn_id}"
+                fi
+            done < <(echo "${XR_REGION_VCN_ATTACH["${region_key}:${drg_id}"]:-[]}" | jq -r '.[] | select((.["network-details"]["type"] // "VCN") == "VCN") | "\(.id)|\(.["network-details"]["id"] // .["vcn-id"] // "")|\(.["lifecycle-state"])|\(.["compartment-id"] // "")"' 2>/dev/null)
+            fi  # vcn flag
+            
+            # ── 5. Attachments (unified: VCN, VIRTUAL_CIRCUIT, IPSEC_TUNNEL, REMOTE_PEERING_CONNECTION) ──
+            if [[ "${DRG_TOPO_FLAGS[attachments]}" == "1" ]]; then
             local att_data="${XR_REGION_VCN_ATTACH["${region_key}:${drg_id}"]:-[]}"
             local all_att_count
             all_att_count=$(jq 'length' <<< "$att_data" 2>/dev/null || echo "0")
@@ -16888,307 +17957,123 @@ display_cross_region_drg_map() {
                     [[ -n "$extra_detail" ]] && printf "  %b" "$extra_detail"
                     printf "\n"
                     
-                    # ── Subnet drill-down for VCN attachments ──
-                    if [[ "$att_type" == "VCN" && -n "$att_net_id" && "$att_net_id" != "null" ]]; then
-                        local sub_data="${XR_VCN_SUBNETS[$att_net_id]:-[]}"
-                        local sub_count
-                        sub_count=$(jq 'length' <<< "$sub_data" 2>/dev/null || echo "0")
-                        local lpg_data="${XR_VCN_LPGS[$att_net_id]:-[]}"
-                        local lpg_count
-                        lpg_count=$(jq 'length' <<< "$lpg_data" 2>/dev/null || echo "0")
-                        if [[ "$sub_count" -gt 0 ]]; then
-                            while IFS='|' read -r sub_name sub_cidr sub_access; do
-                                [[ -z "$sub_name" ]] && continue
-                                local access_icon="🔒"
-                                [[ "$sub_access" == "true" ]] && access_icon="🌐"
-                                local sub_lpg_flag=""
-                                [[ "$lpg_count" -gt 0 ]] && sub_lpg_flag=" ${GREEN}🔗${NC}"
-                                printf "  ${CYAN}%s${NC}         %s ${GRAY}%-26s${NC} ${WHITE}%-18s${NC}%b\n" \
-                                    "$V" "$access_icon" "${sub_name:0:26}" "${sub_cidr:0:18}" "$sub_lpg_flag"
-                            done < <(jq -r '.[] | "\(.["display-name"] // "N/A")|\(.["cidr-block"] // "")|\(.["prohibit-internet-ingress"] // "true" | if . == false then "true" else "false" end)"' <<< "$sub_data" 2>/dev/null)
-                        fi
-                        if [[ "$lpg_count" -gt 0 ]]; then
-                            while IFS='|' read -r lpg_name lpg_status; do
-                                [[ -z "$lpg_name" ]] && continue
-                                local lpg_color="$GREEN"; [[ "$lpg_status" != "PEERED" ]] && lpg_color="$YELLOW"
-                                printf "  ${CYAN}%s${NC}         ${lpg_color}🔗 LPG: %-22s${NC} [${lpg_color}%s${NC}]\n" \
-                                    "$V" "${lpg_name:0:22}" "$lpg_status"
-                            done < <(jq -r '.[] | "\(.["display-name"])|\(.["peering-status"])"' <<< "$lpg_data" 2>/dev/null)
-                        fi
-                    fi
-                    
                     # ── FastConnect drill-down for VIRTUAL_CIRCUIT attachments ──
                     if [[ "$att_type" == "VIRTUAL_CIRCUIT" && -n "$att_net_id" && "$att_net_id" != "null" ]]; then
-                        local _fc_vc_detail
-                        _fc_vc_detail=$(oci network virtual-circuit get --virtual-circuit-id "$att_net_id" --region "$region_key" --output json 2>/dev/null)
-                        if [[ -n "$_fc_vc_detail" ]] && jq -e '.data' <<< "$_fc_vc_detail" >/dev/null 2>&1; then
-                            # Encryption status
-                            local _fc_is_transport _fc_encrypt_d
-                            _fc_is_transport=$(jq -r '.data["is-transport-mode"] // "null"' <<< "$_fc_vc_detail" 2>/dev/null)
-                            if [[ "$_fc_is_transport" == "true" ]]; then
-                                _fc_encrypt_d="${GREEN}IPSec Transport Mode${NC}"
-                            elif [[ "$_fc_is_transport" == "false" ]]; then
-                                _fc_encrypt_d="${GRAY}Not encrypted (IPSec)${NC}"
-                            else
-                                _fc_encrypt_d="${GRAY}N/A${NC}"
-                            fi
-                            printf "  ${CYAN}%s${NC}         ${CYAN}Encryption:${NC} %b\n" "$V" "$_fc_encrypt_d"
-                            
-                            # MTU
-                            local _fc_mtu
-                            _fc_mtu=$(jq -r '.data["ip-mtu"] // "N/A"' <<< "$_fc_vc_detail" 2>/dev/null)
-                            [[ "$_fc_mtu" != "N/A" && "$_fc_mtu" != "null" ]] && \
-                                printf "  ${CYAN}%s${NC}         ${CYAN}MTU:${NC} ${WHITE}%s${NC}\n" "$V" "$_fc_mtu"
-                            
-                            # Cross-connect mappings → physical details
-                            local _fc_cc_maps
-                            _fc_cc_maps=$(jq -r '.data["cross-connect-mappings"] // []' <<< "$_fc_vc_detail" 2>/dev/null)
-                            local _fc_cc_count
-                            _fc_cc_count=$(jq 'length' <<< "$_fc_cc_maps" 2>/dev/null || echo "0")
-                            
-                            if [[ "$_fc_cc_count" -gt 0 ]]; then
-                                local _fc_ci=0
-                                while [[ $_fc_ci -lt $_fc_cc_count ]]; do
-                                    local _fc_ccid
-                                    _fc_ccid=$(jq -r ".[$_fc_ci][\"cross-connect-or-cross-connect-group-id\"] // \"null\"" <<< "$_fc_cc_maps" 2>/dev/null)
-                                    
-                                    if [[ -n "$_fc_ccid" && "$_fc_ccid" != "null" ]]; then
-                                        if [[ "$_fc_ccid" == ocid1.crossconnect.* ]]; then
-                                            local _fc_cc_json
-                                            _fc_cc_json=$(oci network cross-connect get --cross-connect-id "$_fc_ccid" --region "$region_key" --output json 2>/dev/null)
-                                            if [[ -n "$_fc_cc_json" ]] && jq -e '.data' <<< "$_fc_cc_json" >/dev/null 2>&1; then
-                                                local _fc_loc _fc_phys _fc_logi _fc_port _fc_speed _fc_ms_state _fc_cc_state
-                                                _fc_loc=$(jq -r '.data["location-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_phys=$(jq -r '.data["oci-physical-device-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_logi=$(jq -r '.data["oci-logical-device-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_port=$(jq -r '.data["port-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_speed=$(jq -r '.data["port-speed-shape-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_ms_state=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                _fc_cc_state=$(jq -r '.data["lifecycle-state"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                
-                                                printf "  ${CYAN}%s${NC}         ${CYAN}Phys Location:${NC} ${WHITE}%s${NC}  ${CYAN}Phys Device:${NC} ${WHITE}%s${NC}  ${CYAN}Logical Device:${NC} ${WHITE}%s${NC}\n" \
-                                                    "$V" "$_fc_loc" "$_fc_phys" "$_fc_logi"
-                                                
-                                                # MACsec
-                                                local _fc_ms_c="$GRAY"
-                                                [[ "$_fc_ms_state" == "ENABLED" ]] && _fc_ms_c="$GREEN"
-                                                [[ "$_fc_ms_state" == "DISABLED" ]] && _fc_ms_c="$YELLOW"
-                                                printf "  ${CYAN}%s${NC}         ${CYAN}MACsec:${NC} ${_fc_ms_c}%s${NC}" "$V" "$_fc_ms_state"
-                                                if [[ "$_fc_ms_state" == "ENABLED" ]]; then
-                                                    local _fc_ms_cipher
-                                                    _fc_ms_cipher=$(jq -r '.data["macsec-properties"]["encryption-cipher"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                    printf "  ${CYAN}Cipher:${NC} ${WHITE}%s${NC}" "$_fc_ms_cipher"
-                                                fi
-                                                printf "\n"
-                                                
-                                                # Light levels
-                                                local _fc_ll_ind _fc_ll_val
-                                                _fc_ll_ind=$(jq -r '.data["customer-reference-name"] // "N/A"' <<< "$_fc_cc_json" 2>/dev/null)
-                                                [[ "$_fc_ll_ind" != "N/A" && "$_fc_ll_ind" != "null" && -n "$_fc_ll_ind" ]] && \
-                                                    printf "  ${CYAN}%s${NC}         ${CYAN}Light Level Ref:${NC} ${WHITE}%s${NC}\n" "$V" "$_fc_ll_ind"
-                                                
-                                                # Interface state
-                                                local _fc_if_c="$GREEN"
-                                                case "$_fc_cc_state" in
-                                                    PROVISIONED) _fc_if_c="$GREEN" ;;
-                                                    PENDING_*|PROVISIONING) _fc_if_c="$YELLOW" ;;
-                                                    *) _fc_if_c="$RED" ;;
-                                                esac
-                                                printf "  ${CYAN}%s${NC}         ${CYAN}Interface State:${NC} ${_fc_if_c}%s${NC}  ${CYAN}Port:${NC} ${WHITE}%s${NC} ${GRAY}(%s)${NC}\n" \
-                                                    "$V" "$_fc_cc_state" "$_fc_port" "$_fc_speed"
-                                            fi
-                                        elif [[ "$_fc_ccid" == ocid1.crossconnectgroup.* ]]; then
-                                            # Cross-connect group — show group + member details
-                                            local _fc_ccg_json
-                                            _fc_ccg_json=$(oci network cross-connect-group get --cross-connect-group-id "$_fc_ccid" --region "$region_key" --output json 2>/dev/null)
-                                            if [[ -n "$_fc_ccg_json" ]] && jq -e '.data' <<< "$_fc_ccg_json" >/dev/null 2>&1; then
-                                                local _fc_ccg_name _fc_ccg_ms
-                                                _fc_ccg_name=$(jq -r '.data["display-name"] // "N/A"' <<< "$_fc_ccg_json" 2>/dev/null)
-                                                _fc_ccg_ms=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_fc_ccg_json" 2>/dev/null)
-                                                local _fc_ccg_ms_c="$GRAY"
-                                                [[ "$_fc_ccg_ms" == "ENABLED" ]] && _fc_ccg_ms_c="$GREEN"
-                                                [[ "$_fc_ccg_ms" == "DISABLED" ]] && _fc_ccg_ms_c="$YELLOW"
-                                                printf "  ${CYAN}%s${NC}         ${CYAN}CC Group:${NC} ${WHITE}%s${NC}  ${CYAN}MACsec:${NC} ${_fc_ccg_ms_c}%s${NC}\n" \
-                                                    "$V" "$_fc_ccg_name" "$_fc_ccg_ms"
-                                            fi
-                                            
-                                            # List member cross-connects
-                                            for _fc_sc in "${search_comps[@]}"; do
-                                                [[ -z "$_fc_sc" ]] && continue
-                                                local _fc_mem_json
-                                                _fc_mem_json=$(oci network cross-connect list --compartment-id "$_fc_sc" \
-                                                    --cross-connect-group-id "$_fc_ccid" --region "$region_key" --output json 2>/dev/null)
-                                                if [[ -n "$_fc_mem_json" ]] && jq -e '.data[0]' <<< "$_fc_mem_json" >/dev/null 2>&1; then
-                                                    while IFS='|' read -r _fm_name _fm_state _fm_loc _fm_phys _fm_logi _fm_port _fm_speed _fm_ms; do
-                                                        [[ -z "$_fm_name" ]] && continue
-                                                        local _fm_if_c="$GREEN"
-                                                        case "$_fm_state" in PROVISIONED) ;; PENDING_*|PROVISIONING) _fm_if_c="$YELLOW" ;; *) _fm_if_c="$RED" ;; esac
-                                                        local _fm_ms_c="$GRAY"
-                                                        [[ "$_fm_ms" == "ENABLED" ]] && _fm_ms_c="$GREEN"
-                                                        [[ "$_fm_ms" == "DISABLED" ]] && _fm_ms_c="$YELLOW"
-                                                        
-                                                        printf "  ${CYAN}%s${NC}           ${WHITE}%s${NC}  ${CYAN}Loc:${NC}${WHITE}%s${NC}  ${CYAN}Phys:${NC}${WHITE}%s${NC}  ${CYAN}Logi:${NC}${WHITE}%s${NC}\n" \
-                                                            "$V" "$_fm_name" "$_fm_loc" "$_fm_phys" "$_fm_logi"
-                                                        printf "  ${CYAN}%s${NC}             ${CYAN}Port:${NC}${WHITE}%s${NC} ${GRAY}(%s)${NC}  ${CYAN}State:${NC}${_fm_if_c}%s${NC}  ${CYAN}MACsec:${NC}${_fm_ms_c}%s${NC}\n" \
-                                                            "$V" "$_fm_port" "$_fm_speed" "$_fm_state" "$_fm_ms"
-                                                    done < <(jq -r '.data[] | "\(.["display-name"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["location-name"] // "N/A")|\(.["oci-physical-device-name"] // "N/A")|\(.["oci-logical-device-name"] // "N/A")|\(.["port-name"] // "N/A")|\(.["port-speed-shape-name"] // "N/A")|\(.["macsec-properties"]["state"] // "N/A")"' <<< "$_fc_mem_json" 2>/dev/null)
-                                                    break
-                                                fi
-                                            done
-                                        fi
-                                    fi
-                                    ((_fc_ci++))
-                                done
-                            fi
-                        fi
+                        _fc_display_details "$att_net_id" "$region_key" "  ${CYAN}${V}${NC}         "
                     fi
                 done < <(jq -r '.[] | "\(.["display-name"] // "N/A")|\(.["lifecycle-state"])|\(.id)|\(.["network-details"]["type"] // "VCN")|\(.["network-details"]["id"] // "null")|\(.["drg-route-table-id"] // "null")"' <<< "$att_data" 2>/dev/null)
             fi
+            fi  # attachments flag
             
-            # ── RPCs not shown as attachments (peer info) ──
+            # ── 6. Remote Peering ──
+            if [[ "${DRG_TOPO_FLAGS[peering]}" == "1" ]]; then
             local rpc_data="${XR_REGION_RPCS["${region_key}:${drg_id}"]:-[]}"
             local rpc_count
             rpc_count=$(jq 'length' <<< "$rpc_data" 2>/dev/null || echo "0")
             if [[ "$rpc_count" -gt 0 ]]; then
-                # Check if any RPCs were NOT already shown as attachments
-                local rpc_shown_as_att=0
-                local att_rpc_ids
-                att_rpc_ids=$(jq -r '.[] | select(.["network-details"]["type"] == "REMOTE_PEERING_CONNECTION") | .["network-details"]["id"]' <<< "$att_data" 2>/dev/null)
-                # Show standalone RPCs section only if there are RPCs not in attachments
-                local standalone_rpcs="[]"
+                printf "  ${CYAN}%s${NC}  ${YELLOW}🌍 Remote Peering (%s):${NC}\n" "$V" "$rpc_count"
                 while IFS='|' read -r rpc_id rpc_name peer_region peer_status; do
                     [[ -z "$rpc_id" ]] && continue
-                    local found=0
-                    if [[ -n "$att_rpc_ids" ]]; then
-                        while IFS= read -r aid; do [[ "$aid" == "$rpc_id" ]] && found=1 && break; done <<< "$att_rpc_ids"
-                    fi
-                    if [[ $found -eq 0 ]]; then
-                        standalone_rpcs=$(jq --arg n "$rpc_name" --arg r "$peer_region" --arg s "$peer_status" '. + [{"name":$n,"region":$r,"status":$s}]' <<< "$standalone_rpcs")
-                    fi
+                    local ps_c="$GREEN"; [[ "$peer_status" != "PEERED" ]] && ps_c="$YELLOW"
+                    printf "  ${CYAN}%s${NC}    ${ps_c}⟷${NC} ${WHITE}%-22s${NC} ${ps_c}──►${NC} ${YELLOW}%s${NC} [${ps_c}%s${NC}]\n" \
+                        "$V" "${rpc_name:0:22}" "${peer_region:-N/A}" "$peer_status"
                 done < <(jq -r '.[] | "\(.id)|\(.["display-name"])|\(.["peer-region-name"] // "")|\(.["peering-status"])"' <<< "$rpc_data" 2>/dev/null)
-                local standalone_count
-                standalone_count=$(jq 'length' <<< "$standalone_rpcs" 2>/dev/null || echo "0")
-                if [[ "$standalone_count" -gt 0 ]]; then
-                    printf "  ${CYAN}%s${NC}  ${YELLOW}🌍 Remote Peering (%s):${NC}\n" "$V" "$standalone_count"
-                    while IFS='|' read -r rpc_name peer_region peer_status; do
-                        local ps_c="$GREEN"; [[ "$peer_status" != "PEERED" ]] && ps_c="$YELLOW"
-                        printf "  ${CYAN}%s${NC}    ${ps_c}⟷${NC} ${WHITE}%-22s${NC} ${ps_c}──►${NC} ${YELLOW}%s${NC} [${ps_c}%s${NC}]\n" \
-                            "$V" "${rpc_name:0:22}" "${peer_region:-N/A}" "$peer_status"
-                    done < <(jq -r '.[] | "\(.name)|\(.region)|\(.status)"' <<< "$standalone_rpcs" 2>/dev/null)
-                fi
             fi
+            fi  # peering flag
             
-            # ── FC not shown as attachments ──
+            # ── 6b. FastConnect Virtual Circuits ──
+            if [[ "${DRG_TOPO_FLAGS[fastconnect]}" == "1" ]]; then
             local fc_data="${XR_REGION_FC["${region_key}:${drg_id}"]:-[]}"
             local fc_count
             fc_count=$(jq 'length' <<< "$fc_data" 2>/dev/null || echo "0")
             if [[ "$fc_count" -gt 0 ]]; then
-                local att_fc_ids
-                att_fc_ids=$(jq -r '.[] | select(.["network-details"]["type"] == "VIRTUAL_CIRCUIT") | .["network-details"]["id"]' <<< "$att_data" 2>/dev/null)
-                local standalone_fc=0
-                while IFS='|' read -r fc_id fc_name fc_state fc_bw fc_provider fc_bgp; do
-                    [[ -z "$fc_id" ]] && continue
-                    local found=0
-                    if [[ -n "$att_fc_ids" ]]; then
-                        while IFS= read -r aid; do [[ "$aid" == "$fc_id" ]] && found=1 && break; done <<< "$att_fc_ids"
-                    fi
-                    if [[ $found -eq 0 ]]; then
-                        [[ $standalone_fc -eq 0 ]] && printf "  ${CYAN}%s${NC}  ${MAGENTA}⚡ FastConnect (standalone):${NC}\n" "$V"
-                        standalone_fc=1
-                        local bgp_c="$GREEN"; [[ "$fc_bgp" == "DOWN" ]] && bgp_c="$RED"; [[ "$fc_bgp" == "N/A" ]] && bgp_c="$GRAY"
-                        printf "  ${CYAN}%s${NC}    ⚡ ${WHITE}%-22s${NC} ${GRAY}%s %s${NC} BGP:${bgp_c}%s${NC}\n" \
-                            "$V" "${fc_name:0:22}" "$fc_bw" "${fc_provider:0:15}" "${fc_bgp:-N/A}"
-                        
-                        # Extended FC details for standalone circuits
-                        local _sfc_detail
-                        _sfc_detail=$(oci network virtual-circuit get --virtual-circuit-id "$fc_id" --region "$region_key" --output json 2>/dev/null)
-                        if [[ -n "$_sfc_detail" ]] && jq -e '.data' <<< "$_sfc_detail" >/dev/null 2>&1; then
-                            local _sfc_transport _sfc_mtu
-                            _sfc_transport=$(jq -r '.data["is-transport-mode"] // "null"' <<< "$_sfc_detail" 2>/dev/null)
-                            _sfc_mtu=$(jq -r '.data["ip-mtu"] // "N/A"' <<< "$_sfc_detail" 2>/dev/null)
-                            local _sfc_enc_d="${GRAY}N/A${NC}"
-                            [[ "$_sfc_transport" == "true" ]] && _sfc_enc_d="${GREEN}IPSec Transport Mode${NC}"
-                            [[ "$_sfc_transport" == "false" ]] && _sfc_enc_d="${GRAY}Not encrypted${NC}"
-                            printf "  ${CYAN}%s${NC}      ${CYAN}Encryption:${NC} %b" "$V" "$_sfc_enc_d"
-                            [[ "$_sfc_mtu" != "N/A" && "$_sfc_mtu" != "null" ]] && printf "  ${CYAN}MTU:${NC} ${WHITE}%s${NC}" "$_sfc_mtu"
-                            printf "\n"
-                            
-                            local _sfc_cc_maps
-                            _sfc_cc_maps=$(jq -r '.data["cross-connect-mappings"] // []' <<< "$_sfc_detail" 2>/dev/null)
-                            local _sfc_cc_ct
-                            _sfc_cc_ct=$(jq 'length' <<< "$_sfc_cc_maps" 2>/dev/null || echo "0")
-                            local _sfc_ci=0
-                            while [[ $_sfc_ci -lt $_sfc_cc_ct ]]; do
-                                local _sfc_ccid
-                                _sfc_ccid=$(jq -r ".[$_sfc_ci][\"cross-connect-or-cross-connect-group-id\"] // \"null\"" <<< "$_sfc_cc_maps" 2>/dev/null)
-                                if [[ -n "$_sfc_ccid" && "$_sfc_ccid" != "null" && "$_sfc_ccid" == ocid1.crossconnect.* ]]; then
-                                    local _sfc_cc_json
-                                    _sfc_cc_json=$(oci network cross-connect get --cross-connect-id "$_sfc_ccid" --region "$region_key" --output json 2>/dev/null)
-                                    if [[ -n "$_sfc_cc_json" ]] && jq -e '.data' <<< "$_sfc_cc_json" >/dev/null 2>&1; then
-                                        local _sfc_loc _sfc_phys _sfc_logi _sfc_port _sfc_speed _sfc_ms _sfc_st
-                                        _sfc_loc=$(jq -r '.data["location-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_phys=$(jq -r '.data["oci-physical-device-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_logi=$(jq -r '.data["oci-logical-device-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_port=$(jq -r '.data["port-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_speed=$(jq -r '.data["port-speed-shape-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_ms=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        _sfc_st=$(jq -r '.data["lifecycle-state"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        
-                                        local _sfc_ms_c="$GRAY"; [[ "$_sfc_ms" == "ENABLED" ]] && _sfc_ms_c="$GREEN"; [[ "$_sfc_ms" == "DISABLED" ]] && _sfc_ms_c="$YELLOW"
-                                        local _sfc_if_c="$GREEN"
-                                        case "$_sfc_st" in PROVISIONED) ;; PENDING_*|PROVISIONING) _sfc_if_c="$YELLOW" ;; *) _sfc_if_c="$RED" ;; esac
-                                        
-                                        printf "  ${CYAN}%s${NC}      ${CYAN}Loc:${NC}${WHITE}%s${NC}  ${CYAN}Phys:${NC}${WHITE}%s${NC}  ${CYAN}Logi:${NC}${WHITE}%s${NC}  ${CYAN}Port:${NC}${WHITE}%s${NC}${GRAY}(%s)${NC}\n" \
-                                            "$V" "$_sfc_loc" "$_sfc_phys" "$_sfc_logi" "$_sfc_port" "$_sfc_speed"
-                                        printf "  ${CYAN}%s${NC}      ${CYAN}MACsec:${NC}${_sfc_ms_c}%s${NC}  ${CYAN}State:${NC}${_sfc_if_c}%s${NC}\n" \
-                                            "$V" "$_sfc_ms" "$_sfc_st"
-                                        
-                                        local _sfc_ll
-                                        _sfc_ll=$(jq -r '.data["customer-reference-name"] // "N/A"' <<< "$_sfc_cc_json" 2>/dev/null)
-                                        [[ "$_sfc_ll" != "N/A" && "$_sfc_ll" != "null" && -n "$_sfc_ll" ]] && \
-                                            printf "  ${CYAN}%s${NC}      ${CYAN}Light Level Ref:${NC}${WHITE}%s${NC}\n" "$V" "$_sfc_ll"
-                                    fi
-                                elif [[ -n "$_sfc_ccid" && "$_sfc_ccid" != "null" && "$_sfc_ccid" == ocid1.crossconnectgroup.* ]]; then
-                                    local _sfc_ccg_json
-                                    _sfc_ccg_json=$(oci network cross-connect-group get --cross-connect-group-id "$_sfc_ccid" --region "$region_key" --output json 2>/dev/null)
-                                    if [[ -n "$_sfc_ccg_json" ]] && jq -e '.data' <<< "$_sfc_ccg_json" >/dev/null 2>&1; then
-                                        local _sfc_ccg_name _sfc_ccg_ms
-                                        _sfc_ccg_name=$(jq -r '.data["display-name"] // "N/A"' <<< "$_sfc_ccg_json" 2>/dev/null)
-                                        _sfc_ccg_ms=$(jq -r '.data["macsec-properties"]["state"] // "N/A"' <<< "$_sfc_ccg_json" 2>/dev/null)
-                                        local _sfc_ccg_ms_c="$GRAY"; [[ "$_sfc_ccg_ms" == "ENABLED" ]] && _sfc_ccg_ms_c="$GREEN"
-                                        printf "  ${CYAN}%s${NC}      ${CYAN}CC Group:${NC}${WHITE}%s${NC}  ${CYAN}MACsec:${NC}${_sfc_ccg_ms_c}%s${NC}\n" "$V" "$_sfc_ccg_name" "$_sfc_ccg_ms"
-                                    fi
-                                fi
-                                ((_sfc_ci++))
-                            done
-                        fi
-                    fi
-                done < <(jq -r '.[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["bandwidth-shape-name"] // "N/A")|\(.["provider-name"] // "")|\(.["bgp-session-state"] // "N/A")"' <<< "$fc_data" 2>/dev/null)
+                printf "  ${CYAN}%s${NC}  ${MAGENTA}⚡ FastConnect Virtual Circuits (%s):${NC}\n" "$V" "$fc_count"
+                while IFS='|' read -r _fc_id _fc_name _fc_state _fc_bw _fc_bgp _fc_provider _fc_type _fc_vc_state; do
+                    [[ -z "$_fc_id" ]] && continue
+                    local _fc_state_c="$GREEN"
+                    case "$_fc_state" in
+                        PROVISIONED) _fc_state_c="$GREEN" ;;
+                        PROVISIONING|VERIFYING) _fc_state_c="$YELLOW" ;;
+                        INACTIVE|FAILED|TERMINATED) _fc_state_c="$RED" ;;
+                        *) _fc_state_c="$GRAY" ;;
+                    esac
+                    local _fc_bgp_c="$GREEN"
+                    case "$_fc_bgp" in
+                        UP) _fc_bgp_c="$GREEN" ;;
+                        DOWN) _fc_bgp_c="$RED" ;;
+                        *) _fc_bgp_c="$YELLOW" ;;
+                    esac
+                    printf "  ${CYAN}%s${NC}    ${_fc_state_c}●${NC} ${WHITE}%-30s${NC} ${_fc_state_c}%-14s${NC} ${CYAN}%-12s${NC} BGP:${_fc_bgp_c}%-5s${NC} ${GRAY}%-20s${NC} ${GRAY}%s${NC}\n" \
+                        "$V" "${_fc_name:0:30}" "$_fc_state" "${_fc_bw:-N/A}" "${_fc_bgp:-N/A}" "${_fc_provider:-}" "${_fc_type:-}"
+                    
+                    # Full FC detail drill-down
+                    _fc_display_details "$_fc_id" "$region_key" "  ${CYAN}${V}${NC}      "
+                done < <(jq -r '.[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["bandwidth-shape-name"] // "")|\(.["bgp-session-state"] // "")|\(.["provider-name"] // "")|\(.["type"] // "")|\(.["service-type"] // "")"' <<< "$fc_data" 2>/dev/null)
             fi
+            fi  # fastconnect flag
             
-            # ── VPN not shown as attachments ──
+            # ── 6c. IPSec VPN Connections ──
+            if [[ "${DRG_TOPO_FLAGS[ipsec]}" == "1" ]]; then
             local vpn_data="${XR_REGION_VPN["${region_key}:${drg_id}"]:-[]}"
             local vpn_count
             vpn_count=$(jq 'length' <<< "$vpn_data" 2>/dev/null || echo "0")
             if [[ "$vpn_count" -gt 0 ]]; then
-                local att_vpn_ids
-                att_vpn_ids=$(jq -r '.[] | select(.["network-details"]["type"] == "IPSEC_TUNNEL") | .["network-details"]["id"]' <<< "$att_data" 2>/dev/null)
-                local standalone_vpn=0
-                while IFS='|' read -r vpn_id vpn_name vpn_state cpe_id; do
-                    [[ -z "$vpn_id" ]] && continue
-                    local found=0
-                    if [[ -n "$att_vpn_ids" ]]; then
-                        while IFS= read -r aid; do [[ "$aid" == "$vpn_id" ]] && found=1 && break; done <<< "$att_vpn_ids"
+                printf "  ${CYAN}%s${NC}  ${GREEN}🔒 IPSec VPN Connections (%s):${NC}\n" "$V" "$vpn_count"
+                while IFS='|' read -r _vpn_id _vpn_name _vpn_state _vpn_cpe_id _vpn_routing _vpn_static_routes; do
+                    [[ -z "$_vpn_id" ]] && continue
+                    local _vpn_state_c="$GREEN"
+                    case "$_vpn_state" in
+                        AVAILABLE) _vpn_state_c="$GREEN" ;;
+                        PROVISIONING) _vpn_state_c="$YELLOW" ;;
+                        TERMINATING|TERMINATED) _vpn_state_c="$RED" ;;
+                        *) _vpn_state_c="$GRAY" ;;
+                    esac
+                    
+                    # Resolve CPE name
+                    local _vpn_cpe_name=""
+                    if [[ -n "$_vpn_cpe_id" && "$_vpn_cpe_id" != "null" ]]; then
+                        _vpn_cpe_name=$(oci network cpe get --cpe-id "$_vpn_cpe_id" --region "$region_key" \
+                            --query 'data."display-name"' --raw-output 2>/dev/null || echo "")
                     fi
-                    if [[ $found -eq 0 ]]; then
-                        [[ $standalone_vpn -eq 0 ]] && printf "  ${CYAN}%s${NC}  ${RED}🔒 IPSec VPN (standalone):${NC}\n" "$V"
-                        standalone_vpn=1
-                        printf "  ${CYAN}%s${NC}    🔐 ${WHITE}%-22s${NC}\n" "$V" "${vpn_name:0:22}"
+                    
+                    local _vpn_cpe_display="${_vpn_cpe_name:-$_vpn_cpe_id}"
+                    [[ -z "$_vpn_cpe_display" || "$_vpn_cpe_display" == "null" ]] && _vpn_cpe_display="-"
+                    
+                    local _vpn_routing_d="${_vpn_routing:-STATIC}"
+                    local _vpn_static_d=""
+                    [[ -n "$_vpn_static_routes" && "$_vpn_static_routes" != "null" && "$_vpn_static_routes" != "[]" ]] && \
+                        _vpn_static_d=$(echo "$_vpn_static_routes" | jq -r 'join(", ")' 2>/dev/null)
+                    
+                    printf "  ${CYAN}%s${NC}    ${_vpn_state_c}●${NC} ${WHITE}%-30s${NC} ${_vpn_state_c}%-14s${NC} CPE: ${CYAN}%-30s${NC} Routing: ${YELLOW}%s${NC}" \
+                        "$V" "${_vpn_name:0:30}" "$_vpn_state" "${_vpn_cpe_display:0:30}" "$_vpn_routing_d"
+                    [[ -n "$_vpn_static_d" ]] && printf " ${GRAY}[%s]${NC}" "$_vpn_static_d"
+                    printf "\n"
+                    
+                    # Fetch tunnel details
+                    local _vpn_tunnels
+                    _vpn_tunnels=$(oci network ip-sec-tunnel list --ipsc-id "$_vpn_id" --region "$region_key" --all --output json 2>/dev/null)
+                    if [[ -n "$_vpn_tunnels" ]] && jq -e '.data[0]' <<< "$_vpn_tunnels" >/dev/null 2>&1; then
+                        while IFS='|' read -r _tun_name _tun_status _tun_routing _tun_ip _tun_bgp; do
+                            [[ -z "$_tun_name" ]] && continue
+                            local _tun_sc="$GREEN"
+                            case "$_tun_status" in
+                                UP) _tun_sc="$GREEN" ;;
+                                DOWN|DOWN_FOR_MAINTENANCE) _tun_sc="$RED" ;;
+                                *) _tun_sc="$YELLOW" ;;
+                            esac
+                            local _tun_bgp_d=""
+                            [[ -n "$_tun_bgp" && "$_tun_bgp" != "null" && "$_tun_bgp" != "N/A" ]] && _tun_bgp_d=" BGP:${_tun_bgp}"
+                            printf "  ${CYAN}%s${NC}      ${_tun_sc}└─${NC} ${GRAY}%-22s${NC} ${_tun_sc}%-6s${NC} IP:${WHITE}%-16s${NC} ${GRAY}%s%s${NC}\n" \
+                                "$V" "${_tun_name:0:22}" "$_tun_status" "${_tun_ip:-N/A}" "${_tun_routing:-}" "$_tun_bgp_d"
+                        done < <(jq -r '.data[] | "\(.["display-name"] // "N/A")|\(.status // "N/A")|\(.routing // "")|\(.["vpn-ip"] // "")|\(.["bgp-session-state"] // "")"' <<< "$_vpn_tunnels" 2>/dev/null)
                     fi
-                done < <(jq -r '.[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.["cpe-id"] // "")"' <<< "$vpn_data" 2>/dev/null)
+                done < <(jq -r '.[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["cpe-id"] // "")|\(.routing // "")|\(.["static-routes"] // "[]")"' <<< "$vpn_data" 2>/dev/null)
             fi
+            fi  # ipsec flag
             
-            # ── Route Rules (per DRG, grouped by route table) ──
+            # ── 7+8. Route Rules + NSGs/SLs ──
+            if [[ "${DRG_TOPO_FLAGS[routes]}" == "1" ]]; then
+            # ── 7. Route Rules (per DRG, grouped by route table) ──
             local has_rules=0
             for key in "${!XR_REGION_ROUTE_RULES[@]}"; do
                 [[ "$key" != "${region_key}:${drg_id}:"* ]] && continue
@@ -17200,6 +18085,9 @@ display_cross_region_drg_map() {
             
             if [[ $has_rules -eq 1 ]]; then
                 printf "  ${CYAN}%s${NC}  ${BOLD}${WHITE}📋 Route Rules:${NC}\n" "$V"
+                # Track all VCN next-hops across all route tables for this DRG
+                declare -A _rr_vcn_seen=()
+                
                 for key in $(echo "${!XR_REGION_ROUTE_RULES[@]}" | tr ' ' '\n' | grep "^${region_key}:${drg_id}:" | sort); do
                     local rt_id="${key##*:}"
                     local rt_name="${XR_REGION_DRT_NAMES[$key]:-$rt_id}"
@@ -17224,10 +18112,19 @@ display_cross_region_drg_map() {
                             if [[ -z "$hop_name" || "$hop_name" == "N/A" ]]; then
                                 # API fallback: resolve attachment display-name
                                 local _xr_hop_json
+                                _drg_dbg_cmd "Route hop resolve" "oci network drg-attachment get --drg-attachment-id ${r_hop_id} --region $region_key"
                                 _xr_hop_json=$(oci network drg-attachment get --drg-attachment-id "$r_hop_id" --region "$region_key" --output json 2>/dev/null)
                                 if [[ -n "$_xr_hop_json" ]] && jq -e '.data' <<< "$_xr_hop_json" >/dev/null 2>&1; then
                                     hop_name=$(jq -r '.data["display-name"] // ""' <<< "$_xr_hop_json" 2>/dev/null)
                                     [[ -n "$hop_name" ]] && XR_ATT_NAMES[$r_hop_id]="$hop_name"
+                                    # Also capture VCN ID if this is a VCN attachment
+                                    local _hop_att_type
+                                    _hop_att_type=$(jq -r '.data["network-details"]["type"] // ""' <<< "$_xr_hop_json" 2>/dev/null)
+                                    if [[ "$_hop_att_type" == "VCN" ]]; then
+                                        local _hop_vcn
+                                        _hop_vcn=$(jq -r '.data["network-details"]["id"] // .data["vcn-id"] // ""' <<< "$_xr_hop_json" 2>/dev/null)
+                                        [[ -n "$_hop_vcn" && "$_hop_vcn" != "null" ]] && XR_ATT_VCN_IDS[$r_hop_id]="$_hop_vcn"
+                                    fi
                                 fi
                             fi
                             if [[ -n "$hop_name" && "$hop_name" != "N/A" ]]; then
@@ -17235,15 +18132,519 @@ display_cross_region_drg_map() {
                             else
                                 hop_display="${YELLOW}(${r_hop_id})${NC}"
                             fi
+                            # Track VCN next-hops
+                            if [[ -n "${XR_ATT_VCN_IDS[$r_hop_id]+x}" ]]; then
+                                _rr_vcn_seen["${XR_ATT_VCN_IDS[$r_hop_id]}"]=1
+                            fi
                         fi
                         
                         printf "  ${CYAN}%s${NC}      ${WHITE}%-20s${NC} ${type_color}%-9s${NC} %-16s %b\n" \
                             "$V" "${r_dest:0:20}" "${r_type:0:9}" "${r_origin:0:16}" "$hop_display"
                     done < <(jq -r '.[] | "\(.destination // "N/A")|\(.["route-type"] // "N/A")|\(.["route-provenance"] // "N/A")|\(.["next-hop-drg-attachment-id"] // "N/A")"' <<< "$rules" 2>/dev/null)
                 done
+                
+                # ── 8. NSGs & Security Lists applicable to VCN next-hops referenced by route rules ──
+                if [[ ${#_rr_vcn_seen[@]} -gt 0 ]]; then
+                    printf "  ${CYAN}%s${NC}\n" "$V"
+                    printf "  ${CYAN}%s${NC}  ${BOLD}${WHITE}🔐 NSGs & Security Lists in Route-Rule VCN Targets:${NC}\n" "$V"
+                    
+                    # Pre-fetch: parallel batch for any NSGs still with ? counts OR 0 counts with empty/missing rules
+                    {
+                        local _prefetch_ids=""
+                        for _pf_vcn in "${!_rr_vcn_seen[@]}"; do
+                            local _pf_nsgs="${XR_VCN_NSGS[$_pf_vcn]:-}"
+                            while IFS= read -r _pf_nid; do
+                                [[ -z "$_pf_nid" ]] && continue
+                                [[ -z "${XR_NSG_INFO[$_pf_nid]+x}" ]] && continue
+                                local _pf_in _pf_rules_len
+                                _pf_in=$(echo "${XR_NSG_INFO[$_pf_nid]}" | cut -d'|' -f2)
+                                # Retry if: counts are ? (never fetched) OR counts are 0 with empty/no rules
+                                if [[ "$_pf_in" == "?" ]]; then
+                                    _prefetch_ids="${_prefetch_ids}${_pf_nid}"$'\n'
+                                elif [[ "$_pf_in" == "0" ]]; then
+                                    # Check if rules are truly empty — retry to catch transient failures
+                                    _pf_rules_len=0
+                                    if [[ -n "${XR_NSG_RULES[$_pf_nid]+x}" ]]; then
+                                        _pf_rules_len=$(jq 'length' <<< "${XR_NSG_RULES[$_pf_nid]}" 2>/dev/null || echo "0")
+                                    fi
+                                    if [[ "$_pf_rules_len" == "0" ]]; then
+                                        unset 'XR_NSG_RULES['"$_pf_nid"']' 2>/dev/null
+                                        _prefetch_ids="${_prefetch_ids}${_pf_nid}"$'\n'
+                                    fi
+                                fi
+                            done <<< "$_pf_nsgs"
+                        done
+                        _prefetch_ids=$(echo "$_prefetch_ids" | sort -u | grep .)
+                        if [[ -n "$_prefetch_ids" ]]; then
+                            local _pf_ct
+                            _pf_ct=$(echo "$_prefetch_ids" | wc -l)
+                            _drg_dbg_section "Pre-fetch: ${_pf_ct} NSGs with ?/0 counts — parallel rules batch (OCID-parsed region)"
+                            local _pf_dir
+                            _pf_dir=$(mktemp -d "${TEMP_DIR}/pf_nsg.XXXXXX")
+                            while IFS= read -r _pf_nid; do
+                                [[ -z "$_pf_nid" ]] && continue
+                                # Use region from the NSG's own OCID — not the display loop variable
+                                local _pf_nsg_region
+                                _pf_nsg_region=$(_ocid_region "$_pf_nid" "$region_key")
+                                _drg_dbg_cmd "Pre-fetch NSG rules" "oci network nsg rules list --nsg-id ${_pf_nid} --region $_pf_nsg_region --all"
+                                oci network nsg rules list --nsg-id "$_pf_nid" --region "$_pf_nsg_region" --all --output json > "$_pf_dir/${_pf_nid: -8}.json" 2>/dev/null &
+                            done <<< "$_prefetch_ids"
+                            wait
+                            while IFS= read -r _pf_nid; do
+                                [[ -z "$_pf_nid" ]] && continue
+                                local _pf_rf="$_pf_dir/${_pf_nid: -8}.json"
+                                if [[ -f "$_pf_rf" && -s "$_pf_rf" ]]; then
+                                    local _pf_rj
+                                    _pf_rj=$(cat "$_pf_rf" 2>/dev/null)
+                                    if [[ -n "$_pf_rj" ]] && jq -e '.data' <<< "$_pf_rj" >/dev/null 2>&1; then
+                                        local _pf_in_ct _pf_eg_ct
+                                        _pf_in_ct=$(jq '[(.data // [])[] | select(.direction=="INGRESS")] | length' <<< "$_pf_rj" 2>/dev/null || echo "0")
+                                        _pf_eg_ct=$(jq '[(.data // [])[] | select(.direction=="EGRESS")] | length' <<< "$_pf_rj" 2>/dev/null || echo "0")
+                                        local _pf_name _pf_comp
+                                        _pf_name=$(echo "${XR_NSG_INFO[$_pf_nid]}" | cut -d'|' -f1)
+                                        _pf_comp=$(echo "${XR_NSG_INFO[$_pf_nid]}" | cut -d'|' -f4)
+                                        XR_NSG_INFO[$_pf_nid]="${_pf_name}|${_pf_in_ct}|${_pf_eg_ct}|${_pf_comp}"
+                                        XR_NSG_RULES[$_pf_nid]=$(jq -c '.data // []' <<< "$_pf_rj" 2>/dev/null)
+                                        _drg_dbg_result "Pre-fetch NSG rules" "OK" "${_pf_name}: ${_pf_in_ct}↓ ${_pf_eg_ct}↑ (region=$(_ocid_region "$_pf_nid" "$region_key"))"
+                                    else
+                                        _drg_dbg_result "Pre-fetch NSG rules" "FAIL" "${_pf_nid} — no .data in response"
+                                    fi
+                                else
+                                    _drg_dbg_result "Pre-fetch NSG rules" "FAIL" "${_pf_nid} — file missing/empty"
+                                fi
+                            done <<< "$_prefetch_ids"
+                            rm -rf "$_pf_dir" 2>/dev/null
+                        fi
+                    }
+                    
+                    for _rr_vcn_id in "${!_rr_vcn_seen[@]}"; do
+                        local _rr_vcn_name="${XR_VCN_NAMES[$_rr_vcn_id]:-Unknown}"
+                        local _rr_vcn_cidr="${XR_VCN_CIDRS[$_rr_vcn_id]:-}"
+                        local _rr_nsg_ids="${XR_VCN_NSGS[$_rr_vcn_id]:-}"
+                        
+                        # On-the-fly resolution for VCNs missed during BFS
+                        if [[ "$_rr_vcn_name" == "Unknown" || ( -z "$_rr_nsg_ids" && -z "${XR_VCN_NSGS[$_rr_vcn_id]+x}" ) ]]; then
+                            _drg_dbg_section "ON-THE-FLY: VCN ${_rr_vcn_id} (name=$_rr_vcn_name, nsgs=$([[ -z "$_rr_nsg_ids" ]] && echo MISSING || echo present))"
+                            # Fetch VCN details to get name, CIDR, and compartment
+                            local _otf_vcn_json
+                            _drg_dbg_cmd "OTF VCN get" "oci network vcn get --vcn-id ${_rr_vcn_id} --region $region_key"
+                            _otf_vcn_json=$(oci network vcn get --vcn-id "$_rr_vcn_id" --region "$region_key" --output json 2>/dev/null)
+                            if [[ -n "$_otf_vcn_json" ]] && jq -e '.data' <<< "$_otf_vcn_json" >/dev/null 2>&1; then
+                                _rr_vcn_name=$(jq -r '.data["display-name"] // "Unknown"' <<< "$_otf_vcn_json")
+                                _rr_vcn_cidr=$(jq -r '.data["cidr-block"] // .data["cidr-blocks"][0] // ""' <<< "$_otf_vcn_json")
+                                local _otf_comp
+                                _otf_comp=$(jq -r '.data["compartment-id"] // ""' <<< "$_otf_vcn_json")
+                                XR_VCN_NAMES[$_rr_vcn_id]="$_rr_vcn_name"
+                                XR_VCN_CIDRS[$_rr_vcn_id]="$_rr_vcn_cidr"
+                                _drg_dbg_result "OTF VCN get" "OK" "$_rr_vcn_name [$_rr_vcn_cidr] comp=${_otf_comp}"
+                                
+                                # Fetch NSGs from attachment comp + VCN's own + DRG's + known compartments
+                                if [[ -z "$_rr_nsg_ids" ]]; then
+                                    local -a _otf_comps=()
+                                    local -A _otf_cseen=()
+                                    # Attachment compartment (from drg-attachment — most reliable)
+                                    local _otf_att_comp
+                                    _otf_att_comp=$(echo "${XR_REGION_VCN_ATTACH["${region_key}:${drg_id}"]:-[]}" | jq -r \
+                                        --arg vid "$_rr_vcn_id" '.[] | select((.["network-details"]["id"] // .["vcn-id"]) == $vid) | .["compartment-id"] // empty' 2>/dev/null | head -1)
+                                    if [[ -n "$_otf_att_comp" && -z "${_otf_cseen[$_otf_att_comp]+x}" ]]; then
+                                        _otf_comps+=("$_otf_att_comp"); _otf_cseen[$_otf_att_comp]=1
+                                    fi
+                                    # VCN's own compartment
+                                    if [[ -n "$_otf_comp" && -z "${_otf_cseen[$_otf_comp]+x}" ]]; then
+                                        _otf_comps+=("$_otf_comp"); _otf_cseen[$_otf_comp]=1
+                                    fi
+                                    # DRG's compartment
+                                    local _otf_drg_comp="${XR_DRG_COMPS[$drg_id]:-}"
+                                    if [[ -n "$_otf_drg_comp" && -z "${_otf_cseen[$_otf_drg_comp]+x}" ]]; then
+                                        _otf_comps+=("$_otf_drg_comp"); _otf_cseen[$_otf_drg_comp]=1
+                                    fi
+                                    # Network and default compartments
+                                    if [[ -n "$NETWORK_COMPARTMENT_ID" && -z "${_otf_cseen[$NETWORK_COMPARTMENT_ID]+x}" ]]; then
+                                        _otf_comps+=("$NETWORK_COMPARTMENT_ID"); _otf_cseen[$NETWORK_COMPARTMENT_ID]=1
+                                    fi
+                                    if [[ -n "$COMPARTMENT_ID" && -z "${_otf_cseen[$COMPARTMENT_ID]+x}" ]]; then
+                                        _otf_comps+=("$COMPARTMENT_ID"); _otf_cseen[$COMPARTMENT_ID]=1
+                                    fi
+                                    
+                                    local _otf_par_dir
+                                    _otf_par_dir=$(mktemp -d "${TEMP_DIR}/otf_nsg.XXXXXX")
+                                    _drg_dbg "OTF NSG sweep: ${#_otf_comps[@]} compartments for VCN ${_rr_vcn_id}"
+                                    _drg_dbg_comps "OTF comp priority" "${_otf_comps[@]}"
+                                    for _oc in "${_otf_comps[@]}"; do
+                                        _drg_dbg_cmd "OTF NSG list" "oci network nsg list --compartment-id ${_oc} --vcn-id ${_rr_vcn_id} --region $region_key"
+                                        oci network nsg list --compartment-id "$_oc" --vcn-id "$_rr_vcn_id" --region "$region_key" --all --output json > "$_otf_par_dir/nsg_${_oc: -8}.json" 2>/dev/null &
+                                    done
+                                    wait
+                                    
+                                    _rr_nsg_ids=""
+                                    # Process in priority order: VCN comp first, then default, then network
+                                    # If found in one compartment, they're all there — skip the rest
+                                    for _oc in "${_otf_comps[@]}"; do
+                                        local _otf_nsg_f="$_otf_par_dir/nsg_${_oc: -8}.json"
+                                        if [[ -f "$_otf_nsg_f" ]]; then
+                                            local _otf_nsg_j
+                                            _otf_nsg_j=$(cat "$_otf_nsg_f" 2>/dev/null)
+                                            if [[ -n "$_otf_nsg_j" ]] && jq -e '.data[0]' <<< "$_otf_nsg_j" >/dev/null 2>&1; then
+                                                while IFS='|' read -r _onid _onname _onstate; do
+                                                    [[ -z "$_onid" ]] && continue
+                                                    if [[ -z "${XR_NSG_INFO[$_onid]+x}" ]]; then
+                                                        XR_NSG_INFO[$_onid]="${_onname}|?|?|${_oc}"
+                                                    fi
+                                                    _rr_nsg_ids="${_rr_nsg_ids}${_onid}"$'\n'
+                                                done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["lifecycle-state"])"' <<< "$_otf_nsg_j" 2>/dev/null)
+                                                # Found in this compartment — all NSGs are here, skip rest
+                                                break
+                                            fi
+                                        fi
+                                    done
+                                    XR_VCN_NSGS[$_rr_vcn_id]="$_rr_nsg_ids"
+                                    
+                                    # Fetch NSG rules for newly discovered NSGs
+                                    if [[ -n "$_rr_nsg_ids" ]]; then
+                                        while IFS= read -r _onid; do
+                                            [[ -z "$_onid" || -n "${XR_NSG_RULES[$_onid]+x}" ]] && continue
+                                            local _onid_region; _onid_region=$(_ocid_region "$_onid" "$region_key")
+                                            oci network nsg rules list --nsg-id "$_onid" --region "$_onid_region" --all --output json > "$_otf_par_dir/rules_${_onid: -8}.json" 2>/dev/null &
+                                        done <<< "$_rr_nsg_ids"
+                                        wait
+                                        
+                                        while IFS= read -r _onid; do
+                                            [[ -z "$_onid" || -n "${XR_NSG_RULES[$_onid]+x}" ]] && continue
+                                            local _otf_rf="$_otf_par_dir/rules_${_onid: -8}.json"
+                                            if [[ -f "$_otf_rf" && -s "$_otf_rf" ]]; then
+                                                local _otf_rj
+                                                _otf_rj=$(cat "$_otf_rf" 2>/dev/null)
+                                                if [[ -n "$_otf_rj" ]] && jq -e '.data' <<< "$_otf_rj" >/dev/null 2>&1; then
+                                                    local _otf_in _otf_eg
+                                                    _otf_in=$(jq '[(.data // [])[] | select(.direction=="INGRESS")] | length' <<< "$_otf_rj" 2>/dev/null || echo "0")
+                                                    _otf_eg=$(jq '[(.data // [])[] | select(.direction=="EGRESS")] | length' <<< "$_otf_rj" 2>/dev/null || echo "0")
+                                                    local _otf_nname _otf_ncomp
+                                                    _otf_nname=$(echo "${XR_NSG_INFO[$_onid]}" | cut -d'|' -f1)
+                                                    _otf_ncomp=$(echo "${XR_NSG_INFO[$_onid]}" | cut -d'|' -f4)
+                                                    XR_NSG_INFO[$_onid]="${_otf_nname}|${_otf_in}|${_otf_eg}|${_otf_ncomp}"
+                                                    XR_NSG_RULES[$_onid]=$(jq -c '.data // []' <<< "$_otf_rj" 2>/dev/null)
+                                                fi
+                                            fi
+                                        done <<< "$_rr_nsg_ids"
+                                    fi
+                                    rm -rf "$_otf_par_dir" 2>/dev/null
+                                fi
+                            else
+                                # VCN get failed — try attachment comp then DRG comp for NSGs
+                                if [[ -z "$_rr_nsg_ids" ]]; then
+                                    local -a _fb_comps=()
+                                    local -A _fb_cseen=()
+                                    local _fb_att_comp
+                                    _fb_att_comp=$(echo "${XR_REGION_VCN_ATTACH["${region_key}:${drg_id}"]:-[]}" | jq -r \
+                                        --arg vid "$_rr_vcn_id" '.[] | select((.["network-details"]["id"] // .["vcn-id"]) == $vid) | .["compartment-id"] // empty' 2>/dev/null | head -1)
+                                    if [[ -n "$_fb_att_comp" ]]; then _fb_comps+=("$_fb_att_comp"); _fb_cseen[$_fb_att_comp]=1; fi
+                                    local _fb_drg_comp="${XR_DRG_COMPS[$drg_id]:-}"
+                                    if [[ -n "$_fb_drg_comp" && -z "${_fb_cseen[$_fb_drg_comp]+x}" ]]; then _fb_comps+=("$_fb_drg_comp"); fi
+                                    
+                                    local _otf_par_dir2
+                                    _otf_par_dir2=$(mktemp -d "${TEMP_DIR}/otf_nsg2.XXXXXX")
+                                    for _oc in "${_fb_comps[@]}"; do
+                                        oci network nsg list --compartment-id "$_oc" --vcn-id "$_rr_vcn_id" --region "$region_key" --all --output json > "$_otf_par_dir2/nsg_${_oc: -8}.json" 2>/dev/null &
+                                    done
+                                    wait
+                                    
+                                    _rr_nsg_ids=""
+                                    for _oc in "${_fb_comps[@]}"; do
+                                        local _fb_nf="$_otf_par_dir2/nsg_${_oc: -8}.json"
+                                        if [[ -f "$_fb_nf" ]]; then
+                                            local _fb_nj
+                                            _fb_nj=$(cat "$_fb_nf" 2>/dev/null)
+                                            if [[ -n "$_fb_nj" ]] && jq -e '.data[0]' <<< "$_fb_nj" >/dev/null 2>&1; then
+                                                while IFS='|' read -r _onid _onname _onstate; do
+                                                    [[ -z "$_onid" ]] && continue
+                                                    [[ -z "${XR_NSG_INFO[$_onid]+x}" ]] && XR_NSG_INFO[$_onid]="${_onname}|?|?|${_oc}"
+                                                    _rr_nsg_ids="${_rr_nsg_ids}${_onid}"$'\n'
+                                                done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["lifecycle-state"])"' <<< "$_fb_nj" 2>/dev/null)
+                                                break
+                                            fi
+                                        fi
+                                    done
+                                    XR_VCN_NSGS[$_rr_vcn_id]="$_rr_nsg_ids"
+                                    
+                                    # Fetch NSG rules
+                                    if [[ -n "$_rr_nsg_ids" ]]; then
+                                        while IFS= read -r _onid; do
+                                            [[ -z "$_onid" || -n "${XR_NSG_RULES[$_onid]+x}" ]] && continue
+                                            local _onid_region2; _onid_region2=$(_ocid_region "$_onid" "$region_key")
+                                            oci network nsg rules list --nsg-id "$_onid" --region "$_onid_region2" --all --output json > "$_otf_par_dir2/rules_${_onid: -8}.json" 2>/dev/null &
+                                        done <<< "$_rr_nsg_ids"
+                                        wait
+                                        while IFS= read -r _onid; do
+                                            [[ -z "$_onid" || -n "${XR_NSG_RULES[$_onid]+x}" ]] && continue
+                                            local _fb_rf="$_otf_par_dir2/rules_${_onid: -8}.json"
+                                            if [[ -f "$_fb_rf" && -s "$_fb_rf" ]]; then
+                                                local _fb_rj
+                                                _fb_rj=$(cat "$_fb_rf" 2>/dev/null)
+                                                if [[ -n "$_fb_rj" ]] && jq -e '.data' <<< "$_fb_rj" >/dev/null 2>&1; then
+                                                    local _fb_in _fb_eg
+                                                    _fb_in=$(jq '[(.data // [])[] | select(.direction=="INGRESS")] | length' <<< "$_fb_rj" 2>/dev/null || echo "0")
+                                                    _fb_eg=$(jq '[(.data // [])[] | select(.direction=="EGRESS")] | length' <<< "$_fb_rj" 2>/dev/null || echo "0")
+                                                    local _fb_nn _fb_nc
+                                                    _fb_nn=$(echo "${XR_NSG_INFO[$_onid]}" | cut -d'|' -f1)
+                                                    _fb_nc=$(echo "${XR_NSG_INFO[$_onid]}" | cut -d'|' -f4)
+                                                    XR_NSG_INFO[$_onid]="${_fb_nn}|${_fb_in}|${_fb_eg}|${_fb_nc}"
+                                                    XR_NSG_RULES[$_onid]=$(jq -c '.data // []' <<< "$_fb_rj" 2>/dev/null)
+                                                fi
+                                            fi
+                                        done <<< "$_rr_nsg_ids"
+                                    fi
+                                    rm -rf "$_otf_par_dir2" 2>/dev/null
+                                fi
+                            fi
+                        fi
+                        
+                        if [[ -n "$_rr_nsg_ids" ]]; then
+                            printf "  ${CYAN}%s${NC}    ${WHITE}VCN: %s${NC}" "$V" "$_rr_vcn_name"
+                            [[ -n "$_rr_vcn_cidr" ]] && printf " ${GRAY}[%s]${NC}" "$_rr_vcn_cidr"
+                            printf "\n"
+                            
+                            while IFS= read -r _rr_nid; do
+                                [[ -z "$_rr_nid" ]] && continue
+                                [[ -z "${XR_NSG_INFO[$_rr_nid]+x}" ]] && continue
+                                
+                                local _rr_nsg_name _rr_nsg_in _rr_nsg_eg _rr_nsg_comp
+                                IFS='|' read -r _rr_nsg_name _rr_nsg_in _rr_nsg_eg _rr_nsg_comp <<< "${XR_NSG_INFO[$_rr_nid]}"
+                                
+                                # Late-binding: if counts are still placeholder (?) or 0 with empty rules, fetch rules now
+                                if [[ "$_rr_nsg_in" == "?" || "$_rr_nsg_eg" == "?" || ( "$_rr_nsg_in" == "0" && "$_rr_nsg_eg" == "0" ) ]]; then
+                                    local _lb_need_fetch=0
+                                    if [[ "$_rr_nsg_in" == "?" || "$_rr_nsg_eg" == "?" ]]; then
+                                        _lb_need_fetch=1
+                                    elif [[ -z "${XR_NSG_RULES[$_rr_nid]+x}" ]]; then
+                                        _lb_need_fetch=1
+                                    else
+                                        local _lb_rl
+                                        _lb_rl=$(jq 'length' <<< "${XR_NSG_RULES[$_rr_nid]}" 2>/dev/null || echo "0")
+                                        [[ "$_lb_rl" == "0" ]] && _lb_need_fetch=1
+                                    fi
+                                    if [[ $_lb_need_fetch -eq 1 ]]; then
+                                        # Use region from NSG's own OCID
+                                        local _lb_region
+                                        _lb_region=$(_ocid_region "$_rr_nid" "$region_key")
+                                        _drg_dbg_cmd "Late-bind NSG rules" "oci network nsg rules list --nsg-id ${_rr_nid} --region $_lb_region --all"
+                                        local _lb_rj
+                                        _lb_rj=$(oci network nsg rules list --nsg-id "$_rr_nid" --region "$_lb_region" --all --output json 2>/dev/null)
+                                        if [[ -n "$_lb_rj" ]] && jq -e '.data' <<< "$_lb_rj" >/dev/null 2>&1; then
+                                            _rr_nsg_in=$(jq '[(.data // [])[] | select(.direction=="INGRESS")] | length' <<< "$_lb_rj" 2>/dev/null || echo "0")
+                                            _rr_nsg_eg=$(jq '[(.data // [])[] | select(.direction=="EGRESS")] | length' <<< "$_lb_rj" 2>/dev/null || echo "0")
+                                            XR_NSG_INFO[$_rr_nid]="${_rr_nsg_name}|${_rr_nsg_in}|${_rr_nsg_eg}|${_rr_nsg_comp}"
+                                            XR_NSG_RULES[$_rr_nid]=$(jq -c '.data // []' <<< "$_lb_rj" 2>/dev/null)
+                                            _drg_dbg_result "Late-bind NSG rules" "OK" "${_rr_nsg_name}: ${_rr_nsg_in}↓ ${_rr_nsg_eg}↑ (region=$_lb_region)"
+                                        else
+                                            _drg_dbg_result "Late-bind NSG rules" "FAIL" "${_rr_nsg_name}: API returned no .data (region=$_lb_region)"
+                                        fi
+                                    fi
+                                fi
+                                
+                                printf "  ${CYAN}%s${NC}      ${CYAN}🔐 %s${NC} ${GREEN}%s↓${NC} ${YELLOW}%s↑${NC}\n" \
+                                    "$V" "$_rr_nsg_name" "$_rr_nsg_in" "$_rr_nsg_eg"
+                                
+                                # Show compact rules from XR_NSG_RULES
+                                if [[ -n "${XR_NSG_RULES[$_rr_nid]+x}" ]]; then
+                                    # Ingress
+                                    while IFS='|' read -r _rp _rs _rdp _rd; do
+                                        [[ -z "$_rp" ]] && continue
+                                        # Resolve NSG OCID to name
+                                        if [[ "$_rs" == ocid1.networksecuritygroup* && -n "${XR_NSG_INFO[$_rs]+x}" ]]; then
+                                            _rs="NSG:${XR_NSG_INFO[$_rs]%%|*}"
+                                        fi
+                                        printf "  ${CYAN}%s${NC}        ${GREEN}↓${NC} ${WHITE}%-18s${NC} ${CYAN}%-5s${NC} %-11s ${GRAY}%s${NC}\n" \
+                                            "$V" "${_rs:0:18}" "$_rp" "$_rdp" "${_rd:0:200}"
+                                    done < <(echo "${XR_NSG_RULES[$_rr_nid]}" | jq -r '
+                                        [.[] | select(.direction=="INGRESS")] |
+                                        sort_by(.protocol | tonumber? // 999) | .[] |
+                                        (if .protocol == "6" then "TCP"
+                                         elif .protocol == "17" then "UDP"
+                                         elif .protocol == "1" then "ICMP"
+                                         elif .protocol == "all" or .protocol == "0" then "ALL"
+                                         else .protocol end) as $proto |
+                                        (.source // "any") as $src |
+                                        (if .protocol == "6" then
+                                            (if .["tcp-options"]["destination-port-range"] then
+                                                "\(.["tcp-options"]["destination-port-range"].min)" +
+                                                (if .["tcp-options"]["destination-port-range"].max != .["tcp-options"]["destination-port-range"].min then
+                                                    "-\(.["tcp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "17" then
+                                            (if .["udp-options"]["destination-port-range"] then
+                                                "\(.["udp-options"]["destination-port-range"].min)" +
+                                                (if .["udp-options"]["destination-port-range"].max != .["udp-options"]["destination-port-range"].min then
+                                                    "-\(.["udp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "1" then
+                                            (if .["icmp-options"] then
+                                                "\(.["icmp-options"].type // ""),\(.["icmp-options"].code // "")"
+                                            else "ALL" end)
+                                         else "ALL" end) as $ports |
+                                        "\($proto)|\($src)|\($ports)|\(.description // "")"
+                                    ' 2>/dev/null)
+                                    
+                                    # Egress
+                                    while IFS='|' read -r _rp _rd2 _rdp _rd; do
+                                        [[ -z "$_rp" ]] && continue
+                                        # Resolve NSG OCID to name
+                                        if [[ "$_rd2" == ocid1.networksecuritygroup* && -n "${XR_NSG_INFO[$_rd2]+x}" ]]; then
+                                            _rd2="NSG:${XR_NSG_INFO[$_rd2]%%|*}"
+                                        fi
+                                        printf "  ${CYAN}%s${NC}        ${YELLOW}↑${NC} ${WHITE}%-18s${NC} ${CYAN}%-5s${NC} %-11s ${GRAY}%s${NC}\n" \
+                                            "$V" "${_rd2:0:18}" "$_rp" "$_rdp" "${_rd:0:200}"
+                                    done < <(echo "${XR_NSG_RULES[$_rr_nid]}" | jq -r '
+                                        [.[] | select(.direction=="EGRESS")] |
+                                        sort_by(.protocol | tonumber? // 999) | .[] |
+                                        (if .protocol == "6" then "TCP"
+                                         elif .protocol == "17" then "UDP"
+                                         elif .protocol == "1" then "ICMP"
+                                         elif .protocol == "all" or .protocol == "0" then "ALL"
+                                         else .protocol end) as $proto |
+                                        (.destination // "any") as $dst |
+                                        (if .protocol == "6" then
+                                            (if .["tcp-options"]["destination-port-range"] then
+                                                "\(.["tcp-options"]["destination-port-range"].min)" +
+                                                (if .["tcp-options"]["destination-port-range"].max != .["tcp-options"]["destination-port-range"].min then
+                                                    "-\(.["tcp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "17" then
+                                            (if .["udp-options"]["destination-port-range"] then
+                                                "\(.["udp-options"]["destination-port-range"].min)" +
+                                                (if .["udp-options"]["destination-port-range"].max != .["udp-options"]["destination-port-range"].min then
+                                                    "-\(.["udp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "1" then
+                                            (if .["icmp-options"] then
+                                                "\(.["icmp-options"].type // ""),\(.["icmp-options"].code // "")"
+                                            else "ALL" end)
+                                         else "ALL" end) as $ports |
+                                        "\($proto)|\($dst)|\($ports)|\(.description // "")"
+                                    ' 2>/dev/null)
+                                fi
+                            done <<< "$_rr_nsg_ids"
+                        fi
+                        
+                        # Security Lists for this VCN
+                        local _rr_sl_ids="${XR_VCN_SLS[$_rr_vcn_id]:-}"
+                        if [[ -n "$_rr_sl_ids" ]]; then
+                            # If NSGs weren't shown, show the VCN header now
+                            if [[ -z "$_rr_nsg_ids" ]]; then
+                                printf "  ${CYAN}%s${NC}    ${WHITE}VCN: %s${NC}" "$V" "$_rr_vcn_name"
+                                [[ -n "$_rr_vcn_cidr" ]] && printf " ${GRAY}[%s]${NC}" "$_rr_vcn_cidr"
+                                printf "\n"
+                            fi
+                            while IFS= read -r _rr_slid; do
+                                [[ -z "$_rr_slid" ]] && continue
+                                [[ -z "${XR_SL_INFO[$_rr_slid]+x}" ]] && continue
+                                local _rr_sl_name _rr_sl_in _rr_sl_eg
+                                IFS='|' read -r _rr_sl_name _rr_sl_in _rr_sl_eg <<< "${XR_SL_INFO[$_rr_slid]}"
+                                
+                                # Late-bind: fetch SL rules if not cached
+                                if [[ -z "${XR_SL_RULES[$_rr_slid]+x}" ]]; then
+                                    local _sl_lb_region
+                                    _sl_lb_region=$(_ocid_region "$_rr_slid" "$region_key")
+                                    _drg_dbg_cmd "Late-bind SL rules" "oci network security-list get --security-list-id ${_rr_slid} --region $_sl_lb_region"
+                                    local _sl_lb_json
+                                    _sl_lb_json=$(oci network security-list get --security-list-id "$_rr_slid" --region "$_sl_lb_region" --output json 2>/dev/null)
+                                    if [[ -n "$_sl_lb_json" ]] && jq -e '.data' <<< "$_sl_lb_json" >/dev/null 2>&1; then
+                                        _rr_sl_in=$(jq '(.data["ingress-security-rules"] // []) | length' <<< "$_sl_lb_json" 2>/dev/null || echo "0")
+                                        _rr_sl_eg=$(jq '(.data["egress-security-rules"] // []) | length' <<< "$_sl_lb_json" 2>/dev/null || echo "0")
+                                        XR_SL_INFO[$_rr_slid]="${_rr_sl_name}|${_rr_sl_in}|${_rr_sl_eg}"
+                                        XR_SL_RULES[$_rr_slid]=$(jq -c '.data | {"ingress": (.["ingress-security-rules"] // []), "egress": (.["egress-security-rules"] // [])}' <<< "$_sl_lb_json" 2>/dev/null)
+                                        _drg_dbg_result "Late-bind SL rules" "OK" "${_rr_sl_name}: ${_rr_sl_in}↓ ${_rr_sl_eg}↑ (region=$_sl_lb_region)"
+                                    else
+                                        _drg_dbg_result "Late-bind SL rules" "FAIL" "${_rr_sl_name}: API returned no .data (region=$_sl_lb_region)"
+                                    fi
+                                fi
+                                
+                                printf "  ${CYAN}%s${NC}      ${CYAN}🛡️  %s${NC} ${GREEN}%s↓${NC} ${YELLOW}%s↑${NC}\n" \
+                                    "$V" "$_rr_sl_name" "${_rr_sl_in:-0}" "${_rr_sl_eg:-0}"
+                                
+                                # Show compact SL rules
+                                if [[ -n "${XR_SL_RULES[$_rr_slid]+x}" ]]; then
+                                    # Ingress rules
+                                    while IFS='|' read -r _slp _sls _sldp _sld; do
+                                        [[ -z "$_slp" ]] && continue
+                                        printf "  ${CYAN}%s${NC}        ${GREEN}↓${NC} ${WHITE}%-18s${NC} ${CYAN}%-5s${NC} %-11s ${GRAY}%s${NC}\n" \
+                                            "$V" "${_sls:0:18}" "$_slp" "$_sldp" "${_sld:0:200}"
+                                    done < <(echo "${XR_SL_RULES[$_rr_slid]}" | jq -r '
+                                        .ingress | sort_by(.protocol | tonumber? // 999) | .[] |
+                                        (if .protocol == "6" then "TCP"
+                                         elif .protocol == "17" then "UDP"
+                                         elif .protocol == "1" then "ICMP"
+                                         elif .protocol == "all" or .protocol == "0" then "ALL"
+                                         else .protocol end) as $proto |
+                                        (.source // "any") as $src |
+                                        (if .protocol == "6" then
+                                            (if .["tcp-options"]["destination-port-range"] then
+                                                "\(.["tcp-options"]["destination-port-range"].min)" +
+                                                (if .["tcp-options"]["destination-port-range"].max != .["tcp-options"]["destination-port-range"].min then
+                                                    "-\(.["tcp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "17" then
+                                            (if .["udp-options"]["destination-port-range"] then
+                                                "\(.["udp-options"]["destination-port-range"].min)" +
+                                                (if .["udp-options"]["destination-port-range"].max != .["udp-options"]["destination-port-range"].min then
+                                                    "-\(.["udp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "1" then
+                                            (if .["icmp-options"] then
+                                                "\(.["icmp-options"].type // ""),\(.["icmp-options"].code // "")"
+                                            else "ALL" end)
+                                         else "ALL" end) as $ports |
+                                        "\($proto)|\($src)|\($ports)|\(.description // "")"
+                                    ' 2>/dev/null)
+                                    
+                                    # Egress rules
+                                    while IFS='|' read -r _slp _sld2 _sldp _sld; do
+                                        [[ -z "$_slp" ]] && continue
+                                        printf "  ${CYAN}%s${NC}        ${YELLOW}↑${NC} ${WHITE}%-18s${NC} ${CYAN}%-5s${NC} %-11s ${GRAY}%s${NC}\n" \
+                                            "$V" "${_sld2:0:18}" "$_slp" "$_sldp" "${_sld:0:200}"
+                                    done < <(echo "${XR_SL_RULES[$_rr_slid]}" | jq -r '
+                                        .egress | sort_by(.protocol | tonumber? // 999) | .[] |
+                                        (if .protocol == "6" then "TCP"
+                                         elif .protocol == "17" then "UDP"
+                                         elif .protocol == "1" then "ICMP"
+                                         elif .protocol == "all" or .protocol == "0" then "ALL"
+                                         else .protocol end) as $proto |
+                                        (.destination // "any") as $dst |
+                                        (if .protocol == "6" then
+                                            (if .["tcp-options"]["destination-port-range"] then
+                                                "\(.["tcp-options"]["destination-port-range"].min)" +
+                                                (if .["tcp-options"]["destination-port-range"].max != .["tcp-options"]["destination-port-range"].min then
+                                                    "-\(.["tcp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "17" then
+                                            (if .["udp-options"]["destination-port-range"] then
+                                                "\(.["udp-options"]["destination-port-range"].min)" +
+                                                (if .["udp-options"]["destination-port-range"].max != .["udp-options"]["destination-port-range"].min then
+                                                    "-\(.["udp-options"]["destination-port-range"].max)" else "" end)
+                                            else "ALL" end)
+                                         elif .protocol == "1" then
+                                            (if .["icmp-options"] then
+                                                "\(.["icmp-options"].type // ""),\(.["icmp-options"].code // "")"
+                                            else "ALL" end)
+                                         else "ALL" end) as $ports |
+                                        "\($proto)|\($dst)|\($ports)|\(.description // "")"
+                                    ' 2>/dev/null)
+                                fi
+                            done <<< "$_rr_sl_ids"
+                        fi
+                        
+                        # Show message only if VCN has neither NSGs nor SLs
+                        if [[ -z "$_rr_nsg_ids" && -z "$_rr_sl_ids" ]]; then
+                            printf "  ${CYAN}%s${NC}    ${WHITE}VCN: %s${NC} ${GRAY}[%s]${NC} — ${GRAY}no NSGs or Security Lists found${NC}\n" \
+                                "$V" "$_rr_vcn_name" "${_rr_vcn_cidr:-N/A}"
+                        fi
+                    done
+                fi
+                unset _rr_vcn_seen
             fi
+            fi  # routes flag
             
-            # ── Import Route Distributions (per DRG) ──
+            # ── 9-11. Route Distributions (per DRG) ──
+            if [[ "${DRG_TOPO_FLAGS[distributions]}" == "1" ]]; then
             local _xr_dist_json="${XR_DRG_DIST_LIST[$drg_id]:-}"
             if [[ -n "$_xr_dist_json" && "$_xr_dist_json" != "[]" ]]; then
                 local _xr_imp_found=0
@@ -17257,6 +18658,7 @@ display_cross_region_drg_map() {
                     
                     # Statements
                     local _xid_stmt_json
+                    _drg_dbg_cmd "Import dist stmts (live)" "oci network drg-route-distribution-statement list --route-distribution-id ${_xid_id} --region $region_key --all"
                     _xid_stmt_json=$(oci network drg-route-distribution-statement list --route-distribution-id "$_xid_id" --all \
                         --region "$region_key" --output json 2>/dev/null)
                     local _xid_stmt_data="[]"
@@ -17326,8 +18728,40 @@ display_cross_region_drg_map() {
                         printf "  ${CYAN}%s${NC}      ${GRAY}(No statements)${NC}\n" "$V"
                     fi
                 done < <(jq -r '.[] | "\(.["display-name"])|\(.["distribution-type"])|\(.id)"' <<< "$_xr_dist_json" 2>/dev/null)
-                
-                # Export distributions
+            fi
+            
+            # ── 10. Default Export Route Distribution ──
+            local export_dist_info="${XR_DRG_EXPORT_DIST[$drg_id]:-}"
+            if [[ -n "$export_dist_info" ]]; then
+                local ed_name ed_type ed_ocid
+                IFS='|' read -r ed_name ed_type ed_ocid <<< "$export_dist_info"
+                printf "  ${CYAN}%s${NC}  ${BOLD}${WHITE}📤 Default Export Route Distribution:${NC}\n" "$V"
+                printf "  ${CYAN}%s${NC}    ${GREEN}%s${NC} ${GRAY}[%s]${NC} ${YELLOW}(%s)${NC}\n" \
+                    "$V" "$ed_name" "$ed_type" "$ed_ocid"
+                # Statements
+                local export_stmts="${XR_DRG_EXPORT_DIST_STMTS[$drg_id]:-[]}"
+                local export_stmt_count
+                export_stmt_count=$(jq 'length' <<< "$export_stmts" 2>/dev/null || echo "0")
+                if [[ "$export_stmt_count" -gt 0 ]]; then
+                    printf "  ${CYAN}%s${NC}      ${BOLD}%-10s %-8s %-24s %-40s${NC}\n" "$V" "Action" "Priority" "Match Type" "Match Criteria"
+                    while IFS='|' read -r es_action es_priority es_match_type es_att_type; do
+                        [[ -z "$es_action" ]] && continue
+                        local match_d=""
+                        if [[ -n "$es_att_type" && "$es_att_type" != "null" ]]; then
+                            match_d="attachment-type=${es_att_type}"
+                        else
+                            match_d="match=${es_match_type}"
+                        fi
+                        printf "  ${CYAN}%s${NC}      ${WHITE}%-10s${NC} ${GREEN}%-8s${NC} %-24s %s\n" \
+                            "$V" "$es_action" "$es_priority" "$es_match_type" "$match_d"
+                    done < <(jq -r '.[] | "\(.action)|\(.priority)|\(.["match-criteria"][0]["match-type"] // "ALL")|\(.["match-criteria"][0]["attachment-type"] // "null")"' <<< "$export_stmts" 2>/dev/null)
+                else
+                    printf "  ${CYAN}%s${NC}      ${GRAY}(No statements)${NC}\n" "$V"
+                fi
+            fi
+            
+            # ── 11. Export Route Distributions ──
+            if [[ -n "$_xr_dist_json" && "$_xr_dist_json" != "[]" ]]; then
                 local _xr_exp_found=0
                 while IFS='|' read -r _xed_name _xed_type _xed_id; do
                     [[ -z "$_xed_name" || "$_xed_type" != "EXPORT" ]] && continue
@@ -17409,6 +18843,7 @@ display_cross_region_drg_map() {
                     fi
                 done < <(jq -r '.[] | "\(.["display-name"])|\(.["distribution-type"])|\(.id)"' <<< "$_xr_dist_json" 2>/dev/null)
             fi
+            fi  # distributions flag
             
         done <<< "$drg_ids_in_region"
         
@@ -17418,6 +18853,7 @@ display_cross_region_drg_map() {
     # ═══════════════════════════════════════════════════════════════════════════════
     # PHASE 3: Unified Route Summary
     # ═══════════════════════════════════════════════════════════════════════════════
+    if [[ "${DRG_TOPO_FLAGS[summary]}" == "1" ]]; then
     echo ""
     _ui_section "UNIFIED ROUTE SUMMARY"
     printf "  ${BOLD}%-16s %-20s %-20s %-9s %-14s %s${NC}\n" "Region" "DRG" "Destination" "Type" "Origin" "Next Hop"
@@ -17447,6 +18883,7 @@ display_cross_region_drg_map() {
                         local hop_name="${XR_ATT_NAMES[$r_hop_id]:-}"
                         if [[ -z "$hop_name" || "$hop_name" == "N/A" ]]; then
                             local _sr_hop_json
+                            _drg_dbg_cmd "Summary hop resolve (live)" "oci network drg-attachment get --drg-attachment-id ${r_hop_id} --region $region_key"
                             _sr_hop_json=$(oci network drg-attachment get --drg-attachment-id "$r_hop_id" --region "$region_key" --output json 2>/dev/null)
                             if [[ -n "$_sr_hop_json" ]] && jq -e '.data' <<< "$_sr_hop_json" >/dev/null 2>&1; then
                                 hop_name=$(jq -r '.data["display-name"] // ""' <<< "$_sr_hop_json" 2>/dev/null)
@@ -17468,6 +18905,8 @@ display_cross_region_drg_map() {
     done
     
     printf "  %s\n" "$(printf '%*s' 140 '' | tr ' ' '─')"
+    fi  # summary flag
+    echo ""
     echo -e "  ${BOLD}${WHITE}Total: ${GREEN}${xr_total_regions} region(s)${NC}, ${WHITE}${#XR_VISITED_DRGS[@]} DRG(s)${NC} traversed via RPC peering chains"
     local start_drg_name="${XR_DRG_NAMES[$start_drg_id]:-Unknown}"
     echo -e "  ${GRAY}Start: ${WHITE}${start_drg_name}${NC} ${GRAY}in ${WHITE}${start_region}${NC}  ${BOLD}Legend:${NC} ${GREEN}✓${NC}=Attached ${YELLOW}◐${NC}=Attaching ${YELLOW}○${NC}=Other 🌐=Public 🔒=Private ${GREEN}🔗${NC}=LPG"
@@ -17507,14 +18946,70 @@ manage_drg_connectivity() {
         fi
     fi
     
+    # Ensure NSG detail cache is populated (needed for DRG topology SL/NSG overlay)
+    if [[ -n "$param_vcn_ocid" && "$param_vcn_ocid" != "N/A" ]]; then
+        local _drg_vcn_comp="${param_vcn_compartment_id:-$compartment_id}"
+        
+        # Ensure NETWORK_RESOURCES_CACHE exists (has NSG names)
+        if [[ ! -f "$NETWORK_RESOURCES_CACHE" ]] || ! is_cache_fresh "$NETWORK_RESOURCES_CACHE" 2>/dev/null; then
+            echo -ne "  ${GRAY}Populating network resource cache...${NC}"
+            fetch_network_resources "$_drg_vcn_comp" "$param_vcn_ocid" 2>/dev/null
+            echo -ne "\r                                                  \r"
+        fi
+        
+        # Ensure DRG_CACHE exists (DRG attachments)
+        if [[ ! -f "$DRG_CACHE" ]] || ! is_cache_fresh "$DRG_CACHE" 2>/dev/null; then
+            echo -ne "  ${GRAY}Populating DRG attachment cache...${NC}"
+            fetch_drg_attachments "$_drg_vcn_comp" 2>/dev/null
+            echo -ne "\r                                                  \r"
+        fi
+        
+        # Ensure OS_PE_CACHE exists (Object Storage Private Endpoints)
+        if [[ ! -f "$OS_PE_CACHE" ]] || ! is_cache_fresh "$OS_PE_CACHE" 2>/dev/null; then
+            echo -ne "  ${GRAY}Populating OS private endpoint cache...${NC}"
+            fetch_os_private_endpoints "$_drg_vcn_comp" "${NETWORK_COMPARTMENT_ID:-}" 2>/dev/null
+            echo -ne "\r                                                  \r"
+        fi
+        
+        # Ensure SL_CACHE exists
+        if [[ ! -f "$SL_CACHE" ]] || ! is_cache_fresh "$SL_CACHE" 2>/dev/null; then
+            echo -ne "  ${GRAY}Populating security list cache...${NC}"
+            fetch_security_lists "$_drg_vcn_comp" "$param_vcn_ocid" 2>/dev/null
+            echo -ne "\r                                                  \r"
+        fi
+        
+        # Ensure RT_CACHE exists
+        if [[ ! -f "$RT_CACHE" ]] || ! is_cache_fresh "$RT_CACHE" 2>/dev/null; then
+            echo -ne "  ${GRAY}Populating route table cache...${NC}"
+            fetch_route_tables "$_drg_vcn_comp" "$param_vcn_ocid" 2>/dev/null
+            echo -ne "\r                                                  \r"
+        fi
+        
+        # Ensure NSG rules detail cache is populated
+        if [[ ! -d "$NSG_RULES_DETAIL_DIR" ]] || [[ -z "$(ls -A "$NSG_RULES_DETAIL_DIR" 2>/dev/null)" ]]; then
+            if [[ -f "$NETWORK_RESOURCES_CACHE" ]]; then
+                local _drg_nsg_ids=""
+                _drg_nsg_ids=$(grep "^NSG|" "$NETWORK_RESOURCES_CACHE" 2>/dev/null | while IFS='|' read -r _t _n _ _s _o; do echo "$_o"; done)
+                if [[ -n "$_drg_nsg_ids" ]]; then
+                    fetch_nsg_rules_detail_parallel "$_drg_nsg_ids"
+                fi
+            fi
+        fi
+    fi
+    
     while true; do
         echo ""
         _ui_banner "DRG & NETWORK CONNECTIVITY"
         _display_cache_info \
-            "${DRG_CACHE}|DRG Attachments"
+            "${DRG_CACHE}|DRG Attachments" \
+            "${RT_CACHE}|Route Tables" \
+            "${SL_CACHE}|Security Lists" \
+            "${NSG_RULES_CACHE}|NSG Rules" \
+            "${OS_PE_CACHE}|OS Private Endpoints"
         echo ""
         
         # Pre-cache compartment names to avoid "Unknown" throughout
+        _warm_comp_name_cache
         for _pc_comp in "${SEARCH_COMPARTMENTS[@]}"; do
             resolve_compartment_name "$_pc_comp" >/dev/null 2>&1
         done
@@ -17562,6 +19057,7 @@ manage_drg_connectivity() {
             local vcn_att_comp="${param_vcn_compartment_id:-$compartment_id}"
             echo -ne "\r${GRAY}  Discovering DRG attachments for VCN...${NC}          "
             local vcn_att_json
+            _drg_dbg_cmd "DRG att list (via VCN)" "oci network drg-attachment list --compartment-id ${vcn_att_comp} --vcn-id ${param_vcn_ocid} --all"
             vcn_att_json=$(oci network drg-attachment list --compartment-id "$vcn_att_comp" --vcn-id "$param_vcn_ocid" --all --output json 2>/dev/null)
             
             if [[ -n "$vcn_att_json" && "$vcn_att_json" != "null" ]]; then
@@ -17601,6 +19097,7 @@ manage_drg_connectivity() {
             
             # Find DRGs owned by this compartment
             local drg_json
+            _drg_dbg_cmd "DRG list" "oci network drg list --compartment-id ${search_comp}"
             drg_json=$(oci network drg list --compartment-id "$search_comp" --output json 2>/dev/null)
             
             if [[ -n "$drg_json" && "$drg_json" != "null" ]]; then
@@ -17616,6 +19113,7 @@ manage_drg_connectivity() {
             
             # Find DRGs via DRG attachments in this compartment
             local attach_json
+            _drg_dbg_cmd "DRG att list (discovery)" "oci network drg-attachment list --compartment-id ${search_comp} --all"
             attach_json=$(oci network drg-attachment list --compartment-id "$search_comp" --all --output json 2>/dev/null)
             
             if [[ -n "$attach_json" && "$attach_json" != "null" ]]; then
@@ -17728,25 +19226,23 @@ manage_drg_connectivity() {
         
         echo ""
         
-        # Show cross-region DRG map by default (replaces per-DRG maps)
-        if [[ "$total_drgs" -gt 0 ]]; then
-            local primary_drg_id="${DRG_MAP[1]}"
-            display_cross_region_drg_map "$primary_drg_id" "$region" "0" "${SEARCH_COMPARTMENTS[@]}"
-        fi
-        
         echo ""
         _ui_section "Actions"
         echo ""
         echo -e "  ${YELLOW}#${NC})    View DRG details (enter number)"
         echo ""
+        echo -e "  ${CYAN}v${NC})    View DRG configuration across VCN"
         echo -e "  ${CYAN}vm${NC})   View per-DRG connectivity maps (legacy view)"
+        echo -e "  ${CYAN}vc${NC})   View XR cache contents (NSGs, SLs, RTs, VCNs)"
         echo ""
         echo -e "  ${MAGENTA}r${NC})    Refresh (re-query cross-region map & clear cache)"
+        echo -e "  ${CYAN}show${NC}) Re-display DRG list"
+        echo -e "  ${CYAN}f${NC})    Toggle display sections (${GREEN}$(printf '%s' "${DRG_TOPO_FLAGS[@]}" | tr -cd '1' | wc -c)${NC}/9 enabled)"
         echo -e "  ${CYAN}b${NC})    Back to network menu"
         echo ""
         xr_cache_age_display
         echo ""
-        _ui_prompt "Network > DRG" "r, b, show"
+        _ui_prompt "Network > DRG" "v, r, f, b, show"
         read -r selection
         
         case "$selection" in
@@ -17773,6 +19269,71 @@ manage_drg_connectivity() {
                 xr_cache_clear
                 sleep 1
                 ;;
+            show|SHOW)
+                # Re-display the DRG list (continue to loop top)
+                continue
+                ;;
+            v|V)
+                # View DRG configuration across VCN
+                if [[ "$total_drgs" -gt 0 ]]; then
+                    local primary_drg_id="${DRG_MAP[1]}"
+                    display_cross_region_drg_map "$primary_drg_id" "$region" "0" "${SEARCH_COMPARTMENTS[@]}"
+                    _ui_pause
+                else
+                    echo -e "  ${YELLOW}No DRGs discovered yet. Use ${WHITE}r${NC}${YELLOW} to refresh.${NC}"
+                    sleep 1
+                fi
+                ;;
+            f|F)
+                # Toggle display section flags
+                while true; do
+                    echo ""
+                    _ui_section "DRG Topology Display Sections"
+                    echo ""
+                    local _f_keys=("compartments" "vcn" "attachments" "peering" "fastconnect" "ipsec" "routes" "distributions" "summary")
+                    local _f_labels=("Compartments" "VCN" "Attachments" "Remote Peering" "FastConnect Virtual Circuits" "IPSec VPN Connections" "Route Rules + NSGs/SLs" "Import/Export Distributions" "Unified Route Summary")
+                    for _fi in "${!_f_keys[@]}"; do
+                        local _fk="${_f_keys[$_fi]}"
+                        local _fl="${_f_labels[$_fi]}"
+                        local _fv="${DRG_TOPO_FLAGS[$_fk]:-1}"
+                        local _fs _fc
+                        if [[ "$_fv" == "1" ]]; then
+                            _fs="✓"; _fc="$GREEN"
+                        else
+                            _fs="✗"; _fc="$RED"
+                        fi
+                        printf "  ${CYAN}%s)${NC}  ${_fc}[%s]${NC}  %s\n" "$((_fi+1))" "$_fs" "$_fl"
+                    done
+                    echo ""
+                    echo -e "  ${CYAN}a${NC})  Enable all"
+                    echo -e "  ${CYAN}n${NC})  Disable all"
+                    echo -e "  ${CYAN}b${NC})  Back"
+                    echo ""
+                    echo -n -e "  ${WHITE}Toggle section (1-9) or a/n/b: ${NC}"
+                    read -r _ftoggle
+                    case "$_ftoggle" in
+                        [1-9])
+                            local _tk="${_f_keys[$((_ftoggle-1))]}"
+                            if [[ "${DRG_TOPO_FLAGS[$_tk]}" == "1" ]]; then
+                                DRG_TOPO_FLAGS[$_tk]=0
+                            else
+                                DRG_TOPO_FLAGS[$_tk]=1
+                            fi
+                            ;;
+                        a|A)
+                            for _fk in "${_f_keys[@]}"; do DRG_TOPO_FLAGS[$_fk]=1; done
+                            echo -e "  ${GREEN}✓ All sections enabled${NC}"
+                            sleep 0.5
+                            ;;
+                        n|N)
+                            for _fk in "${_f_keys[@]}"; do DRG_TOPO_FLAGS[$_fk]=0; done
+                            echo -e "  ${YELLOW}✗ All sections disabled${NC}"
+                            sleep 0.5
+                            ;;
+                        b|B|"") break ;;
+                    esac
+                done
+                ;;
             vm|VM)
                 if [[ "$total_drgs" -gt 0 ]]; then
                     _ui_section "Per-DRG Connectivity Maps"
@@ -17785,6 +19346,227 @@ manage_drg_connectivity() {
                         display_drg_connectivity_map "$drg_id" "$drg_name" "$drg_comp" "$region" "${SEARCH_COMPARTMENTS[@]}"
                         echo ""
                     done
+                    _ui_pause
+                fi
+                ;;
+            vc|VC)
+                echo ""
+                local _xr_cache_file="${XR_CACHE_DIR}/xr_data.sh"
+                if [[ ! -f "$_xr_cache_file" ]]; then
+                    echo -e "  ${YELLOW}No XR cache file found.${NC} Run the topology map first (press ${WHITE}r${NC} to refresh)."
+                    echo ""
+                    _ui_pause
+                else
+                    echo ""
+                    _ui_banner "XR CACHE INSPECTOR"
+                    echo ""
+                    
+                    local _cache_age_s=0
+                    if [[ -f "${XR_CACHE_DIR}/.meta" ]]; then
+                        _cache_age_s=$(( $(date +%s) - $(stat -c %Y "${XR_CACHE_DIR}/.meta" 2>/dev/null || echo "0") ))
+                    fi
+                    local _cache_size
+                    _cache_size=$(du -sh "$_xr_cache_file" 2>/dev/null | cut -f1)
+                    echo -e "  ${CYAN}Cache file:${NC}  $_xr_cache_file"
+                    echo -e "  ${CYAN}File size:${NC}   ${_cache_size}"
+                    echo -e "  ${CYAN}Cache age:${NC}   ${_cache_age_s}s  (TTL: ${XR_CACHE_TTL}s)"
+                    echo ""
+                    
+                    # Source the cache to load all XR_ arrays
+                    declare -A _VC_DRG_NAMES=() _VC_DRG_STATES=() _VC_DRG_REGIONS=() _VC_DRG_COMPS=() _VC_DRG_COMP_NAMES=()
+                    declare -A _VC_VCN_NAMES=() _VC_VCN_CIDRS=() _VC_VCN_NSGS=()
+                    declare -A _VC_NSG_INFO=() _VC_NSG_RULES=()
+                    declare -A _VC_SL_INFO=() _VC_RT_INFO=()
+                    declare -A _VC_REGION_VCN_ATTACH=()
+                    # Source then copy (declare -A in cache resets our locals)
+                    (
+                        source "$_xr_cache_file" 2>/dev/null
+                        # Output counts
+                        echo "COUNTS|${#XR_DRG_NAMES[@]}|${#XR_VCN_NAMES[@]}|${#XR_NSG_INFO[@]}|${#XR_NSG_RULES[@]}|${#XR_VCN_NSGS[@]}|${#XR_SL_INFO[@]}|${#XR_SL_RULES[@]}|${#XR_RT_INFO[@]}"
+                        # Output DRGs
+                        for _k in "${!XR_DRG_NAMES[@]}"; do
+                            echo "DRG|${_k}|${XR_DRG_NAMES[$_k]}|${XR_DRG_REGIONS[$_k]:-?}|${XR_DRG_STATES[$_k]:-?}|${XR_DRG_COMPS[$_k]:-}|${XR_DRG_COMP_NAMES[$_k]:-Unknown}"
+                        done
+                        # Output VCNs
+                        for _k in "${!XR_VCN_NAMES[@]}"; do
+                            _nsg_ct=0
+                            if [[ -n "${XR_VCN_NSGS[$_k]:-}" ]]; then
+                                _nsg_ct=$(echo "${XR_VCN_NSGS[$_k]}" | sed '/^$/d' | wc -l)
+                            fi
+                            echo "VCN|${_k}|${XR_VCN_NAMES[$_k]}|${XR_VCN_CIDRS[$_k]:-}|${_nsg_ct}"
+                        done
+                        # Output NSGs
+                        for _k in "${!XR_NSG_INFO[@]}"; do
+                            _has_rules="no"
+                            [[ -n "${XR_NSG_RULES[$_k]+x}" ]] && _has_rules="yes"
+                            echo "NSG|${_k}|${XR_NSG_INFO[$_k]}|${_has_rules}"
+                        done
+                        # Output SLs
+                        for _k in "${!XR_SL_INFO[@]}"; do
+                            _has_rules="no"
+                            [[ -n "${XR_SL_RULES[$_k]+x}" ]] && _has_rules="yes"
+                            echo "SL|${_k}|${XR_SL_INFO[$_k]}|${_has_rules}"
+                        done
+                        # Output RTs
+                        for _k in "${!XR_RT_INFO[@]}"; do
+                            echo "RT|${_k}|${XR_RT_INFO[$_k]}"
+                        done
+                        # Output VCN→NSG mappings
+                        for _k in "${!XR_VCN_NSGS[@]}"; do
+                            _vn="${XR_VCN_NAMES[$_k]:-...${_k: -16}}"
+                            echo "VCNNSG_HDR|${_k}|${_vn}"
+                            if [[ -n "${XR_VCN_NSGS[$_k]}" ]]; then
+                                while IFS= read -r _nid; do
+                                    [[ -z "$_nid" ]] && continue
+                                    echo "VCNNSG_ROW|${_nid}|${XR_NSG_INFO[$_nid]:-?|?|?|}"
+                                done <<< "${XR_VCN_NSGS[$_k]}"
+                            else
+                                echo "VCNNSG_EMPTY|${_k}"
+                            fi
+                        done
+                    ) | {
+                        # Read and display the structured output
+                        local _ct_drg=0 _ct_vcn=0 _ct_nsg=0 _ct_rules=0 _ct_vnsg=0 _ct_sl=0 _ct_rt=0
+                        local -a _drg_lines=() _vcn_lines=() _nsg_lines=() _sl_lines=() _rt_lines=() _map_lines=()
+                        
+                        while IFS= read -r _line; do
+                            local _type="${_line%%|*}"
+                            local _rest="${_line#*|}"
+                            case "$_type" in
+                                COUNTS)
+                                    IFS='|' read -r _ct_drg _ct_vcn _ct_nsg _ct_rules _ct_vnsg _ct_sl _ct_rt <<< "$_rest"
+                                    ;;
+                                DRG) _drg_lines+=("$_rest") ;;
+                                VCN) _vcn_lines+=("$_rest") ;;
+                                NSG) _nsg_lines+=("$_rest") ;;
+                                SL) _sl_lines+=("$_rest") ;;
+                                RT) _rt_lines+=("$_rest") ;;
+                                VCNNSG_HDR|VCNNSG_ROW|VCNNSG_EMPTY) _map_lines+=("${_type}|${_rest}") ;;
+                            esac
+                        done
+                        
+                        # Summary
+                        echo -e "  ${BOLD}${WHITE}Summary:${NC}"
+                        printf "    %-25s %s\n" "DRGs:" "$_ct_drg"
+                        printf "    %-25s %s\n" "VCNs:" "$_ct_vcn"
+                        printf "    %-25s %s\n" "NSGs (info):" "$_ct_nsg"
+                        printf "    %-25s %s\n" "NSG Rules (detail):" "$_ct_rules"
+                        printf "    %-25s %s\n" "VCN→NSG mappings:" "$_ct_vnsg"
+                        printf "    %-25s %s\n" "Security Lists:" "$_ct_sl"
+                        printf "    %-25s %s\n" "Route Tables:" "$_ct_rt"
+                        echo ""
+                        
+                        # DRGs
+                        _ui_section "DRGs in Cache"
+                        echo ""
+                        printf "  ${BOLD}%-40s %-18s %-12s %s${NC}\n" "DRG Name" "Region" "State" "Compartment"
+                        print_separator 130
+                        for _dl in "${_drg_lines[@]}"; do
+                            local _did _dname _dreg _dstate _dcomp _dcname
+                            IFS='|' read -r _did _dname _dreg _dstate _dcomp _dcname <<< "$_dl"
+                            local _sc="${GREEN}"; [[ "$_dstate" != "AVAILABLE" ]] && _sc="${YELLOW}"
+                            printf "  %-40s ${CYAN}%-18s${NC} ${_sc}%-12s${NC} ${WHITE}%s${NC} ${GRAY}(%s)${NC}\n" \
+                                "${_dname:0:38}" "$_dreg" "$_dstate" "${_dcname:0:25}" "${_dcomp}"
+                        done
+                        echo ""
+                        
+                        # VCNs
+                        _ui_section "VCNs in Cache"
+                        echo ""
+                        printf "  ${BOLD}%-40s %-20s %-10s %s${NC}\n" "VCN Name" "CIDR" "NSGs" "VCN OCID (last 20)"
+                        print_separator 120
+                        for _vl in "${_vcn_lines[@]}"; do
+                            local _vid _vname _vcidr _vnct
+                            IFS='|' read -r _vid _vname _vcidr _vnct <<< "$_vl"
+                            local _nc="${WHITE}"; [[ "$_vnct" -eq 0 ]] 2>/dev/null && _nc="${YELLOW}"
+                            printf "  %-40s ${CYAN}%-20s${NC} ${_nc}%-10s${NC} ${GRAY}...%s${NC}\n" \
+                                "${_vname:0:38}" "${_vcidr:-?}" "$_vnct" "${_vid: -20}"
+                        done
+                        echo ""
+                        
+                        # NSGs
+                        _ui_section "NSGs in Cache"
+                        echo ""
+                        printf "  ${BOLD}%-40s %5s %5s   %-12s %s${NC}\n" "NSG Name" "In" "Eg" "Has Rules?" "Compartment"
+                        print_separator 130
+                        for _nl in "${_nsg_lines[@]}"; do
+                            local _nid _ninfo _has_r
+                            # Format: nsg_ocid|name|in|eg|comp|has_rules
+                            _nid="${_nl%%|*}"; _rest="${_nl#*|}"
+                            local _nn _ni _ne _nc _hr
+                            # _rest = "name|in|eg|comp|has_rules"
+                            _nn="${_rest%%|*}"; _rest="${_rest#*|}"
+                            _ni="${_rest%%|*}"; _rest="${_rest#*|}"
+                            _ne="${_rest%%|*}"; _rest="${_rest#*|}"
+                            _nc="${_rest%%|*}"; _rest="${_rest#*|}"
+                            _hr="${_rest}"
+                            local _hr_color="${YELLOW}no${NC}"
+                            [[ "$_hr" == "yes" ]] && _hr_color="${GREEN}yes${NC}"
+                            local _comp_d=""
+                            if [[ -n "$_nc" ]]; then
+                                _comp_d="...${_nc: -16}"
+                            else
+                                _comp_d="${YELLOW}not stored${NC}"
+                            fi
+                            printf "  %-40s %5s %5s   %-20b ${GRAY}%s${NC}\n" \
+                                "${_nn:0:38}" "${_ni:-?}" "${_ne:-?}" "$_hr_color" "$_comp_d"
+                        done
+                        echo ""
+                        
+                        # Security Lists
+                        _ui_section "Security Lists in Cache"
+                        echo ""
+                        printf "  ${BOLD}%-50s %5s %5s   %s${NC}\n" "SL Name" "In" "Eg" "SL OCID (last 20)"
+                        print_separator 100
+                        for _sl in "${_sl_lines[@]}"; do
+                            local _sid _sn _si _se
+                            _sid="${_sl%%|*}"; _rest="${_sl#*|}"
+                            _sn="${_rest%%|*}"; _rest="${_rest#*|}"
+                            _si="${_rest%%|*}"; _se="${_rest#*|}"
+                            printf "  %-50s %5s %5s   ${GRAY}...%s${NC}\n" "${_sn:0:48}" "${_si:-?}" "${_se:-?}" "${_sid: -20}"
+                        done
+                        echo ""
+                        
+                        # Route Tables
+                        _ui_section "Route Tables in Cache"
+                        echo ""
+                        printf "  ${BOLD}%-50s %6s   %s${NC}\n" "RT Name" "Rules" "RT OCID (last 20)"
+                        print_separator 90
+                        for _rl in "${_rt_lines[@]}"; do
+                            local _rid _rn _rrc
+                            _rid="${_rl%%|*}"; _rest="${_rl#*|}"
+                            _rn="${_rest%%|*}"; _rrc="${_rest#*|}"
+                            printf "  %-50s %6s   ${GRAY}...%s${NC}\n" "${_rn:0:48}" "${_rrc:-?}" "${_rid: -20}"
+                        done
+                        echo ""
+                        
+                        # VCN → NSG Mappings
+                        _ui_section "VCN → NSG Mappings"
+                        echo ""
+                        for _ml in "${_map_lines[@]}"; do
+                            local _mtype="${_ml%%|*}"
+                            local _mrest="${_ml#*|}"
+                            case "$_mtype" in
+                                VCNNSG_HDR)
+                                    local _mvid="${_mrest%%|*}" _mvn="${_mrest#*|}"
+                                    echo -e "  ${WHITE}${_mvn}${NC} ${GRAY}(${_mvid})${NC}:"
+                                    ;;
+                                VCNNSG_ROW)
+                                    local _mnid="${_mrest%%|*}" _mninfo="${_mrest#*|}"
+                                    local _mnn _mni _mne _mnc
+                                    IFS='|' read -r _mnn _mni _mne _mnc <<< "$_mninfo"
+                                    local _mc_d=""
+                                    [[ -n "$_mnc" ]] && _mc_d="  comp: ...${_mnc: -12}"
+                                    printf "    ${GREEN}↳${NC} %-35s  ${CYAN}%s↓ %s↑${NC}${GRAY}%s${NC}\n" "${_mnn:-?}" "${_mni:-?}" "${_mne:-?}" "$_mc_d"
+                                    ;;
+                                VCNNSG_EMPTY)
+                                    echo -e "    ${YELLOW}(no NSGs found)${NC}"
+                                    ;;
+                            esac
+                        done
+                        echo ""
+                    }
+                    
                     _ui_pause
                 fi
                 ;;
@@ -17819,6 +19601,10 @@ drg_view_details() {
     
     # Try drg get with --region
     local drg_json
+    _drg_dbg_section "drg_view_details: ${drg_id} in $region"
+    _drg_dbg_cmd "DRG get" "oci network drg get --drg-id ${drg_id} --region $region"
+    _drg_dbg_comps "Search compartments" "${search_comps[@]}"
+    _warm_comp_name_cache
     drg_json=$(oci network drg get --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
     
     if [[ -z "$drg_json" || "$drg_json" == "null" ]] || ! jq -e '.data' <<< "$drg_json" >/dev/null 2>&1; then
@@ -17847,6 +19633,7 @@ drg_view_details() {
         # Redundancy
         local _lim_redund="N/A"
         local _lim_redund_json
+        _drg_dbg_cmd "Redundancy get (limited)" "oci network drg-redundancy-status get --drg-id ${drg_id} --region $region"
         _lim_redund_json=$(oci network drg-redundancy-status get --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$_lim_redund_json" ]] && jq -e '.data' <<< "$_lim_redund_json" >/dev/null 2>&1; then
             _lim_redund=$(jq -r '.data.status // "N/A"' <<< "$_lim_redund_json" 2>/dev/null)
@@ -17880,6 +19667,7 @@ drg_view_details() {
         # Redundancy status via dedicated API
         local drg_redund_status="N/A"
         local redund_json
+        _drg_dbg_cmd "Redundancy get (full)" "oci network drg-redundancy-status get --drg-id ${drg_id} --region $region"
         redund_json=$(oci network drg-redundancy-status get --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$redund_json" ]] && jq -e '.data' <<< "$redund_json" >/dev/null 2>&1; then
             drg_redund_status=$(jq -r '.data.status // "N/A"' <<< "$redund_json" 2>/dev/null)
@@ -18033,6 +19821,7 @@ drg_view_details() {
     local all_attach="[]"
     for comp in "${search_comps[@]}"; do
         local att_json
+        _drg_dbg_cmd "DRG att list (per comp)" "oci network drg-attachment list --compartment-id ${comp} --region $region"
         att_json=$(oci network drg-attachment list --compartment-id "$comp" --region "$region" --all --output json 2>/dev/null)
         if [[ -n "$att_json" ]] && jq -e '.data[0]' <<< "$att_json" >/dev/null 2>&1; then
             local filtered
@@ -18043,13 +19832,14 @@ drg_view_details() {
         fi
     done
     
-    # Fallback: if no attachments found via compartment search, try --drg-id directly
+    # Fallback: if no attachments found via compartment search, try DRG's own compartment
     local attach_count_check
     attach_count_check=$(jq 'length' <<< "$all_attach" 2>/dev/null || echo "0")
-    if [[ "$attach_count_check" -eq 0 ]]; then
-        echo -ne "\r  ${GRAY}Trying direct DRG query...${NC}                     "
+    if [[ "$attach_count_check" -eq 0 && -n "${drg_comp_id:-}" ]]; then
+        echo -ne "\r  ${GRAY}Trying DRG compartment query...${NC}                     "
         local drg_att_json
-        drg_att_json=$(oci network drg-attachment list --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null)
+        _drg_dbg_cmd "DRG att list (DRG comp fallback)" "oci network drg-attachment list --compartment-id ${drg_comp_id} --drg-id ${drg_id} --region $region"
+        drg_att_json=$(oci network drg-attachment list --compartment-id "$drg_comp_id" --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null)
         if [[ -n "$drg_att_json" ]] && jq -e '.data[0]' <<< "$drg_att_json" >/dev/null 2>&1; then
             all_attach=$(jq '.data // []' <<< "$drg_att_json" 2>/dev/null)
             
@@ -18188,9 +19978,10 @@ drg_view_details() {
     local all_rpcs="[]"
     for comp in "${connectivity_comps[@]}"; do
         local rpc_json
+        _drg_dbg_cmd "RPC list" "oci network remote-peering-connection list --compartment-id ${comp} --drg-id ${drg_id} --region $region"
         rpc_json=$(oci network remote-peering-connection list --compartment-id "$comp" --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$rpc_json" ]] && jq -e '.data[0]' <<< "$rpc_json" >/dev/null 2>&1; then
-            all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$rpc_json" 2>/dev/null)
+            all_rpcs=$(jq -n --argjson a "$all_rpcs" --argjson b "$(jq '.data' <<< "$rpc_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
         fi
     done
     
@@ -18232,6 +20023,7 @@ drg_view_details() {
                 
                 # Get remote RPC to find remote DRG
                 local remote_rpc_detail
+                _drg_dbg_cmd "Remote RPC get" "oci network remote-peering-connection get --remote-peering-connection-id ${peer_rpc_id} --region $peer_region"
                 remote_rpc_detail=$(oci network remote-peering-connection get \
                     --remote-peering-connection-id "$peer_id" --region "$peer_region" --output json 2>/dev/null)
                 
@@ -18243,6 +20035,7 @@ drg_view_details() {
                 
                 if [[ -n "$remote_drg_id" ]]; then
                     local remote_drg_json
+                    _drg_dbg_cmd "Remote DRG get" "oci network drg get --drg-id ${remote_drg_id} --region $peer_region"
                     remote_drg_json=$(oci network drg get --drg-id "$remote_drg_id" --region "$peer_region" --output json 2>/dev/null)
                     if [[ -n "$remote_drg_json" ]] && jq -e '.data' <<< "$remote_drg_json" >/dev/null 2>&1; then
                         local r_drg_name r_drg_state r_drg_comp
@@ -18258,10 +20051,17 @@ drg_view_details() {
                         [[ -n "$remote_rpc_comp" ]] && { local _a=0; for c in "${r_search[@]}"; do [[ "$c" == "$remote_rpc_comp" ]] && _a=1; done; [[ $_a -eq 0 ]] && r_search+=("$remote_rpc_comp"); }
                         [[ -n "$r_drg_comp" ]] && { local _a=0; for c in "${r_search[@]}"; do [[ "$c" == "$r_drg_comp" ]] && _a=1; done; [[ $_a -eq 0 ]] && r_search+=("$r_drg_comp"); }
                         
-                        # Remote VCN Attachments
-                        local r_att_json
-                        r_att_json=$(oci network drg-attachment list --drg-id "$remote_drg_id" --region "$peer_region" --all --output json 2>/dev/null)
-                        if [[ -n "$r_att_json" ]] && jq -e '.data[0]' <<< "$r_att_json" >/dev/null 2>&1; then
+                        # Remote VCN Attachments — search each compartment and merge
+                        local r_att_json="" _r_all_att="[]"
+                        for _rc in "${r_search[@]}"; do
+                            local _rc_att
+                            _rc_att=$(oci network drg-attachment list --compartment-id "$_rc" --drg-id "$remote_drg_id" --region "$peer_region" --all --output json 2>/dev/null)
+                            if [[ -n "$_rc_att" ]] && jq -e '.data[0]' <<< "$_rc_att" >/dev/null 2>&1; then
+                                _r_all_att=$(jq -n --argjson a "$_r_all_att" --argjson b "$(jq '.data' <<< "$_rc_att")" '$a + $b | unique_by(.id)' 2>/dev/null)
+                            fi
+                        done
+                        r_att_json="{\"data\": $_r_all_att}"
+                        if [[ $(jq '.data | length' <<< "$r_att_json" 2>/dev/null || echo "0") -gt 0 ]]; then
                             echo -e "      ${CYAN}VCN Attachments:${NC}"
                             while IFS='|' read -r ra_name ra_state ra_vcn_id ra_type; do
                                 [[ -z "$ra_name" ]] && continue
@@ -18327,7 +20127,7 @@ drg_view_details() {
                             local r_vpn_json
                             r_vpn_json=$(oci network ip-sec-connection list --compartment-id "$rc" --drg-id "$remote_drg_id" --region "$peer_region" --output json 2>/dev/null)
                             if [[ -n "$r_vpn_json" ]] && jq -e '.data[0]' <<< "$r_vpn_json" >/dev/null 2>&1; then
-                                r_all_vpn=$(jq -n --argjson a "$r_all_vpn" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$r_vpn_json" 2>/dev/null)
+                                r_all_vpn=$(jq -n --argjson a "$r_all_vpn" --argjson b "$(jq '.data' <<< "$r_vpn_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
                             fi
                         done
                         
@@ -18364,9 +20164,10 @@ drg_view_details() {
     local all_ipsec="[]"
     for comp in "${connectivity_comps[@]}"; do
         local ipsec_json
+        _drg_dbg_cmd "IPSec list" "oci network ip-sec-connection list --compartment-id ${comp} --drg-id ${drg_id} --region $region"
         ipsec_json=$(oci network ip-sec-connection list --compartment-id "$comp" --drg-id "$drg_id" --region "$region" --output json 2>/dev/null)
         if [[ -n "$ipsec_json" ]] && jq -e '.data[0]' <<< "$ipsec_json" >/dev/null 2>&1; then
-            all_ipsec=$(jq -n --argjson a "$all_ipsec" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$ipsec_json" 2>/dev/null)
+            all_ipsec=$(jq -n --argjson a "$all_ipsec" --argjson b "$(jq '.data' <<< "$ipsec_json")" '$a + $b | unique_by(.id)' 2>/dev/null)
         fi
     done
     
@@ -18422,6 +20223,7 @@ drg_view_details() {
     local all_fc="[]"
     for comp in "${connectivity_comps[@]}"; do
         local vc_json
+        _drg_dbg_cmd "FC VC list" "oci network virtual-circuit list --compartment-id ${comp} --region $region"
         vc_json=$(oci network virtual-circuit list --compartment-id "$comp" --region "$region" --output json 2>/dev/null)
         if [[ -n "$vc_json" ]] && jq -e '.data[0]' <<< "$vc_json" >/dev/null 2>&1; then
             local filtered
@@ -18636,6 +20438,7 @@ drg_view_details() {
     #==========================================================================
     _ui_section "DRG Route Tables & Route Rules"
     local drt_json
+    _drg_dbg_cmd "DRG RT list" "oci network drg-route-table list --drg-id ${drg_id} --region $region"
     drt_json=$(oci network drg-route-table list --drg-id "$drg_id" --region "$region" --all --output json 2>/dev/null)
     
     local drt_count=0
@@ -19094,7 +20897,7 @@ drg_query_remote_region() {
         local remote_drg_json
         remote_drg_json=$(oci network drg list --compartment-id "$qc" --region "$target_region" --output json 2>/dev/null)
         if [[ -n "$remote_drg_json" ]] && jq -e '.data[0]' <<< "$remote_drg_json" >/dev/null 2>&1; then
-            all_remote_drgs=$(jq -n --argjson a "$all_remote_drgs" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$remote_drg_json" )
+            all_remote_drgs=$(jq -n --argjson a "$all_remote_drgs" --argjson b "$(jq '.data' <<< "$remote_drg_json")" '$a + $b | unique_by(.id)' )
         fi
     done
     
@@ -19168,7 +20971,7 @@ drg_query_remote_region() {
             local rpc_json
             rpc_json=$(oci network remote-peering-connection list --compartment-id "$qc" --drg-id "$drg_id" --region "$target_region" --output json 2>/dev/null)
             if [[ -n "$rpc_json" ]] && jq -e '.data[0]' <<< "$rpc_json" > /dev/null 2>&1; then
-                all_rpc_remote=$(jq -n --argjson a "$all_rpc_remote" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$rpc_json" )
+                all_rpc_remote=$(jq -n --argjson a "$all_rpc_remote" --argjson b "$(jq '.data' <<< "$rpc_json")" '$a + $b | unique_by(.id)' )
             fi
         done
         
@@ -19190,11 +20993,18 @@ drg_query_remote_region() {
             done < <(jq -r '.[] | "\(.["display-name"])|\(.["peer-region-name"] // "null")|\(.["peering-status"])"' <<< "$all_rpc_remote" 2>/dev/null)
         fi
         
-        # Get VCN attachments (try --drg-id first, then compartment search)
-        local attach_json
-        attach_json=$(oci network drg-attachment list --drg-id "$drg_id" --region "$target_region" --all --output json 2>/dev/null)
+        # Get VCN attachments (search DRG compartment + known compartments)
+        local attach_json _all_disc_att="[]"
+        for _dsc in "${drg_search_comps[@]}"; do
+            local _dsc_att
+            _dsc_att=$(oci network drg-attachment list --compartment-id "$_dsc" --drg-id "$drg_id" --region "$target_region" --all --output json 2>/dev/null)
+            if [[ -n "$_dsc_att" ]] && jq -e '.data[0]' <<< "$_dsc_att" >/dev/null 2>&1; then
+                _all_disc_att=$(jq -n --argjson a "$_all_disc_att" --argjson b "$(jq '.data' <<< "$_dsc_att")" '$a + $b | unique_by(.id)' 2>/dev/null)
+            fi
+        done
+        attach_json="{\"data\": $_all_disc_att}"
         
-        if [[ -n "$attach_json" ]] && jq -e '.data[0]' <<< "$attach_json" > /dev/null 2>&1; then
+        if [[ $(jq '.data | length' <<< "$attach_json" 2>/dev/null || echo "0") -gt 0 ]] && jq -e '.data[0]' <<< "$attach_json" > /dev/null 2>&1; then
             echo -e "    ${CYAN}VCN Attachments:${NC}"
             while IFS='|' read -r att_name att_state vcn_id att_type; do
                 [[ -z "$att_name" ]] && continue
@@ -19251,7 +21061,7 @@ drg_query_remote_region() {
             local vpn_json
             vpn_json=$(oci network ip-sec-connection list --compartment-id "$qc" --drg-id "$drg_id" --region "$target_region" --output json 2>/dev/null)
             if [[ -n "$vpn_json" ]] && jq -e '.data[0]' <<< "$vpn_json" > /dev/null 2>&1; then
-                all_vpn_remote=$(jq -n --argjson a "$all_vpn_remote" --argjson b "$(jq '.data')" '$a + $b | unique_by(.id)' <<< "$vpn_json" )
+                all_vpn_remote=$(jq -n --argjson a "$all_vpn_remote" --argjson b "$(jq '.data' <<< "$vpn_json")" '$a + $b | unique_by(.id)' )
             fi
         done
         
@@ -19845,12 +21655,12 @@ view_network_resource_detail() {
                                 fi
                             done
                             
-                            # Fallback: try --drg-id directly
+                            # Fallback: try DRG's own compartment
                             local att_count
                             att_count=$(jq 'length' <<< "$all_drg_atts" 2>/dev/null || echo "0")
-                            if [[ "$att_count" -eq 0 ]]; then
+                            if [[ "$att_count" -eq 0 && -n "$gw_compartment" && "$gw_compartment" != "N/A" ]]; then
                                 local _drg_att_fb
-                                _drg_att_fb=$(oci network drg-attachment list --drg-id "$gw_ocid" --region "$_drg_region" --all --output json 2>/dev/null)
+                                _drg_att_fb=$(oci network drg-attachment list --compartment-id "$gw_compartment" --drg-id "$gw_ocid" --region "$_drg_region" --all --output json 2>/dev/null)
                                 if [[ -n "$_drg_att_fb" ]] && jq -e '.data[0]' <<< "$_drg_att_fb" >/dev/null 2>&1; then
                                     all_drg_atts=$(jq '.data // []' <<< "$_drg_att_fb" 2>/dev/null)
                                     att_count=$(jq 'length' <<< "$all_drg_atts" 2>/dev/null || echo "0")
@@ -20232,14 +22042,19 @@ view_network_resource_detail() {
                             # Build attachment name lookup (for next-hop resolution)
                             declare -A _GA_ATT_NAMES
                             if [[ "$gw_drg_id" != "N/A" && -n "$gw_drg_id" ]]; then
-                                local _ga_att_list
-                                _ga_att_list=$(oci network drg-attachment list --drg-id "$gw_drg_id" --region "$_drg_region" --all --output json 2>/dev/null)
-                                if [[ -n "$_ga_att_list" ]] && jq -e '.data[0]' <<< "$_ga_att_list" >/dev/null 2>&1; then
-                                    while IFS='|' read -r _gai _gan; do
-                                        [[ -z "$_gai" ]] && continue
-                                        _GA_ATT_NAMES[$_gai]="$_gan"
-                                    done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "N/A")"' <<< "$_ga_att_list" 2>/dev/null)
-                                fi
+                                local _ga_att_comp="${_gd_comp:-${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}}"
+                                local _ga_att_list _ga_all_att="[]"
+                                for _gac in "$_ga_att_comp" "${NETWORK_COMPARTMENT_ID:-}" "${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"; do
+                                    [[ -z "$_gac" ]] && continue
+                                    _ga_att_list=$(oci network drg-attachment list --compartment-id "$_gac" --drg-id "$gw_drg_id" --region "$_drg_region" --all --output json 2>/dev/null)
+                                    if [[ -n "$_ga_att_list" ]] && jq -e '.data[0]' <<< "$_ga_att_list" >/dev/null 2>&1; then
+                                        _ga_all_att=$(jq -n --argjson a "$_ga_all_att" --argjson b "$(jq '.data' <<< "$_ga_att_list")" '$a + $b | unique_by(.id)' 2>/dev/null)
+                                    fi
+                                done
+                                while IFS='|' read -r _gai _gan; do
+                                    [[ -z "$_gai" ]] && continue
+                                    _GA_ATT_NAMES[$_gai]="$_gan"
+                                done < <(jq -r '.[] | "\(.id)|\(.["display-name"] // "N/A")"' <<< "$_ga_all_att" 2>/dev/null)
                             fi
                             
                             # DRG Route Table + rules + distributions
@@ -20817,18 +22632,7 @@ _compute_search_properties() {
         return
     fi
     
-    # Resolve nodepool names once
-    declare -A _PROP_NP_CACHE=()
-    local np_ocids
-    np_ocids=$(awk -F'|' '{print $13}' "$tmp_data" | grep '^ocid1.nodepool\.' | sort -u)
-    if [[ -n "$np_ocids" ]]; then
-        while read -r np_ocid; do
-            [[ -z "$np_ocid" ]] && continue
-            local np_name
-            np_name=$(oci ce node-pool get --node-pool-id "$np_ocid" --region "${EFFECTIVE_REGION:-$REGION}" --query 'data.name' --raw-output 2>/dev/null)
-            [[ -n "$np_name" && "$np_name" != "null" ]] && _PROP_NP_CACHE["$np_ocid"]="$np_name"
-        done <<< "$np_ocids"
-    fi
+    # Uses CREATED_BY_NAME_CACHE from parent scope (display_instances_properties_view)
     
     while true; do
         echo ""
@@ -20845,16 +22649,12 @@ _compute_search_properties() {
         # For CreatedBy columns, we need to also search the resolved names
         # Build an augmented version: original line + resolved created_by appended
         local augmented_data=""
-        augmented_data=$(while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp; do
+        augmented_data=$(while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name created_by created_on ci_fp; do
             local resolved_by="$created_by"
-            if [[ "$created_by" == ocid1.instance.* ]]; then
-                local rn
-                rn=$(jq -r --arg id "$created_by" '.data[] | select(.id == $id) | .["display-name"] // empty' <<< "$instances_json" 2>/dev/null)
-                [[ -n "$rn" ]] && resolved_by="$rn"
-            elif [[ "$created_by" == ocid1.nodepool.* && -n "${_PROP_NP_CACHE[$created_by]:-}" ]]; then
-                resolved_by="${_PROP_NP_CACHE[$created_by]}"
+            if [[ "$created_by" == ocid1.* && -n "${CREATED_BY_NAME_CACHE[$created_by]+x}" ]]; then
+                resolved_by="${CREATED_BY_NAME_CACHE[$created_by]}"
             fi
-            echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${launch_mode}|${created_by}|${created_on}|${ci_fp}|${resolved_by}"
+            echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${created_by}|${created_on}|${ci_fp}|${resolved_by}"
         done < <(sort -t'|' -k1,1 "$tmp_data"))
         
         # Filter matching lines (search against augmented data including resolved names)
@@ -20873,11 +22673,11 @@ _compute_search_properties() {
             continue
         fi
         
-        printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s${NC}\n" \
-            "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "LaunchMode" "CreatedBy" "CreatedOn" "CI"
-        print_separator 325
+        printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-50s %-10s %-7s${NC}\n" \
+            "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "CreatedBy" "CreatedOn" "CI"
+        print_separator 307
         
-        echo "$matched_lines" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp resolved_by; do
+        echo "$matched_lines" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name created_by created_on ci_fp resolved_by; do
             [[ -z "$name" ]] && continue
             
             local gpu_disp="$gpus"
@@ -20889,8 +22689,8 @@ _compute_search_properties() {
             
             # Build plain-text row
             local row
-            row=$(printf "%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s" \
-                "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$launch_mode" "$created_by_display" "$created_on" "$ci_fp")
+            row=$(printf "%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-50s %-10s %-7s" \
+                "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$created_by_display" "$created_on" "$ci_fp")
             
             # Apply BG_YELLOW highlight to matching text (case-insensitive)
             local highlighted
@@ -22835,86 +24635,125 @@ display_instances_properties_view() {
     unique_images=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .["image-id"] // empty' <<< "$instances_json" | sort -u | grep -v '^$' )
     unique_instances=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | "\(.id)|\(.["availability-domain"])"' <<< "$instances_json")
     
-    # ========== PARALLEL BOOT VOLUME FETCHING ==========
+    # ========== PARALLEL BOOT VOLUME FETCHING (OPTIMIZED: bulk per-AD) ==========
     if [[ "$bv_cache_valid" == "true" ]]; then
         echo -e "  ${GREEN}✓${NC} Using cached boot volume data"
     else
-        # Create temp directory for parallel results
         local tmp_bv_dir="${TEMP_DIR}/bv_fetch_$$"
         mkdir -p "$tmp_bv_dir"
         
-        local bv_count=0
         local bv_total
         bv_total=$(echo "$unique_instances" | grep -c . 2>/dev/null) || bv_total=0
         [[ ! "$bv_total" =~ ^[0-9]+$ ]] && bv_total=0
         
-        # Start progress bar
-        show_parallel_progress "$tmp_bv_dir" "*" "$bv_total" "boot volumes" &
-        local _bv_progress_pid=$!
+        # Step 1: Get unique ADs and bulk-fetch all boot-volume-attachments per AD (1 call per AD instead of N)
+        local unique_ads
+        unique_ads=$(echo "$unique_instances" | cut -d'|' -f2 | sort -u)
+        local ad_count=0
+        local ad_total
+        ad_total=$(echo "$unique_ads" | grep -c . 2>/dev/null) || ad_total=0
         
-        # Fetch boot volume attachments and details in parallel
-        local _bv_pids=()
-        while IFS='|' read -r inst_ocid inst_ad; do
-            [[ -z "$inst_ocid" ]] && continue
+        echo -e "  ${CYAN}⟳${NC} Fetching boot volume attachments (${ad_total} ADs, bulk mode)..."
+        
+        # Parallel fetch per AD
+        while IFS= read -r ad; do
+            [[ -z "$ad" ]] && continue
+            oci compute boot-volume-attachment list \
+                --compartment-id "$compartment_id" \
+                --availability-domain "$ad" \
+                --all --output json > "${tmp_bv_dir}/ad_${ad_count}.json" 2>/dev/null &
+            ((ad_count++))
+        done <<< "$unique_ads"
+        wait
+        
+        # Build instance → boot-volume-id map from bulk results
+        declare -A _inst_bv_map=()
+        declare -A _unique_bv_ids=()
+        local _ad_i=0
+        while IFS= read -r ad; do
+            [[ -z "$ad" ]] && continue
+            local _ad_file="${tmp_bv_dir}/ad_${_ad_i}.json"
+            if [[ -f "$_ad_file" && -s "$_ad_file" ]]; then
+                while IFS='|' read -r _att_inst _att_bv _att_state; do
+                    [[ -z "$_att_inst" || -z "$_att_bv" ]] && continue
+                    [[ "$_att_state" == "DETACHED" || "$_att_state" == "DETACHING" ]] && continue
+                    _inst_bv_map[$_att_inst]="$_att_bv"
+                    _unique_bv_ids[$_att_bv]=1
+                done < <(jq -r '.data[]? | "\(.["instance-id"] // "")|\(.["boot-volume-id"] // "")|\(.["lifecycle-state"] // "")"' "$_ad_file" 2>/dev/null)
+            fi
+            ((_ad_i++))
+        done <<< "$unique_ads"
+        
+        local bv_mapped=${#_inst_bv_map[@]}
+        local bv_unique=${#_unique_bv_ids[@]}
+        echo -e "  ${GREEN}✓${NC} Mapped ${bv_mapped}/${bv_total} instances → ${bv_unique} unique boot volumes"
+        
+        # Step 2: Parallel fetch unique boot volume details (size + VPUs)
+        if [[ $bv_unique -gt 0 ]]; then
+            local _bv_detail_dir="${tmp_bv_dir}/details"
+            mkdir -p "$_bv_detail_dir"
             
-            # Run in background
-            (
-                # Get boot volume attachment - try with instance's compartment first
-                local bv_attach_json
-                bv_attach_json=$(oci compute boot-volume-attachment list \
-                    --compartment-id "$compartment_id" \
-                    --availability-domain "$inst_ad" \
-                    --instance-id "$inst_ocid" \
-                    --output json 2>/dev/null)
-                
-                local bv_id
-                bv_id=$(jq -r '.data[0]["boot-volume-id"] // empty' <<< "$bv_attach_json" 2>/dev/null)
-                
-                if [[ -n "$bv_id" && "$bv_id" != "null" && "$bv_id" != "None" && "$bv_id" != "" ]]; then
-                    # Get boot volume details using size-in-gbs and vpus-per-gb
+            show_parallel_progress "$_bv_detail_dir" "*" "$bv_unique" "boot volumes" &
+            local _bv_progress_pid=$!
+            
+            local _bv_pids=()
+            local _bv_batch=0
+            local _bv_max_parallel=20
+            for bv_id in "${!_unique_bv_ids[@]}"; do
+                [[ -z "$bv_id" ]] && continue
+                (
                     local bv_json
                     bv_json=$(oci bv boot-volume get --boot-volume-id "$bv_id" --output json 2>/dev/null)
-                    
                     if [[ -n "$bv_json" ]]; then
                         local bv_size bv_vpus
                         bv_size=$(jq -r '.data["size-in-gbs"] // empty' <<< "$bv_json" 2>/dev/null)
                         bv_vpus=$(jq -r '.data["vpus-per-gb"] // empty' <<< "$bv_json" 2>/dev/null)
-                        
-                        # Only write if we got values
                         if [[ -n "$bv_size" && "$bv_size" != "null" ]]; then
                             [[ -z "$bv_vpus" || "$bv_vpus" == "null" ]] && bv_vpus="-"
-                            echo "${inst_ocid}|${bv_size}|${bv_vpus}" > "${tmp_bv_dir}/${inst_ocid##*.}"
+                            echo "${bv_id}|${bv_size}|${bv_vpus}" > "${_bv_detail_dir}/${bv_id##*.}"
                         fi
                     fi
+                ) &
+                _bv_pids+=($!)
+                ((_bv_batch++))
+                if (( _bv_batch % _bv_max_parallel == 0 )); then
+                    wait "${_bv_pids[@]}" 2>/dev/null
+                    _bv_pids=()
                 fi
-            ) &
-            _bv_pids+=($!)
+            done
+            [[ ${#_bv_pids[@]} -gt 0 ]] && wait "${_bv_pids[@]}" 2>/dev/null
             
-            ((bv_count++))
+            kill "$_bv_progress_pid" 2>/dev/null
+            wait "$_bv_progress_pid" 2>/dev/null
+            printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) boot volumes \n" "$bv_unique" "$bv_unique"
             
-            # Limit parallel jobs (wait for current batch, not progress bar)
-            if (( bv_count % max_parallel == 0 )); then
-                wait "${_bv_pids[@]}" 2>/dev/null
-                _bv_pids=()
+            # Build BV detail map
+            declare -A _bv_detail_map=()
+            if ls "${_bv_detail_dir}"/* >/dev/null 2>&1; then
+                while IFS='|' read -r _bvd_id _bvd_size _bvd_vpus; do
+                    [[ -n "$_bvd_id" ]] && _bv_detail_map[$_bvd_id]="${_bvd_size}|${_bvd_vpus}"
+                done < <(cat "${_bv_detail_dir}"/* 2>/dev/null)
             fi
-        done <<< "$unique_instances"
-        
-        # Wait for remaining worker jobs only
-        [[ ${#_bv_pids[@]} -gt 0 ]] && wait "${_bv_pids[@]}" 2>/dev/null
-        
-        # Stop progress bar
-        kill "$_bv_progress_pid" 2>/dev/null
-        wait "$_bv_progress_pid" 2>/dev/null
-        printf "\r  ${GREEN}✓${NC} [████████████████████] 100%% (%d/%d) boot volumes \n" "$bv_total" "$bv_total"
-        
-        # Consolidate results into cache
-        if [[ -d "$tmp_bv_dir" ]] && ls "${tmp_bv_dir}"/* >/dev/null 2>&1; then
-            cat "${tmp_bv_dir}"/* > "$BOOT_VOLUME_CACHE" 2>/dev/null
-            local cached_count
-            cached_count=$(wc -l < "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)
-            echo -e "${GREEN}  Cached ${cached_count} boot volumes${NC}"
+            
+            # Step 3: Write per-instance cache (instance_id|size|vpus)
+            local _bv_cache_tmp="${tmp_bv_dir}/cache_out"
+            for inst_id in "${!_inst_bv_map[@]}"; do
+                local _bv_id="${_inst_bv_map[$inst_id]}"
+                if [[ -n "${_bv_detail_map[$_bv_id]+x}" ]]; then
+                    echo "${inst_id}|${_bv_detail_map[$_bv_id]}" >> "$_bv_cache_tmp"
+                fi
+            done
+            
+            if [[ -f "$_bv_cache_tmp" && -s "$_bv_cache_tmp" ]]; then
+                mv "$_bv_cache_tmp" "$BOOT_VOLUME_CACHE"
+                local cached_count
+                cached_count=$(wc -l < "$BOOT_VOLUME_CACHE" 2>/dev/null || echo 0)
+                echo -e "${GREEN}  Cached ${cached_count} boot volumes${NC}"
+            else
+                echo -e "${YELLOW}  No boot volume data retrieved${NC}"
+            fi
         else
-            echo -e "${YELLOW}  No boot volume data retrieved${NC}"
+            echo -e "${YELLOW}  No boot volume attachments found${NC}"
         fi
         rm -rf "$tmp_bv_dir"
     fi
@@ -23012,7 +24851,7 @@ display_instances_properties_view() {
     fi
     
     # Process each instance using cached data
-    while IFS='|' read -r ocid name state shape ocpus memory gpus net_bw max_vnics ad image_id launch_mode user_data created_by created_on; do
+    while IFS='|' read -r ocid name state shape ocpus memory gpus net_bw max_vnics ad image_id user_data created_by created_on; do
         [[ -z "$ocid" ]] && continue
         
         # Get boot volume from cache - use size-in-gbs and vpus-per-gb values
@@ -23040,7 +24879,6 @@ display_instances_properties_view() {
         [[ "$gpus" == "null" || -z "$gpus" ]] && gpus="0"
         [[ "$net_bw" == "null" || -z "$net_bw" ]] && net_bw="-"
         [[ "$max_vnics" == "null" || -z "$max_vnics" ]] && max_vnics="-"
-        [[ "$launch_mode" == "null" || -z "$launch_mode" ]] && launch_mode="-"
         [[ "$created_by" == "null" || -z "$created_by" ]] && created_by="-"
         [[ "$created_on" == "null" || -z "$created_on" ]] && created_on="-"
         
@@ -23048,12 +24886,12 @@ display_instances_properties_view() {
         [[ "$created_on" != "-" ]] && created_on="${created_on:0:10}"
         
         # Store data
-        echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${launch_mode}|${created_by}|${created_on}|${ci_fp}" >> "$tmp_data"
+        echo "${name}|${state}|${shape}|${ocpus}|${memory}|${gpus}|${net_bw}|${max_vnics}|${bv_size}|${bv_vpus}|${image_name}|${created_by}|${created_on}|${ci_fp}" >> "$tmp_data"
         
     done < <(jq -r ' 
         .data[] | 
         select(.["lifecycle-state"] != "TERMINATED") |
-        "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["shape-config"]["ocpus"] // "")|\(.["shape-config"]["memory-in-gbs"] // "")|\(.["shape-config"]["gpus"] // "0")|\(.["shape-config"]["networking-bandwidth-in-gbps"] // "")|\(.["shape-config"]["max-vnic-attachments"] // "")|\(.["availability-domain"])|\(.["image-id"] // "")|\(.["launch-mode"] // "")|\(.metadata.user_data // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedBy"] // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedOn"] // "")"
+        "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])|\(.shape)|\(.["shape-config"]["ocpus"] // "")|\(.["shape-config"]["memory-in-gbs"] // "")|\(.["shape-config"]["gpus"] // "0")|\(.["shape-config"]["networking-bandwidth-in-gbps"] // "")|\(.["shape-config"]["max-vnic-attachments"] // "")|\(.["availability-domain"])|\(.["image-id"] // "")|\(.metadata.user_data // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedBy"] // "")|\(.["defined-tags"]["Oracle-Tags"]["CreatedOn"] // "")"
     ' <<< "$instances_json" 2>/dev/null)
     
     if [[ ! -f "$tmp_data" ]]; then
@@ -23062,32 +24900,106 @@ display_instances_properties_view() {
         return
     fi
     
-    # Build nodepool name cache: resolve unique ocid1.nodepool OCIDs from CreatedBy
-    declare -A NODEPOOL_NAME_CACHE=()
-    local np_ocids
-    np_ocids=$(awk -F'|' '{print $13}' "$tmp_data" | grep '^ocid1.nodepool\.' | sort -u)
-    if [[ -n "$np_ocids" ]]; then
-        local np_count
-        np_count=$(echo "$np_ocids" | wc -l)
-        echo -e "${GRAY}Resolving ${np_count} nodepool name(s)...${NC}"
-        while read -r np_ocid; do
-            [[ -z "$np_ocid" ]] && continue
-            local np_name
-            np_name=$(oci ce node-pool get --node-pool-id "$np_ocid" --region "$region" --query 'data.name' --raw-output 2>/dev/null)
-            if [[ -n "$np_name" && "$np_name" != "null" ]]; then
-                NODEPOOL_NAME_CACHE["$np_ocid"]="$np_name"
+    # Build OCID name cache: resolve all unique OCIDs from CreatedBy field in parallel
+    declare -A CREATED_BY_NAME_CACHE=()
+    local _all_ocids
+    _all_ocids=$(awk -F'|' '$12 ~ /^ocid1\./' "$tmp_data" | cut -d'|' -f12 | sort -u)
+    if [[ -n "$_all_ocids" ]]; then
+        local _ocid_count
+        _ocid_count=$(echo "$_all_ocids" | wc -l)
+        echo -e "${GRAY}Resolving ${_ocid_count} resource name(s) from CreatedBy OCIDs...${NC}"
+        
+        # Pre-resolve ocid1.instance from instances_json (no API calls needed)
+        while IFS= read -r _oid; do
+            [[ -z "$_oid" ]] && continue
+            if [[ "$_oid" == ocid1.instance.* ]]; then
+                local _iname
+                _iname=$(jq -r --arg id "$_oid" '.data[] | select(.id == $id) | .["display-name"] // empty' <<< "$instances_json" 2>/dev/null)
+                [[ -n "$_iname" ]] && CREATED_BY_NAME_CACHE["$_oid"]="$_iname"
             fi
-        done <<< "$np_ocids"
+        done <<< "$_all_ocids"
+        
+        # Parallel resolve remaining OCIDs by type
+        local _resolve_dir="${TEMP_DIR}/createdby_resolve_$$"
+        mkdir -p "$_resolve_dir"
+        local _resolve_pids=()
+        local _resolve_batch=0
+        local _resolve_max=15
+        
+        while IFS= read -r _oid; do
+            [[ -z "$_oid" ]] && continue
+            # Skip already resolved
+            [[ -n "${CREATED_BY_NAME_CACHE[$_oid]+x}" ]] && continue
+            
+            (
+                local _rname=""
+                case "$_oid" in
+                    ocid1.user.*)
+                        _rname=$(oci iam user get --user-id "$_oid" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.nodepool.*)
+                        _rname=$(oci ce node-pool get --node-pool-id "$_oid" --region "$region" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.instancepool.*)
+                        _rname=$(oci compute-management instance-pool get --instance-pool-id "$_oid" --query 'data."display-name"' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.cluster.*)
+                        _rname=$(oci ce cluster get --cluster-id "$_oid" --region "$region" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.saml2idp.*)
+                        _rname=$(oci iam identity-provider get --identity-provider-id "$_oid" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.group.*)
+                        _rname=$(oci iam group get --group-id "$_oid" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.dynamicgroup.*)
+                        _rname=$(oci iam dynamic-group get --dynamic-group-id "$_oid" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    ocid1.compartment.*)
+                        _rname=$(oci iam compartment get --compartment-id "$_oid" --query 'data.name' --raw-output 2>/dev/null)
+                        ;;
+                    *)
+                        # Generic: try extracting resource type and using a get call
+                        # For unknown types, just keep the OCID
+                        _rname=""
+                        ;;
+                esac
+                if [[ -n "$_rname" && "$_rname" != "null" && "$_rname" != "None" ]]; then
+                    echo "$_rname" > "${_resolve_dir}/${_oid##*.}"
+                fi
+            ) &
+            _resolve_pids+=($!)
+            ((_resolve_batch++))
+            if (( _resolve_batch % _resolve_max == 0 )); then
+                wait "${_resolve_pids[@]}" 2>/dev/null
+                _resolve_pids=()
+            fi
+        done <<< "$_all_ocids"
+        [[ ${#_resolve_pids[@]} -gt 0 ]] && wait "${_resolve_pids[@]}" 2>/dev/null
+        
+        # Load resolved names into cache
+        while IFS= read -r _oid; do
+            [[ -z "$_oid" ]] && continue
+            [[ -n "${CREATED_BY_NAME_CACHE[$_oid]+x}" ]] && continue
+            local _rf="${_resolve_dir}/${_oid##*.}"
+            if [[ -f "$_rf" && -s "$_rf" ]]; then
+                CREATED_BY_NAME_CACHE["$_oid"]=$(cat "$_rf")
+            fi
+        done <<< "$_all_ocids"
+        rm -rf "$_resolve_dir" 2>/dev/null
+        
+        local _resolved_ct=${#CREATED_BY_NAME_CACHE[@]}
+        echo -e "  ${GREEN}✓${NC} Resolved ${_resolved_ct}/${_ocid_count} OCID(s) to names"
     fi
     
     # Display header
     echo ""
-    printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-18s %-50s %-10s %-7s${NC}\n" \
-        "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "LaunchMode" "CreatedBy" "CreatedOn" "CI"
-    print_separator 325
+    printf "${BOLD}%-35s %-8s %-22s %5s %6s %3s %6s %4s %5s %4s %-105s %-50s %-10s %-7s${NC}\n" \
+        "Display Name" "State" "Shape" "OCPUs" "Mem" "GPU" "NetBW" "VNIC" "BV GB" "VPUs" "Image Name" "CreatedBy" "CreatedOn" "CI"
+    print_separator 307
     
     # Display data sorted by name
-    sort -t'|' -k1,1 "$tmp_data" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name launch_mode created_by created_on ci_fp; do
+    sort -t'|' -k1,1 "$tmp_data" | while IFS='|' read -r name state shape ocpus memory gpus net_bw max_vnics bv_size bv_vpus image_name created_by created_on ci_fp; do
         # Color state
         local state_color="$GREEN"
         case "$state" in
@@ -23106,27 +25018,18 @@ display_instances_properties_view() {
         local name_t="${name:0:35}"
         local shape_t="${shape:0:22}"
         
-        # Resolve CreatedBy: if ocid1.instance, look up display name from instances_json
-        # If ocid1.nodepool, look up display name from nodepool cache
+        # Resolve CreatedBy: use unified OCID name cache
         local created_by_display="$created_by"
-        if [[ "$created_by" == ocid1.instance.* ]]; then
-            local resolved_name
-            resolved_name=$(jq -r --arg id "$created_by" '.data[] | select(.id == $id) | .["display-name"] // empty' <<< "$instances_json" 2>/dev/null)
-            if [[ -n "$resolved_name" ]]; then
-                created_by_display="$resolved_name"
-            fi
-        elif [[ "$created_by" == ocid1.nodepool.* ]]; then
-            if [[ -n "${NODEPOOL_NAME_CACHE[$created_by]:-}" ]]; then
-                created_by_display="${NODEPOOL_NAME_CACHE[$created_by]}"
-            fi
+        if [[ "$created_by" == ocid1.* && -n "${CREATED_BY_NAME_CACHE[$created_by]+x}" ]]; then
+            created_by_display="${CREATED_BY_NAME_CACHE[$created_by]}"
         fi
         
-        printf "%-35s ${state_color}%-8s${NC} ${CYAN}%-22s${NC} %5s %6s ${GREEN}%3s${NC} %6s %4s %5s %4s %-105s %-18s ${BLUE}%-50s${NC} ${GRAY}%-10s${NC} ${MAGENTA}%-7s${NC}\n" \
-            "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$launch_mode" "$created_by_display" "$created_on" "$ci_fp"
+        printf "%-35s ${state_color}%-8s${NC} ${CYAN}%-22s${NC} %5s %6s ${GREEN}%3s${NC} %6s %4s %5s %4s %-105s ${BLUE}%-50s${NC} ${GRAY}%-10s${NC} ${MAGENTA}%-7s${NC}\n" \
+            "$name_t" "$state" "$shape_t" "$ocpus" "$memory" "$gpu_disp" "$net_bw" "$max_vnics" "$bv_size" "$bv_vpus" "$image_name" "$created_by_display" "$created_on" "$ci_fp"
     done
     
     echo ""
-    print_separator 325
+    print_separator 307
     echo ""
     
     echo -e "${BOLD}${WHITE}Options:${NC}"
@@ -23154,7 +25057,6 @@ display_instances_properties_view() {
             echo -e "  ${WHITE}VNIC${NC}       - Max VNIC attachments (shape-config.max-vnic-attachments)"
             echo -e "  ${WHITE}BV GB${NC}      - Boot Volume size in GB (boot-volume.size-in-gbs)"
             echo -e "  ${WHITE}VPUs${NC}       - Boot Volume VPUs/GB (boot-volume.vpus-per-gb) [10=Balanced, 20=Higher, 30+=Ultra]"
-            echo -e "  ${WHITE}LaunchMode${NC} - NATIVE, EMULATED, PARAVIRTUALIZED, or CUSTOM (instance.launch-mode)"
             echo -e "  ${BLUE}CreatedBy${NC}  - Oracle-Tags CreatedBy (defined-tags.Oracle-Tags.CreatedBy)"
             echo -e "  ${GRAY}CreatedOn${NC}  - Oracle-Tags CreatedOn date (defined-tags.Oracle-Tags.CreatedOn)"
             echo -e "  ${WHITE}CI${NC}         - Cloud-Init fingerprint (last 7 chars of metadata.user_data)"
@@ -29895,7 +31797,7 @@ rm_show_stack_detail() {
         .["terraform-version"] // "N/A",
         .description // "N/A",
         .["time-created"] // "N/A",
-        .["config-source"].["config-source-type"] // "N/A",
+        .["config-source"]["config-source-type"] // "N/A",
         .["config-source"]["working-directory"] // "N/A"
     ] | @tsv' <<< "$stack_json")
     
@@ -34810,6 +36712,68 @@ _ct_highlight_text() {
 }
 
 #--------------------------------------------------------------------------------
+# Capacity Topology - Resolve instance OCIDs to display names
+# Populates global CT_INST_NAMES associative array
+# Args: $1 = file or "-" for stdin with cache-format lines
+#--------------------------------------------------------------------------------
+_ct_resolve_instance_names() {
+    local source="$1"
+    declare -gA CT_INST_NAMES=()
+    
+    # Collect unique non-N/A instance OCIDs
+    local _ocids
+    if [[ "$source" == "-" ]]; then
+        _ocids=$(cat | cut -d'|' -f1 | grep '^ocid1\.instance\.' | sort -u)
+    else
+        _ocids=$(grep -v "^#" "$source" | cut -d'|' -f1 | grep '^ocid1\.instance\.' | sort -u)
+    fi
+    
+    [[ -z "$_ocids" ]] && return 0
+    
+    local _count
+    _count=$(echo "$_ocids" | wc -l)
+    echo -ne "  ${GRAY}Resolving ${_count} instance name(s)...${NC}"
+    
+    local _resolve_dir
+    _resolve_dir=$(mktemp -d "${TEMP_DIR}/ct_inst_resolve.XXXXXX")
+    local _pids=() _batch=0 _max_par=15
+    local _region="${EFFECTIVE_REGION:-$REGION}"
+    
+    while IFS= read -r _oid; do
+        [[ -z "$_oid" ]] && continue
+        (
+            local _name
+            _name=$(oci compute instance get --instance-id "$_oid" --region "$_region" \
+                --query 'data."display-name"' --raw-output 2>/dev/null)
+            if [[ -n "$_name" && "$_name" != "null" && "$_name" != "None" ]]; then
+                echo "$_name" > "${_resolve_dir}/${_oid##*.}"
+            fi
+        ) &
+        _pids+=($!)
+        ((_batch++))
+        if (( _batch % _max_par == 0 )); then
+            wait "${_pids[@]}" 2>/dev/null
+            _pids=()
+        fi
+    done <<< "$_ocids"
+    [[ ${#_pids[@]} -gt 0 ]] && wait "${_pids[@]}" 2>/dev/null
+    
+    # Load results
+    local _resolved=0
+    while IFS= read -r _oid; do
+        [[ -z "$_oid" ]] && continue
+        local _rf="${_resolve_dir}/${_oid##*.}"
+        if [[ -f "$_rf" && -s "$_rf" ]]; then
+            CT_INST_NAMES["$_oid"]=$(cat "$_rf")
+            ((_resolved++))
+        fi
+    done <<< "$_ocids"
+    rm -rf "$_resolve_dir" 2>/dev/null
+    
+    echo -e "\r  ${GREEN}✓${NC} Resolved ${_resolved}/${_count} instance name(s)                    "
+}
+
+#--------------------------------------------------------------------------------
 # Capacity Topology - Search hosts across all fields
 # Searches: instance OCID, state, details, shape, topology, HPC, net, local block
 # Displays matching rows with search term highlighted
@@ -34957,11 +36921,8 @@ manage_capacity_topology() {
             return
         fi
         
-        # Refresh capacity topology cache
-        _show_spinner "Fetching capacity topology data..." &
-        local _sp=$!
+        # Refresh capacity topology cache (function has its own progress bar)
         fetch_capacity_topology
-        _kill_spinner $_sp
         
         if [[ ! -f "$CAPACITY_TOPOLOGY_CACHE" ]]; then
             echo -e "${RED}Failed to fetch capacity topology data${NC}"
@@ -35100,39 +37061,71 @@ manage_capacity_topology() {
                     # Local Block (prefix visible=14, pad=31)
                     _ro_line "  ${r_hpc_pipe}   ${r_nb_pipe}   ${r_lb_conn}── " "${BOLD}${BLUE}" "Local Block:" 31 "$r_lb_cnt" "${YELLOW}" "$r_lb_display"
                     
-                    # Build shape × status breakdown for this local block
+                    # Build shape breakdown with all states per shape on one line
+                    # Format: shape|state1:count1,state2:count2,...|total
                     local r_lb_breakdown
                     r_lb_breakdown=$(echo "$r_lb_hosts" | awk -F'|' '{
                         shape = ($5 == "" || $5 == "N/A") ? "-" : $5
                         details = ($3 == "" || $3 == "N/A") ? "-" : $3
-                        key = shape "|" details
-                        count[key]++
+                        count[shape SUBSEP details]++
+                        total[shape]++
+                        # Track unique details per shape
+                        if (!(shape SUBSEP details in seen)) {
+                            seen[shape SUBSEP details] = 1
+                            if (shape in details_list)
+                                details_list[shape] = details_list[shape] "," details
+                            else
+                                details_list[shape] = details
+                        }
                     } END {
-                        for (k in count) printf "%s|%s\n", k, count[k]
-                    }' | sort -t'|' -k1,1 -k2,2)
+                        for (s in total) {
+                            dets = ""
+                            n = split(details_list[s], arr, ",")
+                            for (i = 1; i <= n; i++) {
+                                d = arr[i]
+                                if (dets != "") dets = dets ","
+                                dets = dets d ":" count[s SUBSEP d]
+                            }
+                            printf "%s|%s|%s\n", s, dets, total[s]
+                        }
+                    }' | sort -t'|' -k1,1)
                     
                     local r_brk_idx=0
                     local r_brk_total
                     r_brk_total=$(echo "$r_lb_breakdown" | grep -c . 2>/dev/null)
                     
-                    echo "$r_lb_breakdown" | while IFS='|' read -r brk_shape brk_status brk_count; do
+                    echo "$r_lb_breakdown" | while IFS='|' read -r brk_shape brk_details brk_total; do
                         [[ -z "$brk_shape" ]] && continue
                         ((r_brk_idx++))
                         
                         local brk_conn="├"
                         [[ "$r_brk_idx" -eq "$r_brk_total" ]] && brk_conn="└"
                         
-                        # Color by status
-                        local brk_color="$WHITE"
-                        case "$brk_status" in
-                            AVAILABLE|ACTIVE|HEALTHY) brk_color="$GREEN" ;;
-                            DEGRADED|IMPAIRED) brk_color="$YELLOW" ;;
-                            UNAVAILABLE|FAILED|INACTIVE|MAINTENANCE*) brk_color="$RED" ;;
-                            *) brk_color="$WHITE" ;;
-                        esac
+                        # Build detail badges: [# DETAIL] [# DETAIL] ...
+                        local state_badges=""
+                        # Sort details for consistent display order
+                        local _sorted_states
+                        _sorted_states=$(echo "$brk_details" | tr ',' '\n' | sort -t':' -k1,1 | tr '\n' ',')
+                        IFS=',' read -ra _state_pairs <<< "$_sorted_states"
+                        for _sp in "${_state_pairs[@]}"; do
+                            [[ -z "$_sp" ]] && continue
+                            local _sname="${_sp%%:*}"
+                            local _scount="${_sp##*:}"
+                            local _sdisplay="$_sname"
+                            [[ "$_sname" == "-" ]] && _sdisplay="Available"
+                            local _sbadge_color="$WHITE"
+                            case "$_sname" in
+                                AVAILABLE|-) _sbadge_color="$GREEN" ;;
+                                DEGRADED*|IMPAIRED*|NEEDS_ATTENTION*) _sbadge_color="$YELLOW" ;;
+                                UNAVAILABLE*|FAILED*|INACTIVE*|MAINTENANCE*|INFRASTRUCTURE_MAINTENANCE*) _sbadge_color="$RED" ;;
+                                *) _sbadge_color="$WHITE" ;;
+                            esac
+                            state_badges="${state_badges} [${_sbadge_color}${_scount} ${_sdisplay}${NC}]"
+                        done
                         
-                        # Shape (prefix visible=18, pad=27)
-                        _ro_line "  ${r_hpc_pipe}   ${r_nb_pipe}   ${r_lb_pipe}   ${brk_conn}── " "${CYAN}" "$brk_shape" 27 "$brk_count" "${brk_color}" "$brk_status"
+                        # Shape line with inline state badges
+                        printf "  ${r_hpc_pipe}   ${r_nb_pipe}   ${r_lb_pipe}   ${brk_conn}── ${CYAN}%-25s${NC} ${BOLD}[${WHITE}%3s hosts${NC}${BOLD}]${NC}%b\n" \
+                            "$brk_shape" "$brk_total" "$state_badges"
                     done
                     
                 done <<< "$r_local_blocks"
@@ -35276,11 +37269,18 @@ capacity_topology_view_by_state() {
     echo -e "${BOLD}${WHITE}═══ Hosts with Lifecycle State: ${CYAN}$selected_state${NC} ${BOLD}${WHITE}═══${NC}"
     echo ""
     _ui_oci_cmd "oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all"
-    echo ""
-    printf "${BOLD}%-145s %-15s %-20s %-25s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
-    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
-    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | grep "|${selected_state}|" | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+    # Resolve instance names for non-N/A OCIDs
+    local _filtered_file="${TEMP_DIR}/ct_state_filtered_$$.txt"
+    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | grep "|${selected_state}|" > "$_filtered_file"
+    _ct_resolve_instance_names "$_filtered_file"
+    
+    echo ""
+    printf "${BOLD}%-35s %-145s %-15s %-20s %-25s${NC}\n" "INSTANCE NAME" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
+    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+    
+    while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+        [[ -z "$inst_id" ]] && continue
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35295,8 +37295,18 @@ capacity_topology_view_by_state() {
         local shape_display="${inst_shape:-N/A}"
         [[ "$shape_display" == "N/A" ]] && shape_display="-"
         
-        printf "${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_id" "$state" "$details_display" "$shape_display"
-    done 
+        local inst_name="-"
+        if [[ "$inst_id" == ocid1.instance.* && -n "${CT_INST_NAMES[$inst_id]+x}" ]]; then
+            inst_name="${CT_INST_NAMES[$inst_id]}"
+        elif [[ "$inst_id" == "N/A" ]]; then
+            inst_name=""
+            inst_id="-"
+        fi
+        local inst_name_t="${inst_name:0:35}"
+        
+        printf "${WHITE}%-35s${NC} ${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_name_t" "$inst_id" "$state" "$details_display" "$shape_display"
+    done < "$_filtered_file"
+    rm -f "$_filtered_file" 2>/dev/null
     
     echo ""
     echo -e "  ${YELLOW}s${NC}) Search within this view    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
@@ -35347,11 +37357,18 @@ capacity_topology_view_by_details() {
     echo -e "${BOLD}${WHITE}═══ Hosts with Lifecycle Details: ${CYAN}$display_title${NC} ${BOLD}${WHITE}═══${NC}"
     echo ""
     _ui_oci_cmd "oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all"
-    echo ""
-    printf "${BOLD}%-145s %-15s %-20s %-25s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
-    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
-    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v d="$selected_details" '$3 == d' | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+    # Resolve instance names for non-N/A OCIDs
+    local _filtered_file="${TEMP_DIR}/ct_details_filtered_$$.txt"
+    grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | awk -F'|' -v d="$selected_details" '$3 == d' > "$_filtered_file"
+    _ct_resolve_instance_names "$_filtered_file"
+    
+    echo ""
+    printf "${BOLD}%-35s %-145s %-15s %-20s %-25s${NC}\n" "INSTANCE NAME" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE"
+    echo "════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+    
+    while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+        [[ -z "$inst_id" ]] && continue
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35366,8 +37383,18 @@ capacity_topology_view_by_details() {
         local shape_display="${inst_shape:-N/A}"
         [[ "$shape_display" == "N/A" ]] && shape_display="-"
         
-        printf "${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_id" "$state" "$details_display" "$shape_display"
-    done 
+        local inst_name="-"
+        if [[ "$inst_id" == ocid1.instance.* && -n "${CT_INST_NAMES[$inst_id]+x}" ]]; then
+            inst_name="${CT_INST_NAMES[$inst_id]}"
+        elif [[ "$inst_id" == "N/A" ]]; then
+            inst_name=""
+            inst_id="-"
+        fi
+        local inst_name_t="${inst_name:0:35}"
+        
+        printf "${WHITE}%-35s${NC} ${YELLOW}%-145s${NC} ${state_color}%-15s${NC} %-20s %-25s\n" "$inst_name_t" "$inst_id" "$state" "$details_display" "$shape_display"
+    done < "$_filtered_file"
+    rm -f "$_filtered_file" 2>/dev/null
     
     echo ""
     echo -e "  ${YELLOW}s${NC}) Search within this view    ${YELLOW}i${NC}) Instance details    ${CYAN}Enter${NC}) Return"
@@ -35392,11 +37419,16 @@ capacity_topology_view_all_hosts() {
     _ui_section "All Capacity Topology Hosts"
     echo ""
     _ui_oci_cmd "oci compute capacity-topology bare-metal-host list --capacity-topology-id \$TOPOLOGY_ID --all"
+    
+    # Resolve instance names for non-N/A OCIDs
+    _ct_resolve_instance_names "$CAPACITY_TOPOLOGY_CACHE"
+    
     echo ""
-    printf "${BOLD}%-145s %-12s %-15s %-25s %-22s %-22s %-22s${NC}\n" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE" "HPC ISLAND (last 22)" "NET BLOCK (last 22)" "LOCAL BLK (last 22)"
-    echo "═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+    printf "${BOLD}%-35s %-145s %-12s %-15s %-25s %-22s %-22s %-22s${NC}\n" "INSTANCE NAME" "INSTANCE OCID" "STATE" "DETAILS" "SHAPE" "HPC ISLAND (last 22)" "NET BLOCK (last 22)" "LOCAL BLK (last 22)"
+    echo "═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     
     grep -v "^#" "$CAPACITY_TOPOLOGY_CACHE" | sort -t'|' -k2,2 -k3,3 | while IFS='|' read -r inst_id state details topo_id inst_shape hpc_island net_block local_block time_created time_updated; do
+        [[ -z "$inst_id" ]] && continue
         local state_color="$GREEN"
         case "$state" in
             ACTIVE|HEALTHY) state_color="$GREEN" ;;
@@ -35417,7 +37449,16 @@ capacity_topology_view_all_hosts() {
         [[ "$net_block" != "N/A" && -n "$net_block" ]] && net_display="..${net_block: -20}"
         [[ "$local_block" != "N/A" && -n "$local_block" ]] && local_display="..${local_block: -20}"
         
-        printf "${YELLOW}%-145s${NC} ${state_color}%-12s${NC} %-15s %-25s ${GRAY}%-22s %-22s %-22s${NC}\n" "$inst_id" "$state" "$details_display" "$shape_display" "$hpc_display" "$net_display" "$local_display"
+        local inst_name="-"
+        if [[ "$inst_id" == ocid1.instance.* && -n "${CT_INST_NAMES[$inst_id]+x}" ]]; then
+            inst_name="${CT_INST_NAMES[$inst_id]}"
+        elif [[ "$inst_id" == "N/A" ]]; then
+            inst_name=""
+            inst_id="-"
+        fi
+        local inst_name_t="${inst_name:0:35}"
+        
+        printf "${WHITE}%-35s${NC} ${YELLOW}%-145s${NC} ${state_color}%-12s${NC} %-15s %-25s ${GRAY}%-22s %-22s %-22s${NC}\n" "$inst_name_t" "$inst_id" "$state" "$details_display" "$shape_display" "$hpc_display" "$net_display" "$local_display"
     done 
     
     echo ""
@@ -41331,7 +43372,7 @@ custom_image_view_details() {
         echo ""
     fi
     
-    # Show compatible shapes
+    # Show compatible shapes in 3 columns: VM | BM | GPU
     _ui_section "Compatible Shapes"
     local shapes
     shapes=$(jq -r '.data["agent-features"]["is-monitoring-supported"] // "N/A"' <<< "$img_json" 2>/dev/null)
@@ -41339,22 +43380,229 @@ custom_image_view_details() {
     # Try to get shape compatibility
     local compat_json
     compat_json=$(oci compute image-shape-compatibility-entry list --image-id "$image_id" --output json 2>/dev/null)
+    
+    declare -A _COMPAT_SET=()
+    local -a _vm_shapes=() _bm_shapes=() _gpu_shapes=()
+    
     if [[ -n "$compat_json" ]] && jq -e '.data' <<< "$compat_json" > /dev/null 2>&1; then
         local shape_count
         shape_count=$(jq '.data | length' <<< "$compat_json")
+        
+        while read -r _cs; do
+            [[ -z "$_cs" ]] && continue
+            _COMPAT_SET["$_cs"]=1
+            if [[ "$_cs" == VM.GPU.* || "$_cs" == BM.GPU.* ]]; then
+                _gpu_shapes+=("$_cs")
+            elif [[ "$_cs" == BM.* ]]; then
+                _bm_shapes+=("$_cs")
+            else
+                _vm_shapes+=("$_cs")
+            fi
+        done < <(jq -r '.data[].shape' <<< "$compat_json" 2>/dev/null | sort)
+        
         echo -e "  ${WHITE}$shape_count compatible shape(s)${NC}"
-        jq -r '.data[].shape' <<< "$compat_json" 2>/dev/null | head -10 | while read -r shape; do
-            echo -e "    ${GRAY}• $shape${NC}"
+        echo ""
+        
+        # Determine max rows needed
+        local _vm_ct=${#_vm_shapes[@]} _bm_ct=${#_bm_shapes[@]} _gpu_ct=${#_gpu_shapes[@]}
+        local _max_rows=$_vm_ct
+        [[ $_bm_ct -gt $_max_rows ]] && _max_rows=$_bm_ct
+        [[ $_gpu_ct -gt $_max_rows ]] && _max_rows=$_gpu_ct
+        
+        # Column headers
+        printf "  ${BOLD}${CYAN}%-35s${NC} ${BOLD}${MAGENTA}%-35s${NC} ${BOLD}${GREEN}%-35s${NC}\n" \
+            "VM (${_vm_ct})" "BM (${_bm_ct})" "GPU (${_gpu_ct})"
+        printf "  ${GRAY}%-35s %-35s %-35s${NC}\n" \
+            "$(printf '%*s' 33 '' | tr ' ' '─')" \
+            "$(printf '%*s' 33 '' | tr ' ' '─')" \
+            "$(printf '%*s' 33 '' | tr ' ' '─')"
+        
+        local _ri=0
+        while [[ $_ri -lt $_max_rows ]]; do
+            local _vc="" _bc="" _gc=""
+            [[ $_ri -lt $_vm_ct ]] && _vc="${_vm_shapes[$_ri]}"
+            [[ $_ri -lt $_bm_ct ]] && _bc="${_bm_shapes[$_ri]}"
+            [[ $_ri -lt $_gpu_ct ]] && _gc="${_gpu_shapes[$_ri]}"
+            printf "  ${WHITE}%-35s${NC} ${WHITE}%-35s${NC} ${WHITE}%-35s${NC}\n" "$_vc" "$_bc" "$_gc"
+            ((_ri++))
         done
-        if [[ "$shape_count" -gt 10 ]]; then
-            echo -e "    ${GRAY}... and $((shape_count - 10)) more${NC}"
-        fi
     else
         echo -e "  ${GRAY}Unable to retrieve shape compatibility${NC}"
     fi
     echo ""
     
-    _ui_pause
+    # Offer to add missing shapes
+    echo -e "  ${YELLOW}a${NC}) Add missing shape compatibility    ${CYAN}Enter${NC}) Return"
+    echo ""
+    echo -n -e "  ${CYAN}Select: ${NC}"
+    local _cs_action
+    read -r _cs_action
+    
+    if [[ "$_cs_action" == "a" || "$_cs_action" == "A" ]]; then
+        local _ci_compartment="${EFFECTIVE_COMPARTMENT_ID:-$COMPARTMENT_ID}"
+        local _ci_region="${EFFECTIVE_REGION:-$REGION}"
+        local _ci_log="${LOGS_DIR}/custom_images_actions.log"
+        mkdir -p "$(dirname "$_ci_log")" 2>/dev/null
+        
+        echo ""
+        _show_spinner "Fetching available shapes in region ${_ci_region}..." &
+        local _sp2=$!
+        local avail_shapes_json
+        avail_shapes_json=$(oci compute shape list --compartment-id "$_ci_compartment" --all --output json 2>/dev/null)
+        _kill_spinner $_sp2
+        
+        if [[ -n "$avail_shapes_json" ]] && jq -e '.data[0]' <<< "$avail_shapes_json" >/dev/null; then
+            # Build missing shapes lists by category
+            local -a _miss_vm=() _miss_bm=() _miss_gpu=()
+            declare -A _MISS_MAP=()
+            local _midx=0
+            
+            while read -r _as; do
+                [[ -z "$_as" ]] && continue
+                [[ -n "${_COMPAT_SET[$_as]+x}" ]] && continue
+                ((_midx++))
+                _MISS_MAP[$_midx]="$_as"
+                if [[ "$_as" == VM.GPU.* || "$_as" == BM.GPU.* ]]; then
+                    _miss_gpu+=("${_midx}|${_as}")
+                elif [[ "$_as" == BM.* ]]; then
+                    _miss_bm+=("${_midx}|${_as}")
+                else
+                    _miss_vm+=("${_midx}|${_as}")
+                fi
+            done < <(jq -r '[.data[].shape] | unique | sort[]' <<< "$avail_shapes_json" 2>/dev/null)
+            
+            if [[ $_midx -eq 0 ]]; then
+                echo -e "  ${GREEN}All available shapes are already compatible${NC}"
+                _ui_pause
+                return
+            fi
+            
+            echo ""
+            _ui_section "Missing Shapes (not yet compatible)"
+            echo -e "  ${GRAY}${_midx} shape(s) available but not yet compatible${NC}"
+            echo ""
+            
+            # 3-column display of missing shapes
+            local _mvm_ct=${#_miss_vm[@]} _mbm_ct=${#_miss_bm[@]} _mgpu_ct=${#_miss_gpu[@]}
+            local _mmax=$_mvm_ct
+            [[ $_mbm_ct -gt $_mmax ]] && _mmax=$_mbm_ct
+            [[ $_mgpu_ct -gt $_mmax ]] && _mmax=$_mgpu_ct
+            
+            printf "  ${BOLD}${CYAN}%-40s${NC} ${BOLD}${MAGENTA}%-40s${NC} ${BOLD}${GREEN}%-40s${NC}\n" \
+                "VM (${_mvm_ct})" "BM (${_mbm_ct})" "GPU (${_mgpu_ct})"
+            printf "  ${GRAY}%-40s %-40s %-40s${NC}\n" \
+                "$(printf '%*s' 38 '' | tr ' ' '─')" \
+                "$(printf '%*s' 38 '' | tr ' ' '─')" \
+                "$(printf '%*s' 38 '' | tr ' ' '─')"
+            
+            local _mi=0
+            while [[ $_mi -lt $_mmax ]]; do
+                local _mvc="" _mbc="" _mgc=""
+                if [[ $_mi -lt $_mvm_ct ]]; then
+                    local _mn="${_miss_vm[$_mi]%%|*}" _ms="${_miss_vm[$_mi]#*|}"
+                    _mvc=$(printf "${YELLOW}%-4s${NC} %s" "$_mn)" "$_ms")
+                fi
+                if [[ $_mi -lt $_mbm_ct ]]; then
+                    local _mn="${_miss_bm[$_mi]%%|*}" _ms="${_miss_bm[$_mi]#*|}"
+                    _mbc=$(printf "${YELLOW}%-4s${NC} %s" "$_mn)" "$_ms")
+                fi
+                if [[ $_mi -lt $_mgpu_ct ]]; then
+                    local _mn="${_miss_gpu[$_mi]%%|*}" _ms="${_miss_gpu[$_mi]#*|}"
+                    _mgc=$(printf "${YELLOW}%-4s${NC} %s" "$_mn)" "$_ms")
+                fi
+                # Print raw to handle color codes - use fixed-width printf for each
+                echo -ne "  "
+                if [[ $_mi -lt $_mvm_ct ]]; then
+                    local _mn="${_miss_vm[$_mi]%%|*}" _ms="${_miss_vm[$_mi]#*|}"
+                    printf "${YELLOW}%-4s${NC} %-33s " "$_mn)" "$_ms"
+                else
+                    printf "%-40s" ""
+                fi
+                if [[ $_mi -lt $_mbm_ct ]]; then
+                    local _mn="${_miss_bm[$_mi]%%|*}" _ms="${_miss_bm[$_mi]#*|}"
+                    printf "${YELLOW}%-4s${NC} %-33s " "$_mn)" "$_ms"
+                else
+                    printf "%-40s" ""
+                fi
+                if [[ $_mi -lt $_mgpu_ct ]]; then
+                    local _mn="${_miss_gpu[$_mi]%%|*}" _ms="${_miss_gpu[$_mi]#*|}"
+                    printf "${YELLOW}%-4s${NC} %-33s" "$_mn)" "$_ms"
+                fi
+                printf "\n"
+                ((_mi++))
+            done
+            
+            echo ""
+            echo -e "  ${GRAY}Enter shape #(s) separated by commas (e.g. 1,5,12) or 'all' to add all:${NC}"
+            echo -n -e "  ${CYAN}Add shape(s): ${NC}"
+            local _add_input
+            read -r _add_input
+            
+            if [[ -z "$_add_input" ]]; then
+                return
+            fi
+            
+            local -a _shapes_to_add=()
+            if [[ "$_add_input" == "all" || "$_add_input" == "ALL" ]]; then
+                for _ak in $(seq 1 $_midx); do
+                    _shapes_to_add+=("${_MISS_MAP[$_ak]}")
+                done
+            else
+                IFS=',' read -ra _sel_nums <<< "$_add_input"
+                for _sn in "${_sel_nums[@]}"; do
+                    _sn=$(echo "$_sn" | tr -d ' ')
+                    if [[ -n "${_MISS_MAP[$_sn]}" ]]; then
+                        _shapes_to_add+=("${_MISS_MAP[$_sn]}")
+                    fi
+                done
+            fi
+            
+            if [[ ${#_shapes_to_add[@]} -eq 0 ]]; then
+                echo -e "  ${RED}No valid shapes selected${NC}"
+                _ui_pause
+                return
+            fi
+            
+            echo ""
+            echo -e "  ${BOLD}${WHITE}Adding ${#_shapes_to_add[@]} shape(s):${NC}"
+            for _sa in "${_shapes_to_add[@]}"; do
+                echo -e "    ${WHITE}• $_sa${NC}"
+            done
+            echo ""
+            echo -n -e "  ${YELLOW}Confirm? (y/N): ${NC}"
+            local _confirm
+            read -r _confirm
+            
+            if [[ "$_confirm" == "y" || "$_confirm" == "Y" ]]; then
+                local _add_ok=0 _add_fail=0
+                for _sa in "${_shapes_to_add[@]}"; do
+                    local _add_cmd="oci compute image-shape-compatibility-entry add --image-id \"$image_id\" --shape-name \"$_sa\""
+                    echo -e "  ${WHITE}$ $_add_cmd${NC}"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] EXECUTE: $_add_cmd" >> "$_ci_log"
+                    
+                    local _add_result
+                    _add_result=$(oci compute image-shape-compatibility-entry add --image-id "$image_id" --shape-name "$_sa" --output json 2>&1)
+                    
+                    if echo "$_add_result" | jq -e '.data' >/dev/null 2>&1 || [[ -z "$_add_result" ]]; then
+                        echo -e "  ${GREEN}✓ Added: $_sa${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: Added shape compat $_sa" >> "$_ci_log"
+                        ((_add_ok++))
+                    else
+                        echo -e "  ${RED}✗ Failed: $_sa${NC}"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: $_sa — $_add_result" >> "$_ci_log"
+                        ((_add_fail++))
+                    fi
+                done
+                echo ""
+                echo -e "  ${GREEN}${_add_ok} added${NC}, ${RED}${_add_fail} failed${NC}"
+            else
+                echo -e "  ${YELLOW}Cancelled${NC}"
+            fi
+        else
+            echo -e "  ${GRAY}Could not fetch available shapes from region${NC}"
+        fi
+        _ui_pause
+    fi
 }
 
 #--------------------------------------------------------------------------------
