@@ -1,0 +1,48 @@
+#!/bin/bash
+# nic_map.sh — Map Mellanox PCI devices to net/RDMA/link info
+# v1.5.0 | 2026-04-14
+
+printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-22s %s\n" \
+  "PCI_BDF" "TYPE" "NET_IF" "RDMA_DEV" "STATE" "SPEED" "NUMA" "FIRMWARE" "IP_ADDR"
+printf '%0.s-' {1..115}; echo
+
+ETH_ROWS=()
+RDMA_ROWS=()
+while read -r line; do
+  BDF=$(echo "$line" | awk '{print $1}')
+  [[ "$line" == *"ConnectX-8"* ]] && TYPE="CX8" || TYPE="CX7"
+
+  NET_IF=$(ls /sys/bus/pci/devices/${BDF}/net/ 2>/dev/null | head -1)
+  RDMA_DEV=$(ls /sys/bus/pci/devices/${BDF}/infiniband/ 2>/dev/null | head -1)
+  NUMA=$(cat /sys/bus/pci/devices/${BDF}/numa_node 2>/dev/null)
+
+  if [[ -n "$NET_IF" ]]; then
+    STATE=$(cat /sys/class/net/${NET_IF}/operstate 2>/dev/null)
+    SPEED_MBPS=$(cat /sys/class/net/${NET_IF}/speed 2>/dev/null)
+    if [[ "$SPEED_MBPS" =~ ^[0-9]+$ ]]; then
+      SPEED="$((SPEED_MBPS / 1000))G"
+    else
+      SPEED="N/A"
+    fi
+    FW=$(ethtool -i ${NET_IF} 2>/dev/null | awk -F': ' '/firmware-version/{print $2}')
+    IP=$(ip -4 addr show dev ${NET_IF} 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+    if [[ -z "$IP" ]]; then
+      IP=$(ip -6 addr show dev ${NET_IF} scope global 2>/dev/null | awk '/inet6 /{print $2}' | cut -d/ -f1 | head -1)
+    fi
+  else
+    STATE="N/A"; SPEED="N/A"; FW=""; IP=""
+  fi
+
+  ROW=$(printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-22s %s" \
+    "$BDF" "$TYPE" "${NET_IF:-none}" "${RDMA_DEV:-none}" \
+    "${STATE:-N/A}" "$SPEED" "${NUMA:-N/A}" "${FW:-N/A}" "${IP:-none}")
+
+  if [[ "$NET_IF" == eth* ]]; then
+    ETH_ROWS+=("$ROW")
+  elif [[ "$NET_IF" == rdma* ]]; then
+    RDMA_ROWS+=("$ROW")
+  fi
+done < <(lspci -Dmm | grep -i mellanox | grep -i "ethernet controller")
+
+for row in "${ETH_ROWS[@]}"; do echo "$row"; done | sort -t' ' -k3,3V
+for row in "${RDMA_ROWS[@]}"; do echo "$row"; done | sort -t' ' -k3,3V
