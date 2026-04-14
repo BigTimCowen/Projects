@@ -1,6 +1,22 @@
 #!/bin/bash
 # nic_map.sh — Map Mellanox PCI devices to net/RDMA/link info
 # v1.5.0 | 2026-04-14
+#
+#./nic_map.sh
+#PCI_BDF            TYPE   NET_IF   RDMA_DEV STATE  SPEED   NUMA FIRMWARE               IP_ADDR
+#-------------------------------------------------------------------------------------------------------------------
+#0006:09:00.0       CX7    eth0     mlx5_4   up     200G    0    28.44.1022 (ORC0000000014) 10.241.0.2
+#0016:0b:00.0       CX7    eth1     mlx5_9   up     200G    1    28.44.1022 (ORC0000000014) none
+#0000:03:00.0       CX8    rdma0    mlx5_0   up     400G    0    40.46.4050 (ORC0000000015) gdcd:2:a75a:f00a:92e3:17ff:fec4:8aac
+#0000:03:00.1       CX8    rdma1    mlx5_1   up     400G    0    40.46.4050 (ORC0000000015) gdcd:2:a75a:f00b:92e3:17ff:fec4:8aad
+#0002:03:00.0       CX8    rdma2    mlx5_2   up     400G    0    40.46.4050 (ORC0000000015) gdcd:2:a25a:f00a:92e3:17ff:fec4:8aac
+#0002:03:00.1       CX8    rdma3    mlx5_3   up     400G    0    40.46.4050 (ORC0000000015) gdcd:2:a25a:f00b:92e3:17ff:fec4:8aad
+#0010:03:00.0       CX8    rdma4    mlx5_5   up     400G    1    40.46.4050 (ORC0000000015) gdcd:2:a35a:f00a:ea9e:49ff:fe59:7bbe
+#0010:03:00.1       CX8    rdma5    mlx5_6   up     400G    1    40.46.4050 (ORC0000000015) gdcd:2:a35a:f00b:ea9e:49ff:fe59:7bbf
+#0012:03:00.0       CX8    rdma6    mlx5_7   up     400G    1    40.46.4050 (ORC0000000015) gdcd:2:a45a:f00a:ea9e:49ff:fe59:7bbe
+#0012:03:00.1       CX8    rdma7    mlx5_8   up     400G    1    40.46.4050 (ORC0000000015) gdcd:2:a45a:f00b:ea9e:49ff:fe59:7bbf
+#
+#
 
 printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-22s %s\n" \
   "PCI_BDF" "TYPE" "NET_IF" "RDMA_DEV" "STATE" "SPEED" "NUMA" "FIRMWARE" "IP_ADDR"
