@@ -1,6 +1,6 @@
 #!/bin/bash
 # nic_map.sh — Map Mellanox PCI devices to net/RDMA/link info
-# v1.5.0 | 2026-04-14
+# v1.6.0 | 2026-04-15
 #
 #./nic_map.sh
 #PCI_BDF            TYPE   NET_IF   RDMA_DEV STATE  SPEED   NUMA FIRMWARE               IP_ADDR
@@ -18,9 +18,9 @@
 #
 #
 
-printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-22s %s\n" \
-  "PCI_BDF" "TYPE" "NET_IF" "RDMA_DEV" "STATE" "SPEED" "NUMA" "FIRMWARE" "IP_ADDR"
-printf '%0.s-' {1..115}; echo
+printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-13s %-13s %-16s %s\n" \
+  "PCI_BDF" "TYPE" "NET_IF" "RDMA_DEV" "STATE" "SPEED" "NUMA" "FW_RUN" "FW_FLASH" "PSID" "IP_ADDR"
+printf '%0.s-' {1..140}; echo
 
 ETH_ROWS=()
 RDMA_ROWS=()
@@ -40,18 +40,28 @@ while read -r line; do
     else
       SPEED="N/A"
     fi
-    FW=$(ethtool -i ${NET_IF} 2>/dev/null | awk -F': ' '/firmware-version/{print $2}')
     IP=$(ip -4 addr show dev ${NET_IF} 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
     if [[ -z "$IP" ]]; then
       IP=$(ip -6 addr show dev ${NET_IF} scope global 2>/dev/null | awk '/inet6 /{print $2}' | cut -d/ -f1 | head -1)
     fi
   else
-    STATE="N/A"; SPEED="N/A"; FW=""; IP=""
+    STATE="N/A"; SPEED="N/A"; IP=""
   fi
 
-  ROW=$(printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-22s %s" \
+  MST_OUT=$(sudo mstflint -d "$BDF" query 2>/dev/null)
+  FW_FLASH=$(echo "$MST_OUT" | awk -F': *' '/^FW Version:/{print $2; exit}' | awk '{print $1}')
+  FW_RUN=$(echo "$MST_OUT"  | awk -F': *' '/^FW Version\(Running\):/{print $2; exit}' | awk '{print $1}')
+  PSID=$(echo "$MST_OUT"    | awk -F': *' '/^PSID:/{print $2; exit}' | awk '{print $1}')
+  [[ -z "$FW_RUN" ]] && FW_RUN="$FW_FLASH"
+  if [[ -z "$FW_FLASH" && -n "$NET_IF" ]]; then
+    FW_RUN=$(ethtool -i ${NET_IF} 2>/dev/null | awk -F': ' '/firmware-version/{print $2}' | awk '{print $1}')
+    FW_FLASH="$FW_RUN"
+  fi
+
+  ROW=$(printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-13s %-13s %-16s %s" \
     "$BDF" "$TYPE" "${NET_IF:-none}" "${RDMA_DEV:-none}" \
-    "${STATE:-N/A}" "$SPEED" "${NUMA:-N/A}" "${FW:-N/A}" "${IP:-none}")
+    "${STATE:-N/A}" "$SPEED" "${NUMA:-N/A}" \
+    "${FW_RUN:-N/A}" "${FW_FLASH:-N/A}" "${PSID:-N/A}" "${IP:-none}")
 
   if [[ "$NET_IF" == eth* ]]; then
     ETH_ROWS+=("$ROW")
