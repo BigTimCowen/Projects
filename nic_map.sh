@@ -1,6 +1,9 @@
 #!/bin/bash
 # nic_map.sh — Map Mellanox PCI devices to net/RDMA/link info
-# v1.8.0 | 2026-04-23
+# v1.8.1 | 2026-04-23
+#
+# Fetch & run on a node:
+# curl -sSLO https://raw.githubusercontent.com/BigTimCowen/Projects/main/nic_map.sh && chmod +x nic_map.sh && ./nic_map.sh
 #
 #./nic_map.sh
 #PCI_BDF            TYPE   NET_IF   RDMA_DEV STATE  SPEED   NUMA FIRMWARE               IP_ADDR
