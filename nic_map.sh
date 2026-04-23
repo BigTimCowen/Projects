@@ -1,6 +1,6 @@
 #!/bin/bash
 # nic_map.sh — Map Mellanox PCI devices to net/RDMA/link info
-# v1.6.0 | 2026-04-15
+# v1.8.0 | 2026-04-23
 #
 #./nic_map.sh
 #PCI_BDF            TYPE   NET_IF   RDMA_DEV STATE  SPEED   NUMA FIRMWARE               IP_ADDR
@@ -18,6 +18,9 @@
 #
 #
 
+SHAPE=$(curl -sL -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/ 2>/dev/null | jq -r '.shape // empty')
+printf "GPU Model: %s\n\n" "${SHAPE:-unknown}"
+
 printf "%-18s %-6s %-8s %-8s %-6s %-7s %-4s %-13s %-13s %-16s %s\n" \
   "PCI_BDF" "TYPE" "NET_IF" "RDMA_DEV" "STATE" "SPEED" "NUMA" "FW_RUN" "FW_FLASH" "PSID" "IP_ADDR"
 printf '%0.s-' {1..140}; echo
@@ -26,7 +29,15 @@ ETH_ROWS=()
 RDMA_ROWS=()
 while read -r line; do
   BDF=$(echo "$line" | awk '{print $1}')
-  [[ "$line" == *"ConnectX-8"* ]] && TYPE="CX8" || TYPE="CX7"
+  case "$line" in
+    *ConnectX-8*) TYPE="CX8" ;;
+    *ConnectX-7*) TYPE="CX7" ;;
+    *ConnectX-6*) TYPE="CX6" ;;
+    *ConnectX-5*) TYPE="CX5" ;;
+    *ConnectX-4*) TYPE="CX4" ;;
+    *ConnectX-3*) TYPE="CX3" ;;
+    *)            TYPE="N/A" ;;
+  esac
 
   NET_IF=$(ls /sys/bus/pci/devices/${BDF}/net/ 2>/dev/null | head -1)
   RDMA_DEV=$(ls /sys/bus/pci/devices/${BDF}/infiniband/ 2>/dev/null | head -1)
